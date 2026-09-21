@@ -1,4 +1,4 @@
-"""Thin JSON CLI: python -m ctrlloop 'the original user request'."""
+"""Application entry point: python src/main.py 'the original user request'."""
 
 import argparse
 import json
@@ -11,9 +11,15 @@ import tomllib
 from dotenv import load_dotenv
 from typesafe_sdk import RetryPolicy, TypeSafeClient, TypeSafeError
 
-from .driver import CuaDriver, DriverError
-from .pipeline import run_pipeline
-from .selection import ChoiceSelector, PINNED_MODEL, RequestBudget, SelectionError
+if __package__:
+    from .driver import CuaDriver, DriverError
+    from .pipeline import run_pipeline
+    from .selection import ChoiceSelector, PINNED_MODEL, RequestBudget, SelectionError
+else:
+    # Direct script execution puts src on the import path.
+    from driver import CuaDriver, DriverError
+    from pipeline import run_pipeline
+    from selection import ChoiceSelector, PINNED_MODEL, RequestBudget, SelectionError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
-    logging.getLogger("ctrlloop.selection").setLevel(logging.INFO)
+    logging.getLogger(ChoiceSelector.__module__).setLevel(logging.INFO)
     # SDK debug logs can contain UI state; this CLI logs only the model identity.
     logging.getLogger("typesafe_sdk").setLevel(logging.WARNING)
     try:

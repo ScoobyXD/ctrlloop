@@ -1,4 +1,4 @@
-"""Deterministic groups-of-ten Choice elimination, shared by both stages."""
+"""Deterministic groups-of-ten Choice elimination for windows and controls."""
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field

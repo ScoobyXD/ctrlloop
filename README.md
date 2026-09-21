@@ -16,7 +16,7 @@ From the repository root, with Python 3.11+ and `uv`:
 ```powershell
 uv sync --locked
 # Set TYPESAFE_API_KEY in your process environment or local .env (not committed).
-uv run --locked python -m ctrlloop 'Find the Recycle Bin control on the desktop.'
+uv run --locked python src/main.py 'Find the Recycle Bin control on the desktop.'
 ```
 
 The dependencies remain pinned to `typesafe-sdk==0.7.1` and
@@ -35,17 +35,25 @@ trimming or normalizing line endings. Use `--env-file <path>` to read an existin
 credential file without copying it. Existing environment variables take priority.
 
 ```powershell
-uv run --locked python -m ctrlloop --request-file request.txt --max-elements 5000 --max-depth 25
+uv run --locked python src/main.py --request-file request.txt --max-elements 5000 --max-depth 25
 uv run --locked python -m unittest discover -s tests -v
 ```
 
-The package is importable from the checkout:
+The source modules live directly in `src/` and feed into `src/main.py`:
+
+- `driver.py` discovers windows and reads the selected window's accessibility state.
+- `selection.py` batches Jev Choice questions and advances one winner per group.
+- `pipeline.py` connects window discovery, window selection, the snapshot read, and control selection.
+- `main.py` provides the CLI, loads configuration, and prints the result.
+
+From the repository root, `uv run --locked python -m src.main` also runs the CLI.
+The modules are importable from the checkout:
 
 ```python
 from typesafe_sdk import RetryPolicy, TypeSafeClient
-from ctrlloop.driver import CuaDriver
-from ctrlloop.pipeline import run_pipeline
-from ctrlloop.selection import ChoiceSelector, PINNED_MODEL
+from src.driver import CuaDriver
+from src.pipeline import run_pipeline
+from src.selection import ChoiceSelector, PINNED_MODEL
 
 with TypeSafeClient(model=PINNED_MODEL, retry=RetryPolicy(max_retries=0)) as client:
     result = run_pipeline(original_request, CuaDriver(), ChoiceSelector(client))

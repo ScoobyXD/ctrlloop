@@ -4,7 +4,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
-from .selection import Candidate, ChoiceSelector
+if __package__:
+    from .selection import Candidate, ChoiceSelector
+else:
+    from selection import Candidate, ChoiceSelector
 
 
 class ReadOnlyDriver(Protocol):

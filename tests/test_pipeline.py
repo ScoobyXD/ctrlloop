@@ -9,8 +9,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from ctrlloop.pipeline import PipelineResult, control_candidates, run_pipeline, window_candidates
-from ctrlloop.selection import ChoiceSelector, PINNED_MODEL, QUESTION
+from src.pipeline import PipelineResult, control_candidates, run_pipeline, window_candidates
+from src.selection import ChoiceSelector, PINNED_MODEL, QUESTION
 
 
 class ChoosingClient:
@@ -210,7 +210,7 @@ class PipelineTests(unittest.TestCase):
 class CliTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.cli = importlib.import_module("ctrlloop.__main__")
+        cls.cli = importlib.import_module("src.main")
 
     def invoke(self, arguments, *, result=None, api_key="test-key", error=None):
         output = io.StringIO()

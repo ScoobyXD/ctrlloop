@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import unittest
 
-from ctrlloop.driver import CuaDriver, DriverError
+from src.driver import CuaDriver, DriverError
 
 
 def window(**updates):

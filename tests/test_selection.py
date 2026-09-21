@@ -6,7 +6,7 @@ import unittest
 
 from typesafe_sdk import Choice, TypeSafeError
 
-from ctrlloop.selection import (
+from src.selection import (
     Candidate,
     ChoiceSelector,
     GROUP_SIZE,

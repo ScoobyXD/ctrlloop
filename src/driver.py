@@ -1,4 +1,4 @@
-"""Read-only adapter for the installed CUA Driver 0.28.2 CLI.
+"""Read-only Windows adapter for the installed CUA Driver 0.28.2 CLI.
 
 The CLI flattens successful structured content onto stdout, but can also
 print tool errors there with exit code zero. Every response is validated.
