@@ -3,6 +3,6 @@ User Preferences:
 
 Jev rules:
 1. Don't put 1 question per call. Bunch them up.
-2. Minimize the state input sent to Jev
+2. Keep the state input sent to Jev minimal
 3. Don't ask arithmetic/date questions to Jev
 4. Pin the Jev model we are doing, the configurations and tuning we're doing for this Jev model may not carry over to the next

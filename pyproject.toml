@@ -1,0 +1,13 @@
+[project]
+name = "ctrlloop"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = ["typesafe-sdk==0.7.1", "python-dotenv==1.2.3"]
+
+[tool.ctrlloop]
+# SETUP.md passes this preference to uv; it does not restrict compatibility.
+preferred-python = "3.11.15"
+jev-model = "jev-1.13.0"
+
+[tool.uv]
+package = false
