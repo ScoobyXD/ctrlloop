@@ -1,3 +1,6 @@
+Purpose:
+We are making a computer use agent using Jev.
+
 User Preferences:
 1. When I ask you to create a new git worktree, I always mean to create a new git worktree in a brand new codex instance. And make sure to number them, like # <worktree name>
 
