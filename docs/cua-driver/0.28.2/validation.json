@@ -1,0 +1,25 @@
+{
+  "driver_version": "0.28.2",
+  "result": "passed",
+  "json_files_parsed": 23,
+  "json_schemas_checked": 5,
+  "checks": [
+    "list_windows base input",
+    "get_accessibility_tree base input",
+    "get_window_state base input",
+    "get_window_state query input schema",
+    "get_window_state both_false input schema",
+    "get_window_state mismatched_owner input schema",
+    "missing window_id rejected by input schema",
+    "list_windows.output.json",
+    "get_window_state.output.json",
+    "get_window_state.query.output.json",
+    "mcp.get_window_state.output.json structuredContent",
+    "mcp.get_window_state.missing_window_id.output.json structuredContent",
+    "saved schemas match captured MCP tool definitions",
+    "sample counts and snapshot identities consistent",
+    "relative documentation links resolve"
+  ],
+  "relative_links_checked": 21,
+  "scope": "Saved documentation artifacts; no additional desktop reads or actions; validation used a temporary environment and did not change project dependencies."
+}

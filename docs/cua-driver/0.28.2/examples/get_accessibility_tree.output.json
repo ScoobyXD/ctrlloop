@@ -1,0 +1,28 @@
+{
+  "processes": [
+    {
+      "name": "explorer.exe",
+      "pid": 4242
+    }
+  ],
+  "windows": [
+    {
+      "height": 39,
+      "pid": 4242,
+      "title": "<folder title> - File Explorer",
+      "width": 219,
+      "window_id": 123457,
+      "x": -31991,
+      "y": -32000
+    },
+    {
+      "height": 1800,
+      "pid": 4242,
+      "title": "Program Manager",
+      "width": 2880,
+      "window_id": 123456,
+      "x": 0,
+      "y": 0
+    }
+  ]
+}

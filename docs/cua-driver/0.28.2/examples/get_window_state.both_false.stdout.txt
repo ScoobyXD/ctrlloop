@@ -1,0 +1,1 @@
+Nothing to return: both include_accessibility_tree:false and include_screenshot:false. Set at least one to true, or pass screenshot_out_file to force a capture.

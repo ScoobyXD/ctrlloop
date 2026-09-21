@@ -1,0 +1,16 @@
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [
+      {
+        "text": "Missing required integer field window_id. Use `list_windows` to enumerate the target app's windows, or read `launch_app`'s `windows` array.",
+        "type": "text"
+      }
+    ],
+    "isError": true,
+    "structuredContent": {
+      "code": "tool_invocation_failed"
+    }
+  }
+}

@@ -1,0 +1,3 @@
+- Pane "Program Manager"
+  - List "Desktop"
+    - [0] ListItem "Recycle Bin" [actions=[invoke,select]]

@@ -1,0 +1,137 @@
+{
+  "version": "0.28.2",
+  "platform": "x86_64-pc-windows-msvc",
+  "verification_date": "2026-09-21",
+  "verification_scope": "Read-only native Windows window discovery and selected-window UIA capture with screenshots disabled",
+  "result": "verified",
+  "runtime": {
+    "daemon_running": true,
+    "transport": "Windows named pipe",
+    "socket": "\\\\.\\pipe\\cua-driver",
+    "permission_mode": "standard",
+    "session_id": 1,
+    "desktop": "Default",
+    "doctor_ok": true,
+    "uia_com_creation": "succeeded",
+    "doctor_visible_window_count": 12,
+    "authorization_host": "unavailable",
+    "capability_manifest_configured": false,
+    "autostart": {
+      "task_name": "cua-driver-serve",
+      "status": "registered (running)",
+      "run_level": "Highest",
+      "logon_type": "Interactive",
+      "elevation_authorized_by_user": true
+    }
+  },
+  "sandbox_observation": {
+    "sandbox_desktop_visible_windows": 0,
+    "sandbox_named_pipe_access": "denied",
+    "verification_execution_context": "Authorized unsandboxed client connected to the official daemon on the interactive desktop"
+  },
+  "capture_target": {
+    "selection_source": "Actual list_windows response",
+    "app_name": "explorer.exe",
+    "window_title": "Program Manager",
+    "included_screenshot": false,
+    "included_accessibility_tree": true,
+    "max_elements": 100,
+    "max_depth": 8,
+    "indexed_elements_observed": 2,
+    "labels": ["Recycle Bin", "Learn about this picture"],
+    "query_observed": "Recycle",
+    "query_returned_element_count": 1,
+    "query_total_element_count": 2
+  },
+  "observed_operations": [
+    {
+      "transport": "CLI",
+      "tool": "list_windows",
+      "exit_code": 0,
+      "stdout_kind": "JSON structured payload",
+      "observed_window_count": 12,
+      "example": "examples/list_windows.output.json"
+    },
+    {
+      "transport": "CLI",
+      "tool": "get_accessibility_tree",
+      "exit_code": 0,
+      "stdout_kind": "JSON structured payload",
+      "observed_process_count": 348,
+      "observed_window_count": 12,
+      "example": "examples/get_accessibility_tree.output.json"
+    },
+    {
+      "transport": "CLI",
+      "tool": "get_window_state",
+      "exit_code": 0,
+      "stdout_kind": "JSON structured payload",
+      "example": "examples/get_window_state.output.json"
+    },
+    {
+      "transport": "CLI",
+      "tool": "get_window_state",
+      "case": "query projection",
+      "exit_code": 0,
+      "stdout_kind": "JSON structured payload",
+      "example": "examples/get_window_state.query.output.json"
+    },
+    {
+      "transport": "CLI",
+      "tool": "get_window_state",
+      "case": "missing window_id",
+      "exit_code": 0,
+      "stdout_kind": "Plain diagnostic text",
+      "example": "examples/get_window_state.missing_window_id.stdout.txt"
+    },
+    {
+      "transport": "CLI",
+      "tool": "get_window_state",
+      "case": "window belongs to a different pid",
+      "exit_code": 0,
+      "stdout_kind": "Plain diagnostic text",
+      "example": "examples/get_window_state.mismatched_owner.stdout.txt"
+    },
+    {
+      "transport": "CLI",
+      "tool": "get_window_state",
+      "case": "both include flags false",
+      "exit_code": 0,
+      "stdout_kind": "Plain diagnostic text",
+      "example": "examples/get_window_state.both_false.stdout.txt"
+    },
+    {
+      "transport": "MCP via existing daemon",
+      "tool": "get_window_state",
+      "case": "success",
+      "response_shape": "JSON-RPC result containing content and structuredContent; isError absent",
+      "example": "examples/mcp.get_window_state.output.json"
+    },
+    {
+      "transport": "MCP via existing daemon",
+      "tool": "get_window_state",
+      "case": "missing window_id",
+      "response_shape": "JSON-RPC result containing content, isError=true, structuredContent.code=tool_invocation_failed",
+      "example": "examples/mcp.get_window_state.missing_window_id.output.json"
+    }
+  ],
+  "sanitization": {
+    "samples_are_sanitized_live_captures": true,
+    "process_and_window_ids": "Consistent numeric replacements preserve types and relationships; not reusable live identifiers",
+    "list_windows": "Two Explorer records retained from twelve; the same records retained in _legacy_windows",
+    "get_accessibility_tree": "One Explorer process and its two windows retained from 348 processes and twelve windows",
+    "private_window_titles": "File Explorer folder title replaced with a string placeholder",
+    "native_tree": "Nonsensitive standard desktop labels and original structure retained",
+    "raw_capture_location": "%TEMP%\\ctrlloop-cua-0.28.2 (local only; not checked in)"
+  },
+  "limitations": [
+    "Native reading was verified on one existing Explorer Program Manager window; coverage for other applications depends on their UIA providers.",
+    "No GUI applications were launched, activated, clicked, typed into, or edited for verification.",
+    "No browser execution methods or screenshots were used.",
+    "The desktop must remain accessible to the service; the Codex sandbox itself exposes a separate empty desktop.",
+    "elements contains indexed rows, while unindexed ancestors can appear only in tree_markdown.",
+    "elements_complete was false on all observed Windows tree responses.",
+    "Input-validation failures can have CLI process exit code 0 and non-JSON stdout; MCP preserves the tool-error envelope."
+  ],
+  "verification_work_remaining": []
+}

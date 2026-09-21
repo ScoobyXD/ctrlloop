@@ -1,0 +1,14 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "on_screen_only": {
+      "description": "When true, drop windows that aren't currently on-screen. Default false.",
+      "type": "boolean"
+    },
+    "pid": {
+      "description": "Optional pid filter. When set, only this pid's windows are returned.",
+      "type": "integer"
+    }
+  },
+  "type": "object"
+}

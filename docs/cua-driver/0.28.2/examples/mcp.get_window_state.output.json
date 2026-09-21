@@ -1,0 +1,71 @@
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "content": [
+      {
+        "text": "window_id=123456 pid=4242 elements=2\n\n- Pane \"Program Manager\"\n  - List \"Desktop\"\n    - [0] ListItem \"Recycle Bin\" [actions=[invoke,select]]\n    - [1] ListItem \"Learn about this picture\" [actions=[invoke,select]]\n",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "_note": "Prefer `elements` — `tree_markdown` will continue to work but new fields will only be added to the structured side. Issue #22865: use `max_elements` / `max_depth` to bound the UIA walk on apps with very large trees.",
+      "app_name": "explorer.exe",
+      "element_count": 2,
+      "elements": [
+        {
+          "actions": [
+            "invoke",
+            "select"
+          ],
+          "depth": 2,
+          "element_index": 0,
+          "element_token": "s00000003:0",
+          "enabled": true,
+          "frame": {
+            "h": 104,
+            "w": 114,
+            "x": 0,
+            "y": 5
+          },
+          "label": "Recycle Bin",
+          "role": "ListItem",
+          "selected": false
+        },
+        {
+          "actions": [
+            "invoke",
+            "select"
+          ],
+          "depth": 2,
+          "element_index": 1,
+          "element_token": "s00000003:1",
+          "enabled": true,
+          "frame": {
+            "h": 129,
+            "w": 114,
+            "x": 114,
+            "y": 5
+          },
+          "label": "Learn about this picture",
+          "role": "ListItem",
+          "selected": false
+        }
+      ],
+      "elements_complete": false,
+      "pid": 4242,
+      "returned_element_count": 2,
+      "snapshot_id": "s00000003",
+      "total_element_count": 2,
+      "tree_markdown": "- Pane \"Program Manager\"\n  - List \"Desktop\"\n    - [0] ListItem \"Recycle Bin\" [actions=[invoke,select]]\n    - [1] ListItem \"Learn about this picture\" [actions=[invoke,select]]\n",
+      "window_bounds": {
+        "height": 1800,
+        "width": 2880,
+        "x": 0,
+        "y": 0
+      },
+      "window_id": 123456,
+      "window_title": "Program Manager"
+    }
+  }
+}

@@ -1,0 +1,1 @@
+window_id 123456 belongs to pid 4242, not pid 4343. Call `list_windows({"pid": 4343})` to get this pid's own windows.

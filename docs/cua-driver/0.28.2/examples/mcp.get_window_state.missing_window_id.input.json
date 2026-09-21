@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "get_window_state",
+    "arguments": {
+      "pid": 4242,
+      "include_screenshot": false
+    }
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "_legacy_windows": [
+    {
+      "height": 39,
+      "is_on_screen": false,
+      "minimized": true,
+      "pid": 4242,
+      "title": "<folder title> - File Explorer",
+      "width": 219,
+      "window_id": 123457,
+      "x": -31991,
+      "y": -32000
+    },
+    {
+      "height": 1800,
+      "is_on_screen": true,
+      "minimized": false,
+      "pid": 4242,
+      "title": "Program Manager",
+      "width": 2880,
+      "window_id": 123456,
+      "x": 0,
+      "y": 0
+    }
+  ],
+  "current_space_id": null,
+  "windows": [
+    {
+      "app_name": "explorer.exe",
+      "bounds": {
+        "height": 39,
+        "width": 219,
+        "x": -31991,
+        "y": -32000
+      },
+      "is_on_screen": false,
+      "layer": 0,
+      "minimized": true,
+      "pid": 4242,
+      "title": "<folder title> - File Explorer",
+      "window_id": 123457,
+      "z_index": 6
+    },
+    {
+      "app_name": "explorer.exe",
+      "bounds": {
+        "height": 1800,
+        "width": 2880,
+        "x": 0,
+        "y": 0
+      },
+      "is_on_screen": true,
+      "layer": 0,
+      "minimized": false,
+      "pid": 4242,
+      "title": "Program Manager",
+      "window_id": 123456,
+      "z_index": 0
+    }
+  ]
+}

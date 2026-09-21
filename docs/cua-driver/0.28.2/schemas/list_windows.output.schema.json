@@ -1,0 +1,151 @@
+{
+  "anyOf": [
+    {
+      "additionalProperties": true,
+      "properties": {
+        "current_space_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "windows": {
+          "items": {
+            "properties": {
+              "app_name": {
+                "type": "string"
+              },
+              "bounds": {
+                "properties": {
+                  "height": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "width": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "x": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "y": {
+                    "format": "double",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y",
+                  "width",
+                  "height"
+                ],
+                "type": "object"
+              },
+              "current_space_id": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "is_on_screen": {
+                "type": "boolean"
+              },
+              "layer": {
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "minimized": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "on_current_space": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "pid": {
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "space_ids": {
+                "items": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "window_id": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "z_index": {
+                "description": "Higher values are closer to the front. Null means the provider cannot observe stacking order; callers must not infer an order from array position or treat null as zero.",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "window_id",
+              "pid",
+              "app_name",
+              "title",
+              "bounds",
+              "is_on_screen",
+              "z_index"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "windows"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": true,
+      "anyOf": [
+        {
+          "required": [
+            "refusal"
+          ]
+        },
+        {
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "required": [
+            "code"
+          ]
+        }
+      ],
+      "type": "object"
+    }
+  ],
+  "type": "object"
+}
