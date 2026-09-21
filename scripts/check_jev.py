@@ -11,7 +11,7 @@ from typesafe_sdk import Noul, RetryPolicy, TypeSafeClient, TypeSafeError
 
 
 def main() -> int:
-    project_dir = Path(__file__).resolve().parent
+    project_dir = Path(__file__).resolve().parents[1]
     load_dotenv(project_dir / ".env", override=False, interpolate=False)
     config = tomllib.loads((project_dir / "pyproject.toml").read_text(encoding="utf-8"))
     model = config["tool"]["ctrlloop"]["jev-model"]
