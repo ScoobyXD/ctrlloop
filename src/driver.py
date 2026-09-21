@@ -20,6 +20,54 @@ from typing import Any
 class DriverError(Exception):
     """A sanitized driver transport, refusal, or observation-contract error."""
 
+    def __init__(
+        self, message: str, *, code: str = "driver_error", tool: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.tool = tool
+        self.exit_code = exit_code
+        self.context: dict[str, Any] = {}
+
+    def details(self) -> dict[str, Any]:
+        details = {"code": self.code, **self.context}
+        if self.tool is not None:
+            details["tool"] = self.tool
+        if self.exit_code is not None:
+            details["exit_code"] = self.exit_code
+        return details
+
+
+def _failure(tool: str, exit_code: int, diagnostic: str) -> DriverError:
+    """Recognize useful error categories without echoing private driver output."""
+    text = diagnostic.casefold()
+    if "connect to named pipe" in text and "access is denied" in text:
+        code, reason = "pipe_access_denied", "Access to the existing CUA daemon pipe was denied."
+    elif ("approval" in text or "authorization host" in text) and "unavailable" in text:
+        code, reason = "approval_unavailable", "CUA requires an approval host that is unavailable."
+    elif any(marker in text for marker in ("approval_required", "requires approval", "approval required")):
+        code, reason = "approval_required", "CUA requires approval for this read."
+    elif any(marker in text for marker in (
+        "permission denied", "permission_denied", "authorization denied",
+        "access is denied", "access denied", "not authorized",
+    )):
+        code, reason = "access_denied", "CUA denied access for this read."
+    elif "belongs to pid" in text:
+        code, reason = "window_owner_mismatch", "The window no longer belongs to the selected process; rediscover windows."
+    elif any(marker in text for marker in ("invalid window handle", "window not found", "0x80070578")):
+        code, reason = "window_unavailable", "The selected window is no longer available; rediscover windows."
+    elif "timed out" in text or "timeout" in text:
+        code, reason = "driver_timeout", "The driver timed out while processing the read."
+    elif "daemon" in text and any(marker in text for marker in ("not running", "failed to connect", "connection refused")):
+        code, reason = "daemon_unavailable", "The existing CUA daemon could not be reached."
+    else:
+        code, reason = "driver_call_failed", "The CLI did not provide a recognized diagnostic."
+    return DriverError(
+        f"CUA Driver {tool} failed (exit {exit_code}). {reason}",
+        code=code, tool=tool, exit_code=exit_code,
+    )
+
 
 def _integer(value: Any, minimum: int = 0, maximum: int | None = None) -> bool:
     return (
@@ -117,7 +165,9 @@ class CuaDriver:
                 **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
             )
         except subprocess.TimeoutExpired:
-            raise DriverError(f"CUA Driver {tool} timed out; verify daemon and provider availability.") from None
+            raise DriverError(
+                f"CUA Driver {tool} exceeded the client timeout.", code="client_timeout", tool=tool
+            ) from None
         except FileNotFoundError:
             raise DriverError("CUA Driver executable was not found; supply its installed path.") from None
         except OSError:
@@ -125,13 +175,16 @@ class CuaDriver:
         except UnicodeError:
             raise DriverError("CUA Driver output could not be decoded as UTF-8.") from None
         if result.returncode != 0:
-            raise DriverError(
-                f"CUA Driver {tool} failed (exit {result.returncode}); "
-                "check access to the existing interactive-desktop daemon."
+            # Do not inspect success-looking JSON/tree output as a diagnostic.
+            diagnostic = result.stderr or (
+                result.stdout if not result.stdout.lstrip().startswith(("{", "[")) else ""
             )
+            raise _failure(tool, result.returncode, diagnostic)
         try:
             payload = json.loads(result.stdout, parse_constant=_reject_json_constant)
         except (TypeError, ValueError):
+            if not result.stdout.lstrip().startswith(("{", "[")):
+                raise _failure(tool, result.returncode, result.stdout or result.stderr) from None
             raise DriverError(
                 f"CUA Driver {tool} did not return structured JSON; "
                 "the CLI may have reported a tool error despite exit zero."
@@ -141,7 +194,11 @@ class CuaDriver:
         # The advertised refusal alternative has no stable value enum. None of
         # these markers is in the documented success payload, so fail closed.
         if any(key in payload for key in ("refusal", "status", "code", "error")):
-            raise DriverError(f"CUA Driver {tool} returned a refusal or status response.")
+            diagnostic = " ".join(
+                payload[key] for key in ("code", "status", "refusal", "error")
+                if isinstance(payload.get(key), str)
+            )
+            raise _failure(tool, result.returncode, diagnostic)
         if "isError" in payload and payload["isError"] is not False:
             raise DriverError(f"CUA Driver {tool} returned a tool error.")
         return payload

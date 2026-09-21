@@ -5,8 +5,10 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
 if __package__:
+    from .driver import DriverError
     from .selection import Candidate, ChoiceSelector
 else:
+    from driver import DriverError
     from selection import Candidate, ChoiceSelector
 
 
@@ -98,7 +100,22 @@ def run_pipeline(
         result.reason = "Window discovery returned no candidates."
         return result
     result.window = window_selection.winner.record
-    snapshot = driver.get_window_state(result.window)
+    try:
+        snapshot = driver.get_window_state(result.window)
+    except DriverError as error:
+        error.context.update({
+            "stage": "get_window_state",
+            "window": {
+                name: result.window[name]
+                for name in (
+                    "pid", "window_id", "app_name", "title", "bounds",
+                    "is_on_screen", "minimized",
+                )
+                if name in result.window
+            },
+            "selections": result.selections,
+        })
+        raise
     result.snapshot_id = snapshot.get("snapshot_id")
     result.observation = {
         name: snapshot[name]

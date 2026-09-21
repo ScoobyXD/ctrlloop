@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from src.driver import DriverError
 from src.pipeline import PipelineResult, control_candidates, run_pipeline, window_candidates
 from src.selection import ChoiceSelector, PINNED_MODEL, QUESTION
 
@@ -114,6 +115,56 @@ class PipelineTests(unittest.TestCase):
         self.assertIsNone(result.control)
         self.assertEqual(driver.calls, [("list_windows",)])
         self.assertEqual(client.calls, [])
+
+    def test_failed_window_read_preserves_selection_without_retry_or_control_judgment(self):
+        windows = [make_window(index) for index in range(11)]
+        windows[-1].update({
+            "bounds": {"x": 0, "y": 0, "width": 800, "height": 600},
+            "is_on_screen": True, "minimized": False,
+            "unrelated_data": "RAW BODY SECRET",
+        })
+        error = DriverError(
+            "Window read failed.", code="driver_call_failed",
+            tool="get_window_state", exit_code=1,
+        )
+        driver = ObservingDriver(windows, {})
+        client = ChoosingClient()
+
+        def failed_read(window):
+            driver.calls.append(("get_window_state", window))
+            raise error
+
+        with patch.object(driver, "get_window_state", side_effect=failed_read):
+            with self.assertRaises(DriverError) as raised:
+                run_pipeline("Find save", driver, ChoiceSelector(client))
+
+        self.assertIs(raised.exception, error)
+        self.assertEqual(error.context["stage"], "get_window_state")
+        self.assertEqual(error.context["window"], {
+            key: value for key, value in windows[-1].items() if key != "unrelated_data"
+        })
+        self.assertEqual(
+            [round_["candidate_count"] for round_ in error.context["selections"]["windows"]],
+            [11, 2],
+        )
+        self.assertNotIn("controls", error.context["selections"])
+        self.assertNotIn("RAW BODY SECRET", json.dumps(error.details()))
+        self.assertEqual(driver.calls, [("list_windows",), ("get_window_state", windows[-1])])
+        self.assertEqual(len(client.calls), 2)
+        self.assertTrue(all(
+            key.startswith("windows_") for call in client.calls for key in call["questions"]
+        ))
+
+    def test_failed_window_read_does_not_fabricate_optional_window_metadata(self):
+        window = make_window()
+        driver = ObservingDriver([window], {})
+        error = DriverError("Window read failed.")
+        with patch.object(driver, "get_window_state", side_effect=error) as read:
+            with self.assertRaises(DriverError):
+                run_pipeline("Find save", driver, ChoiceSelector(ChoosingClient()))
+        read.assert_called_once_with(window)
+        self.assertEqual(error.context["window"], window)
+        self.assertEqual(error.context["selections"], {"windows": []})
 
     def test_empty_degraded_and_unavailable_reads_are_distinct(self):
         cases = [
@@ -269,6 +320,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output["status"], "error")
         self.assertNotIn("secret-token-and-body", output["error"])
         self.assertIn("OSError", output["error"])
+
+    def test_driver_failure_prints_safe_diagnostics_and_completed_window_selection(self):
+        error = DriverError(
+            "Window read failed.", code="driver_call_failed",
+            tool="get_window_state", exit_code=1,
+        )
+        error.context.update({
+            "stage": "get_window_state", "window": make_window(),
+            "selections": {"windows": []},
+        })
+        status, output, pipeline, _, _ = self.invoke(["Find Save"], error=error)
+        self.assertEqual(status, 1)
+        self.assertEqual(output, {
+            "status": "error", "error": "Window read failed.",
+            "code": "driver_call_failed", "tool": "get_window_state", "exit_code": 1,
+            "stage": "get_window_state", "window": make_window(),
+            "selections": {"windows": []},
+        })
+        pipeline.assert_called_once()
 
     def test_blank_request_is_rejected_before_clients(self):
         status, output, pipeline, client, driver = self.invoke([" \r\n "])

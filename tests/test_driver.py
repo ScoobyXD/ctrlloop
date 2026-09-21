@@ -174,6 +174,48 @@ class DriverTests(unittest.TestCase):
             driver.list_windows()
         self.assertNotIn("private", str(raised.exception))
 
+    def test_driver_diagnostics_distinguish_transport_provider_and_target_failures(self):
+        cases = (
+            ("connect to named pipe: Access is denied. (os error 5)", "pipe_access_denied"),
+            ("authorization host unavailable", "approval_unavailable"),
+            ("approval_required", "approval_required"),
+            ("permission denied", "access_denied"),
+            ("window_id 17 belongs to pid 42, not pid 43", "window_owner_mismatch"),
+            ("Invalid window handle 0x80070578", "window_unavailable"),
+            ("UIA snapshot timed out", "driver_timeout"),
+            ("daemon failed to connect", "daemon_unavailable"),
+            ("unknown private diagnostic", "driver_call_failed"),
+        )
+        for diagnostic, code in cases:
+            with self.subTest(code=code):
+                driver, _ = self.driver(subprocess.CompletedProcess(
+                    [], 1, '{"tree_markdown":"private snapshot"}', diagnostic + " private-secret"
+                ))
+                with self.assertRaises(DriverError) as raised:
+                    driver.get_window_state(window())
+                self.assertEqual(raised.exception.details(), {
+                    "code": code, "tool": "get_window_state", "exit_code": 1,
+                })
+                self.assertNotIn("private", str(raised.exception))
+                if code != "pipe_access_denied" and code != "daemon_unavailable":
+                    self.assertNotIn("daemon", str(raised.exception))
+
+    def test_zero_exit_tool_error_preserves_recognized_diagnostic(self):
+        driver, _ = self.driver(subprocess.CompletedProcess(
+            [], 0, "window_id 17 belongs to pid 42, not pid 43", ""
+        ))
+        with self.assertRaises(DriverError) as raised:
+            driver.get_window_state(window())
+        self.assertEqual(raised.exception.code, "window_owner_mismatch")
+        self.assertEqual(raised.exception.exit_code, 0)
+
+    def test_structured_permission_refusal_has_safe_diagnostic_code(self):
+        driver, _ = self.driver({"code": "permission_denied", "error": "private-secret"})
+        with self.assertRaises(DriverError) as raised:
+            driver.get_window_state(window())
+        self.assertEqual(raised.exception.code, "access_denied")
+        self.assertNotIn("private-secret", str(raised.exception))
+
     def test_structured_refusals_do_not_pass_as_success(self):
         for marker in ("refusal", "status", "code", "error", "isError"):
             for success in ({"windows": []}, state()):

@@ -62,6 +62,11 @@ with TypeSafeClient(model=PINNED_MODEL, retry=RetryPolicy(max_retries=0)) as cli
 
 The Python API raises `DriverError` or `SelectionError` for failures. The CLI
 reports them as `{"status":"error","error":"..."}` with exit code 1.
+Driver errors also include a safe diagnostic `code`, tool and process exit code
+when available. A failed window read retains its stage, selected window metadata,
+and completed window-selection rounds. Raw driver stdout/stderr and UI trees are
+not copied into error messages. An unknown driver failure is reported as unknown;
+it is not automatically attributed to daemon access.
 
 | Status | Meaning | CLI exit |
 | --- | --- | --- |
@@ -75,6 +80,24 @@ reports them as `{"status":"error","error":"..."}` with exit code 1.
 Nonempty degraded observations remain selectable and retain their quality flags.
 `selected` means selection completed, not that the user's original UI operation
 was performed or that the chosen control is guaranteed to fulfill it.
+
+## Debug in VS Code
+
+Open this repository folder in VS Code and select **ctrlloop: step through main**
+in Run and Debug. Press **F5**, enter the original request, and the debugger pauses
+at the entry point. The checked-in launch configuration uses `.venv` and the
+integrated terminal. Set a breakpoint on the first line inside `main()` to skip
+imports; **F10** steps over a line and **F11** steps into a function. Use the
+Variables panel or Debug Console to inspect values.
+
+For a window-read failure, break on `driver.get_window_state(result.window)` in
+`src/pipeline.py` and inspect `result.window`. Inside `src/driver.py`, `result`
+holds the CLI's exit code and separate stdout/stderr after the subprocess returns.
+Inspect those locally when the safe diagnostic code is insufficient.
+
+`python -m pdb src/main.py ...` starts the separate terminal debugger: `(Pdb)` is
+a prompt waiting for debugger commands, not application output. It does not use
+VS Code's graphical breakpoints. See the [VS Code Python debugger guide](https://code.visualstudio.com/docs/python/debugging).
 
 ## Selection contract
 

@@ -76,7 +76,8 @@ def main(argv: list[str] | None = None) -> int:
             message = str(error)
         else:
             message = f"Pipeline failed: {type(error).__name__}. Check local configuration and connectivity."
-        print(json.dumps({"status": "error", "error": message}, ensure_ascii=False))
+        details = error.details() if isinstance(error, DriverError) else {}
+        print(json.dumps({"status": "error", "error": message, **details}, ensure_ascii=False))
         return 1
 
 
