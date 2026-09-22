@@ -23,6 +23,7 @@ class Driver(Protocol):
     def get_window_state(self, window: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def click(self, arguments: Mapping[str, Any]) -> dict[str, Any]: ...
+    def bring_to_front(self, arguments: Mapping[str, Any]) -> dict[str, Any]: ...
 
 
 @dataclass
@@ -107,8 +108,9 @@ def run_pipeline(
 
     Real controls belong to their saved observations only. Synthetic controls
     are semantic destinations and cannot be clicked. Native click results report
-    action facts, not completion of the original request. No post-action read,
-    retry, foreground escalation, or extra Jev stage runs here.
+    action facts, not completion of the original request. Every selected real
+    window is brought forward before obtaining the control snapshot, including
+    runs without a click. No post-click read, retry or extra Jev stage runs here.
     """
     windows = driver.list_windows()
     if report is not None:
@@ -130,6 +132,25 @@ def run_pipeline(
             "coverage": "application-defined controls; no live control snapshot was taken",
         }
     else:
+        arguments = {name: result.window.get(name) for name in ("pid", "window_id")}
+        if report is not None:
+            report.append("action_requested", tool="bring_to_front", arguments=arguments)
+        try:
+            foreground_result = driver.bring_to_front(arguments)
+        except DriverError as error:
+            error.context.update({"stage": "bring_to_front", "selection": result.to_dict()})
+            raise
+        if report is not None:
+            try:
+                report.append("action_returned", tool="bring_to_front", action_result=foreground_result)
+            except (OSError, ValueError):
+                # Focus changed even if the report write failed. Preserve that
+                # fact for callers and stop before taking any further action.
+                error = DriverError("The window was brought forward, but its result could not be saved.",
+                                    code="report_write_failed", tool="bring_to_front")
+                error.context.update(stage="bring_to_front", selection=result.to_dict(),
+                                     action_result=foreground_result)
+                raise error from None
         try:
             snapshot = driver.get_window_state(result.window)
         except DriverError as error:

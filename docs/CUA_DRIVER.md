@@ -101,10 +101,15 @@ From the ctrlloop repository, with its dependencies and `TYPESAFE_API_KEY` confi
 uv run --locked python src/main.py --click 'Click the Test button in my test window.'
 ```
 
-Omit `--click` to keep selection-only behavior. The pipeline dispatches the
+Omit `--click` to select a control without clicking it. Every selected real
+window is always brought forward using native `bring_to_front({pid, window_id})`
+before the control snapshot is captured. A refusal stops execution; the report
+records the activation request and native result as action events. This also
+applies to runs without `--click` and windows that are not minimized.
+With `--click`, the pipeline dispatches the
 selected record's `pid`, `window_id`, and `element_token` (or the matching index
 and snapshot pair), returns the native `action_result`, and stops. It does not
-take a post-action snapshot or retry. Synthetic Start Menu/Search selections
+take a post-click snapshot or retry. Synthetic Start Menu/Search selections
 return `no_action`; opening Start and typing are deferred.
 
 `action_returned`/exit 0 means the driver returned action facts, including an

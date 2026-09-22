@@ -10,7 +10,7 @@ from src.driver import CuaDriver, DriverError
 from src.pipeline import run_pipeline
 from src.selection import ChoiceSelector, PINNED_MODEL
 from src.synthetic import START_MENU_KEY
-from test_driver import FakeRunner, element, state, window
+from test_driver import FakeRunner, element, state, window, foreground_result
 from test_pipeline import ChoosingClient, RecordingReport
 
 
@@ -23,6 +23,7 @@ class ClickPipelineTests(unittest.TestCase):
     def set_up_run(self, *, snapshot=None, windows=None, action_result=None, preferred_key=None):
         runner = FakeRunner(
             {"windows": [window()] if windows is None else windows},
+            foreground_result((windows or [window()])[-1]),
             state(elements=[element(element_token="observed-token")]) if snapshot is None else snapshot,
             ACTION_RESULT if action_result is None else action_result,
         )
@@ -49,6 +50,7 @@ class ClickPipelineTests(unittest.TestCase):
         self.assertEqual(result.snapshot_id, snapshot["snapshot_id"])
         self.assertEqual([call[0] for call in runner.calls], [
             ["fake-cua", "call", "list_windows"],
+            ["fake-cua", "call", "bring_to_front"],
             ["fake-cua", "call", "get_window_state"],
             ["fake-cua", "call", "click"],
         ])
@@ -74,7 +76,7 @@ class ClickPipelineTests(unittest.TestCase):
             "pid": 4242, "window_id": 123456,
             "element_index": 901, "snapshot_id": "snapshot:chosen",
         })
-        self.assertEqual(len(runner.calls), 3)
+        self.assertEqual(len(runner.calls), 4)
         self.assertEqual(len(client.calls), 1)  # One control needs no Jev question.
 
     def test_selection_only_remains_the_default(self):
@@ -84,7 +86,7 @@ class ClickPipelineTests(unittest.TestCase):
 
         self.assertEqual(result.status, "selected")
         self.assertIsNone(result.action_result)
-        self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows", "get_window_state"])
+        self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows", "bring_to_front", "get_window_state"])
 
     def test_synthetic_start_search_stops_without_a_snapshot_or_native_action(self):
         for windows in ([], [window()]):
@@ -116,7 +118,7 @@ class ClickPipelineTests(unittest.TestCase):
 
                 self.assertEqual(result.status, status)
                 self.assertIsNone(result.action_result)
-                self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows", "get_window_state"])
+                self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows", "bring_to_front", "get_window_state"])
 
     def test_native_refusals_preserve_the_result_without_retry_or_reselection(self):
         for code in ("stale_element_token", "background_unavailable"):
@@ -134,7 +136,7 @@ class ClickPipelineTests(unittest.TestCase):
                 self.assertEqual(raised.exception.context["action_result"], native_result)
                 self.assertEqual(raised.exception.exit_code, 0)
                 self.assertEqual([call[0][-1] for call in runner.calls], [
-                    "list_windows", "get_window_state", "click",
+                    "list_windows", "bring_to_front", "get_window_state", "click",
                 ])
                 self.assertEqual(len(client.calls), 1)
 
@@ -146,7 +148,7 @@ class ClickPipelineTests(unittest.TestCase):
                 append_original = report.append
 
                 def append_until_action(event, **data):
-                    if event == "action_returned":
+                    if event == "action_returned" and data.get("tool") != "bring_to_front":
                         raise report_error
                     append_original(event, **data)
 
@@ -159,7 +161,7 @@ class ClickPipelineTests(unittest.TestCase):
                 self.assertEqual(result.status, "action_returned")
                 self.assertEqual(result.action_result, ACTION_RESULT)
                 self.assertEqual([call[0][-1] for call in runner.calls], [
-                    "list_windows", "get_window_state", "click",
+                    "list_windows", "bring_to_front", "get_window_state", "click",
                 ])
                 self.assertEqual(report.events[-1]["event"], "action_requested")
                 self.assertIn("Could not save the action result", " ".join(logged.output))
@@ -173,7 +175,7 @@ class ClickPipelineTests(unittest.TestCase):
                 append_original = report.append
 
                 def append_until_request(event, **data):
-                    if event == "action_requested":
+                    if event == "action_requested" and data.get("tool") != "bring_to_front":
                         raise report_error
                     append_original(event, **data)
 
@@ -182,7 +184,7 @@ class ClickPipelineTests(unittest.TestCase):
                         run_pipeline("Click Save", driver, ChoiceSelector(client), execute_click=True, report=report)
 
                 self.assertIs(raised.exception, report_error)
-                self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows", "get_window_state"])
+                self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows", "bring_to_front", "get_window_state"])
                 self.assertEqual(report.events[-1]["event"], "control_selected")
 
 

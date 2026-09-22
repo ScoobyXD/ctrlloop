@@ -24,6 +24,12 @@ def window(**updates):
     return record
 
 
+def foreground_result(w):
+    return {"landed_on_target": True, "now_fg_hwnd": hex(w["window_id"]),
+            "target_hwnd": hex(w["window_id"]), "previous_fg_hwnd": "0x123",
+            "restored": False, "raised": True}
+
+
 def element(**updates):
     record = {"element_index": 17, "role": "Button", "depth": 3}
     record.update(updates)
@@ -98,7 +104,7 @@ class DriverTests(unittest.TestCase):
 
     def test_other_actions_cannot_be_requested_even_through_private_dispatch(self):
         driver, runner = self.driver()
-        for tool in ("type_text", "launch_app", "bring_to_front", "get_desktop_state", "serve"):
+        for tool in ("type_text", "launch_app", "get_desktop_state", "serve"):
             with self.subTest(tool=tool), self.assertRaises(DriverError):
                 driver._call(tool, {})
         self.assertEqual(runner.calls, [])

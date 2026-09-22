@@ -1,1 +1,1 @@
-"""Application modules for read-only window and control selection with Jev."""
+"""Window selection, activation, and optional control clicking with Jev."""

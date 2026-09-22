@@ -59,6 +59,10 @@ def _failure(tool: str, exit_code: int, diagnostic: str) -> DriverError:
         code, reason = "snapshot_id_required", "CUA requires the observed snapshot identity for this target."
     elif "background_unavailable" in text:
         code, reason = "background_unavailable", "CUA refused background delivery; no escalation was attempted."
+    elif "window_minimized" in text:
+        code, reason = "window_minimized", "CUA requires the minimized window to be restored before this action."
+    elif "foreground_unavailable" in text:
+        code, reason = "foreground_unavailable", "CUA could not bring the selected window to the foreground."
     elif "belongs to pid" in text:
         code, reason = "window_owner_mismatch", "The window no longer belongs to the selected process; rediscover windows."
     elif any(marker in text for marker in ("invalid window handle", "window not found", "0x80070578")):
@@ -137,12 +141,12 @@ def _reject_json_constant(value: str) -> None:
 
 
 class CuaDriver:
-    """Discover windows, capture accessibility state, and dispatch one click.
+    """Discover and activate windows, capture state, and dispatch native clicks.
 
     Optional/nullable observation fields are preserved, including missing
     elements or snapshot identity. The pipeline decides whether that observation
     is usable. A false ``elements_complete`` flag is normal on Windows 0.28.2.
-    No method starts the daemon or changes window focus.
+    No method starts the daemon. bring_to_front explicitly changes window focus.
     """
 
     def __init__(
@@ -167,8 +171,8 @@ class CuaDriver:
         self._runner = runner or subprocess.run
 
     def _call(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        if tool not in {"list_windows", "get_window_state", "click"}:
-            raise DriverError("Only window reads and a single click are available.")
+        if tool not in {"list_windows", "get_window_state", "click", "bring_to_front"}:
+            raise DriverError("Only window reads, bring_to_front, and a single click are available.")
         try:
             result = self._runner(
                 [self.executable, "call", tool],
@@ -192,7 +196,7 @@ class CuaDriver:
         except UnicodeError:
             raise DriverError("CUA Driver output could not be decoded as UTF-8.") from None
         if result.returncode != 0:
-            if tool == "click":
+            if tool in {"click", "bring_to_front"}:
                 try:
                     payload = json.loads(result.stdout, parse_constant=_reject_json_constant)
                 except (TypeError, ValueError):
@@ -217,9 +221,18 @@ class CuaDriver:
             ) from None
         if not isinstance(payload, dict):
             raise DriverError(f"CUA Driver {tool} did not return an object.")
-        if tool == "click":
+        if tool in {"click", "bring_to_front"}:
             # Action facts use a different native contract from observations.
             # In particular, an effect of "unverifiable" is a legitimate result.
+            if (
+                any(key in payload for key in ("refusal", "code", "error"))
+                or ("isError" in payload and payload["isError"] is not False)
+                or ("status" in payload and payload["status"] != "success")
+                or payload.get("effect") == "refused"
+            ):
+                error = _failure(tool, 0, _action_diagnostic(payload))
+                error.context["action_result"] = payload
+                raise error
             return payload
         # The advertised refusal alternative has no stable value enum. None of
         # these markers is in the documented success payload, so fail closed.
@@ -231,6 +244,28 @@ class CuaDriver:
             raise _failure(tool, result.returncode, diagnostic)
         if "isError" in payload and payload["isError"] is not False:
             raise DriverError(f"CUA Driver {tool} returned a tool error.")
+        return payload
+
+    def bring_to_front(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Restore and activate the exact observed window using native CUA."""
+        if (
+            not isinstance(arguments, Mapping)
+            or set(arguments) != {"pid", "window_id"}
+            or not _integer(arguments.get("pid"), 1, 2**32 - 1)
+            or not _integer(arguments.get("window_id"), 1, 2**64 - 1)
+        ):
+            raise DriverError("bring_to_front requires an observed pid/window_id pair.",
+                              code="invalid_window_target", tool="bring_to_front")
+        payload = self._call("bring_to_front", arguments)
+        if (
+            payload.get("landed_on_target") is not True
+            or payload.get("now_fg_hwnd") != hex(arguments["window_id"])
+            or payload.get("target_hwnd") != hex(arguments["window_id"])
+        ):
+            error = DriverError("CUA did not confirm foreground activation of the selected window.",
+                                code="invalid_action_result", tool="bring_to_front")
+            error.context["action_result"] = payload
+            raise error
         return payload
 
     def click(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -265,15 +300,6 @@ class CuaDriver:
             raise DriverError("Click requires an observed element_token or element_index with snapshot_id.",
                               code="invalid_click_target", tool="click")
         payload = self._call("click", arguments)
-        if (
-            any(key in payload for key in ("refusal", "code", "error"))
-            or ("isError" in payload and payload["isError"] is not False)
-            or ("status" in payload and payload["status"] != "success")
-            or payload.get("effect") == "refused"
-        ):
-            error = _failure("click", 0, _action_diagnostic(payload))
-            error.context["action_result"] = payload
-            raise error
         # These are the public 0.28.2 ActionResult facts, not OS dispatch names.
         effect, route = payload.get("effect"), payload.get("route")
         if (

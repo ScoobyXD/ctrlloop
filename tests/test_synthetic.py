@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import unittest
 
 from src.pipeline import run_pipeline, window_candidates
+from test_driver import foreground_result
 from src.selection import Candidate, ChoiceSelector, PINNED_MODEL
 from src.synthetic import (
     DEFAULT_REGISTRY, START_MENU_KEY,
@@ -57,6 +58,10 @@ class ObservingDriver:
     def list_windows(self):
         self.calls.append(("list_windows",))
         return self.windows
+
+    def bring_to_front(self, arguments):
+        self.calls.append(("bring_to_front", arguments))
+        return foreground_result(arguments)
 
     def get_window_state(self, window):
         self.calls.append(("get_window_state", window))
@@ -239,7 +244,7 @@ class SyntheticPipelineTests(unittest.TestCase):
         self.assertIs(result.control, control)
         self.assertEqual(result.snapshot_id, "real")
         self.assertNotIn("synthetic", result.window)
-        self.assertEqual(driver.calls, [("list_windows",), ("get_window_state", start)])
+        self.assertEqual(driver.calls, [("list_windows",), ("bring_to_front", {"pid": 1, "window_id": 2}), ("get_window_state", start)])
         self.assertEqual(client.calls, [])
 
     def test_empty_registry_and_no_real_windows_returns_no_windows(self):

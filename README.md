@@ -6,12 +6,16 @@ Windows UI Automation, then its observed controls are offered for selection.
 Choosing Start Menu instead offers exactly one synthetic **Search** text field.
 The result is JSON containing the selected records, their observation information,
 and selection rounds. Add `--click` to execute one CUA click on the selected real
-control, return its native action result, then stop.
+control, return its native action result, then stop. Every selected real window
+is brought to the foreground using CUA `bring_to_front({pid, window_id})` before
+taking the control snapshot, regardless of its minimized state or `--click`.
+Activation failures stop the run; native results are retained in the report.
 
 Selection retains identities in Python. Without `--click`, a request such as
-“Click Recycle Bin” only selects a candidate. Click execution uses the control's
+“Click Recycle Bin” brings the selected window forward and selects a control,
+but does not click it. Click execution uses the control's
 existing snapshot-bound target and CUA's default background delivery. There is no
-post-action snapshot, retry, reselection, foreground escalation, coordinate
+post-click snapshot, retry, reselection, automatic click escalation, coordinate
 fallback, typing, or additional Jev planning stage.
 
 The Start Menu route is available even when the real menu is closed. An observed
@@ -118,10 +122,10 @@ uv run --locked python -m unittest discover -s tests -v
 
 The source modules live directly in `src/` and feed into `src/main.py`:
 
-- `driver.py` discovers windows, reads accessibility state, and dispatches one native click.
+- `driver.py` discovers and activates windows, reads accessibility state, and dispatches native clicks.
 - `selection.py` batches Jev Choice questions and advances one winner per group.
 - `synthetic.py` defines synthetic windows, their controls, and duplicate-matching rules.
-- `pipeline.py` connects discovery, selection, the snapshot read, and optional click execution.
+- `pipeline.py` connects window selection, activation, a fresh snapshot, control selection, and optional clicking.
 - `reporting.py` appends durable run events and captures the actual Jev HTTP bodies.
 - `main.py` provides the CLI, loads configuration, and prints the result.
 

@@ -224,7 +224,13 @@ For MCP consumption: handle JSON-RPC errors first; then check `result.isError`, 
 
 ## 7. Single-click contract
 
-ctrlloop's `--click` option adds one `cua-driver call click` after the existing
+ctrlloop brings every selected real window forward with native
+`bring_to_front({pid, window_id})` before taking the control snapshot. Activation
+must confirm the exact target; refusals stop the run and preserve native facts.
+The result contract is defined by the versioned
+[Windows implementation](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs#L9191-L9218).
+
+The `--click` option adds one `cua-driver call click` after the existing
 selection. The input is `{pid, window_id, element_token}` copied from the selected
 native records. If no token is present, it uses `{pid, window_id, element_index,
 snapshot_id}` from that same observation. Bare indices and guessed identifiers

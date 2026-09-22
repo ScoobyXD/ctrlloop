@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from src.driver import DriverError
+from test_driver import foreground_result
 from src.pipeline import (
     PipelineResult, control_candidates,
     run_pipeline, window_candidates,
@@ -64,7 +65,7 @@ class ChoosingClient:
 
 
 class ObservingDriver:
-    """Intentionally has no action, screenshot, or focus API."""
+    """Observe and bring forward; deliberately has no click or screenshot API."""
 
     def __init__(self, windows, snapshot):
         self.windows = windows
@@ -74,6 +75,10 @@ class ObservingDriver:
     def list_windows(self):
         self.calls.append(("list_windows",))
         return self.windows
+
+    def bring_to_front(self, arguments):
+        self.calls.append(("bring_to_front", arguments))
+        return foreground_result(arguments)
 
     def get_window_state(self, window):
         self.calls.append(("get_window_state", window))
@@ -110,8 +115,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.control["element_index"], 1000)
         self.assertEqual(result.control["element_token"], "snapshot-secret:100")
         self.assertEqual(result.snapshot_id, "snapshot-secret")
-        self.assertEqual(driver.calls, [("list_windows",), ("get_window_state", windows[-1])])
-        self.assertIs(driver.calls[1][1], windows[-1])
+        self.assertEqual(driver.calls, [("list_windows",), ("bring_to_front", {"pid": windows[-1]["pid"], "window_id": windows[-1]["window_id"]}), ("get_window_state", windows[-1])])
+        self.assertIs(driver.calls[2][1], windows[-1])
         self.assertEqual([r["candidate_count"] for r in result.selections["windows"]], [12, 2])
         self.assertEqual([r["candidate_count"] for r in result.selections["controls"]], [101, 11, 2])
         self.assertIs(result.observation["elements_complete"], False)
@@ -249,7 +254,7 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertNotIn("controls", error.context["selections"])
         self.assertNotIn("RAW BODY SECRET", json.dumps(error.details()))
-        self.assertEqual(driver.calls, [("list_windows",), ("get_window_state", windows[-1])])
+        self.assertEqual(driver.calls, [("list_windows",), ("bring_to_front", {"pid": windows[-1]["pid"], "window_id": windows[-1]["window_id"]}), ("get_window_state", windows[-1])])
         self.assertEqual(len(client.calls), 2)
         self.assertTrue(all(
             key.startswith("windows_") for call in client.calls for key in call["questions"]
@@ -281,7 +286,7 @@ class PipelineTests(unittest.TestCase):
                 result, driver, client = self.run_observation(snapshot)
                 self.assertEqual(result.status, expected)
                 self.assertIsNone(result.control)
-                self.assertEqual(len(driver.calls), 2)
+                self.assertEqual(len(driver.calls), 3)
                 self.assertEqual(len(client.calls), 1)
                 self.assertTrue(all(key.startswith("windows_") for key in client.calls[0]["questions"]))
                 self.assertTrue(result.reason)
@@ -372,7 +377,7 @@ class PipelineTests(unittest.TestCase):
                 run_pipeline("Find Save", driver, ChoiceSelector(ChoosingClient()), report=report)
 
         self.assertEqual([entry["event"] for entry in report.events], [
-            "windows_discovered", "window_selected",
+            "windows_discovered", "window_selected", "action_requested", "action_returned",
         ])
         self.assertEqual(report.events[0]["windows"], windows)
         self.assertEqual(report.events[1]["window"], windows[-1])
@@ -390,14 +395,14 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertEqual([entry["event"] for entry in report.events], [
-            "windows_discovered", "window_selected", "window_observed", "control_selected",
+            "windows_discovered", "window_selected", "action_requested", "action_returned", "window_observed", "control_selected",
         ])
-        observed = report.events[2]
+        observed = report.events[4]
         self.assertEqual(observed["window"], windows[-1])
         self.assertEqual(observed["snapshot_id"], result.snapshot_id)
         self.assertEqual(observed["observation"], result.observation)
-        self.assertEqual(report.events[3]["control"], elements[-1])
-        self.assertEqual(report.events[3]["selections"], result.selections["controls"])
+        self.assertEqual(report.events[5]["control"], elements[-1])
+        self.assertEqual(report.events[5]["selections"], result.selections["controls"])
         self.assertNotIn("UNNEEDED RAW TREE", json.dumps(report.events))
 
     def test_report_distinguishes_empty_discovery_from_synthetic_search_selection(self):
@@ -427,7 +432,7 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "observation_unavailable")
         self.assertEqual([entry["event"] for entry in report.events], [
-            "windows_discovered", "window_selected", "window_observed",
+            "windows_discovered", "window_selected", "action_requested", "action_returned", "window_observed",
         ])
         self.assertEqual(report.events[-1]["observation"], result.observation)
 
