@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import unittest
+from unittest.mock import patch
 
 from src.driver import CuaDriver, DriverError
 
@@ -101,6 +102,28 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(runner.calls[0][1]["timeout"], 12)
         args = json.loads(runner.calls[0][1]["input"])
         self.assertEqual((args["max_elements"], args["max_depth"]), (80, 6))
+
+    def test_telemetry_is_disabled_for_all_calls_without_changing_parent_environment(self):
+        for inherited in ({}, {"CUA_DRIVER_RS_TELEMETRY_ENABLED": "1", "CUA_TELEMETRY_ENABLED": "1"}):
+            with self.subTest(inherited=inherited), patch.dict(
+                os.environ, {"PATH": "preserved-path", "CTRLOOP_TEST_ENV": "preserved", **inherited},
+                clear=True,
+            ):
+                parent_environment = dict(os.environ)
+                observed = window()
+                driver, runner = self.driver(
+                    {"windows": [observed]}, foreground_result(observed), state(),
+                    {"effect": "unverifiable", "route": "accessibility"},
+                )
+                driver.list_windows()
+                driver.bring_to_front({"pid": 4242, "window_id": 123456})
+                driver.get_window_state(observed)
+                driver.click({"pid": 4242, "window_id": 123456, "element_token": "observed:17"})
+                for _, options in runner.calls:
+                    self.assertEqual(options["env"], {
+                        **parent_environment, "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0",
+                    })
+                self.assertEqual(dict(os.environ), parent_environment)
 
     def test_other_actions_cannot_be_requested_even_through_private_dispatch(self):
         driver, runner = self.driver()

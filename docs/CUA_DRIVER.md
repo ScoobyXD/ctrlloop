@@ -33,11 +33,35 @@ Verified on 2026-09-21 using the [official Windows installer](https://cua.ai/dri
 | Permission mode | `standard` |
 | Installer SHA-256 | `3e770fa8c351b80db99ae6b080f696a22f844534498bf44d45816cbd05eb0c3f` |
 
-The installer checksum matched the release's published checksum before execution. The release was explicitly pinned to `0.28.2`. Version garbage collection was disabled for this installation only; no older release cleanup was needed. The driver also installed its official UIAccess worker. Telemetry was left at the official installer's default; its notice describes content-free product metadata.
+The installer checksum matched the release's published checksum before execution. The release was explicitly pinned to `0.28.2`. Version garbage collection was disabled for this installation only; no older release cleanup was needed. The driver also installed its official UIAccess worker. Telemetry was initially left at the installer's default, then explicitly disabled with `cua-driver telemetry disable` on 2026-09-22. A separate status check confirmed `enabled: false` and `source: persisted`.
 
 The binary was initially installed with `-NoAutoStart`. The user then explicitly authorized administrator approval: `cua-driver autostart enable` completed through Windows UAC, followed by `cua-driver stop` and `cua-driver autostart kick`. **Automatic startup is enabled in the final configuration.**
 
 The published guide says installation does not need administrator access. The version-matched installer distinguishes the user-profile binary installation from the scheduled task: registration of its `RunLevel=Highest` task requests UAC elevation. This is not a requirement to build a separate UI or configure a browser.
+
+## Telemetry stays off
+
+The ctrlloop adapter passes `CUA_DRIVER_RS_TELEMETRY_ENABLED=0` to every CUA CLI
+child process. This overrides an inherited enable value and CUA's saved setting
+without changing the parent environment. It covers window discovery,
+foreground activation, accessibility reads, and clicks through the same adapter.
+
+This also avoids a Windows 0.28.2 latency bug: the CLI's background telemetry
+worker can inherit captured output handles, making the caller wait for that
+worker to exit after the command has already returned its result.
+
+For CUA used outside ctrlloop, apply its saved opt-out after installation:
+
+```powershell
+cua-driver telemetry disable
+cua-driver telemetry status --json
+```
+
+The saved preference applies to future events in the existing service unless
+that service has an explicit telemetry environment override. The adapter's
+per-process override applies to its CLI children; it does not reconfigure an
+already-running service. These are CUA 0.28.2 settings and should be checked
+again when upgrading the pinned driver.
 
 ## Reproduce the official installation
 

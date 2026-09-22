@@ -183,6 +183,8 @@ class CuaDriver:
                 timeout=self.timeout,
                 check=False,
                 shell=False,
+                # CUA's telemetry worker can keep captured pipes open after exit.
+                env={**os.environ, "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0"},
                 **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
             )
         except subprocess.TimeoutExpired:

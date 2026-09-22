@@ -111,6 +111,10 @@ CUA Driver 0.28.2 must already be installed with its daemon running on the
 interactive Windows desktop. The adapter finds `cua-driver` on PATH or in its
 default Windows install directory; `--driver <path>` overrides the executable.
 It does not start a daemon. See [driver setup](docs/CUA_DRIVER.md).
+Every CUA child process receives `CUA_DRIVER_RS_TELEMETRY_ENABLED=0`, so the
+adapter keeps CUA CLI telemetry off even if the saved setting or parent
+environment enables it. This avoids the Windows telemetry worker delaying
+captured output after a command finishes.
 
 For a multiline request, `--request-file request.txt` reads UTF-8 bytes without
 trimming or normalizing line endings. Use `--env-file <path>` to read an existing
