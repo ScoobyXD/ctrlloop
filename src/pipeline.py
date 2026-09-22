@@ -1,4 +1,4 @@
-"""Observe windows, choose one, observe its controls once, and choose one."""
+"""Select a real window/control or the synthetic Start Menu search target."""
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -10,6 +10,11 @@ if __package__:
 else:
     from driver import DriverError
     from selection import Candidate, ChoiceSelector
+
+
+START_MENU_KEY = "start_menu"
+START_MENU_SEARCH_KEY = "start_menu_search"
+START_MENU_APP = "StartMenuExperienceHost.exe"
 
 
 class ReadOnlyDriver(Protocol):
@@ -40,8 +45,30 @@ def _text(value: Any, limit: int = 240) -> str | None:
 
 
 def window_candidates(windows: Sequence[dict[str, Any]]) -> list[Candidate]:
-    candidates = []
+    # This is an application-defined destination, not an observed HWND. Keep it
+    # available whether Start is closed or open, and give it one consistent path.
+    start = {
+        "synthetic": True,
+        "app_name": START_MENU_APP,
+        "title": "Start Menu",
+        "target": "windows_start_menu",
+    }
+    candidates = [Candidate(
+        START_MENU_KEY,
+        {
+            "title": "Start Menu",
+            "purpose": "Search Windows for apps, settings, and documents, including apps that are not open.",
+        },
+        start,
+    )]
     for index, window in enumerate(windows):
+        if (
+            window.get("app_name", "").casefold() == START_MENU_APP.casefold()
+            and window.get("title") == "Start"
+        ):
+            # An open real Start window should not create a competing route
+            # that exposes all pinned apps instead of the requested Search field.
+            continue
         description = {}
         for name in ("app_name", "title"):
             if value := _text(window.get(name)):
@@ -51,6 +78,32 @@ def window_candidates(windows: Sequence[dict[str, Any]]) -> list[Candidate]:
                 description[name] = window[name]
         candidates.append(Candidate(f"window_{index}", description, window))
     return candidates
+
+
+def start_menu_search_candidate() -> Candidate:
+    """A semantic text-entry target for a future executor to resolve through CUA.
+
+    It intentionally has no HWND, snapshot, element token, or pixel coordinates.
+    Those must come from a fresh real observation after opening Start.
+    """
+    control = {
+        "synthetic": True,
+        "role": "Edit",
+        "label": "Search",
+        "input_type": "text",
+        "actions": ["type_text"],
+        "target": "windows_start_menu_search",
+    }
+    return Candidate(
+        START_MENU_SEARCH_KEY,
+        {
+            "role": "Edit",
+            "label": "Search",
+            "input_type": "text",
+            "purpose": "Type a query to search Windows for apps, settings, and documents.",
+        },
+        control,
+    )
 
 
 def control_candidates(elements: Sequence[dict[str, Any]]) -> list[Candidate]:
@@ -88,10 +141,11 @@ def control_candidates(elements: Sequence[dict[str, Any]]) -> list[Candidate]:
 def run_pipeline(
     original_request: str, driver: ReadOnlyDriver, selector: ChoiceSelector
 ) -> PipelineResult:
-    """Return observational identities, never execute the requested UI operation.
+    """Return an observed or synthetic selection, without executing UI actions.
 
-    A selected control is from this saved observation only. CLI sessions end after
-    each read, so returned handles are evidence, not a promise of future usability.
+    Real controls belong to their saved observations only. Synthetic Start search
+    is a semantic destination, never a fabricated driver handle. A later executor
+    must resolve it to a live field before typing supplied text.
     """
     windows = driver.list_windows()
     window_selection = selector.select(original_request, window_candidates(windows), stage="windows")
@@ -100,6 +154,18 @@ def run_pipeline(
         result.reason = "Window discovery returned no candidates."
         return result
     result.window = window_selection.winner.record
+    if window_selection.winner.key == START_MENU_KEY:
+        control_selection = selector.select(
+            original_request, [start_menu_search_candidate()], stage="controls"
+        )
+        result.control = control_selection.winner.record
+        result.selections["controls"] = control_selection.rounds
+        result.observation = {
+            "source": "synthetic",
+            "coverage": "application-defined Start Menu search; no live control snapshot was taken",
+        }
+        result.status = "selected"
+        return result
     try:
         snapshot = driver.get_window_state(result.window)
     except DriverError as error:

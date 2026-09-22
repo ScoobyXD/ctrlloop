@@ -1,13 +1,31 @@
 # ctrlloop
 
-The first Python milestone discovers desktop windows, uses Jev to choose one,
-reads that window's Windows UI Automation state once, and uses Jev to choose one
-observed control. The result is JSON containing the original window and control
-records, snapshot identity, observation quality, and selection rounds.
+The first Python milestone offers discovered desktop windows plus a synthetic
+**Start Menu** option. Jev chooses a window; a real window is inspected through
+Windows UI Automation, then its observed controls are offered for selection.
+Choosing Start Menu instead offers exactly one synthetic **Search** text field.
+The result is JSON containing the selected records, their observation information,
+and selection rounds.
 
 Selection retains identities in Python. It does not activate or focus windows,
 click, type, invoke controls, launch applications, or take screenshots. A request
 such as “Click Recycle Bin” only selects a candidate.
+
+The Start Menu route is available even when the real menu is closed. An observed
+Start window is represented by this same route, so it does not add a duplicate
+choice with pinned apps and other controls. Other real windows retain their order
+and identity. Successful empty window discovery still leaves Start Menu available;
+driver errors remain errors.
+
+Both Start Menu and Search records have `synthetic: true`. Search has role `Edit`,
+`input_type: "text"`, and semantic target `windows_start_menu_search`. It has no
+invented PID, window handle, element index/token, geometry, or snapshot identity.
+The existing singleton rule selects Search without an extra Jev request.
+
+This change supplies the selection target for a later computer-use executor.
+That executor must open Start, resolve its real search field in a fresh CUA
+snapshot, and type the supplied text. The selection pipeline itself does not yet
+perform those actions or generate the text to enter.
 
 ## Run
 
@@ -70,8 +88,8 @@ it is not automatically attributed to daemon access.
 
 | Status | Meaning | CLI exit |
 | --- | --- | --- |
-| `selected` | One observed window and one observed control chosen | 0 |
-| `no_windows` | Discovery returned an empty window list | 2 |
+| `selected` | A real window/control or synthetic Start Menu/Search target was chosen | 0 |
+| `no_windows` | No first-stage candidate selected; normally unreachable with the Start Menu option | 2 |
 | `no_controls` | A valid read returned no indexed controls | 2 |
 | `observation_degraded` | A degraded read returned no indexed controls | 2 |
 | `observation_unavailable` | Structured controls or their snapshot identity were unavailable | 2 |
@@ -101,7 +119,8 @@ VS Code's graphical breakpoints. See the [VS Code Python debugger guide](https:/
 
 ## Selection contract
 
-Both stages preserve the driver's observed order. Each group contains at most ten
+Start Menu is prepended to the first-stage options. Other real windows preserve
+the driver's observed order, as do controls from real snapshots. Each group contains at most ten
 candidates and receives one Choice question. One winner from every group advances
 in group order; winners are regrouped in tens until one remains. A singleton is
 forwarded in Python without an API request. For 1,000 candidates, the round counts
@@ -112,7 +131,7 @@ Every question uses this exact text:
 > Which of these candidates is best suited to help fulfill the user’s original request, based on the provided candidate information?
 
 Every Jev request sends the unchanged original request once as shared `state`.
-Choice options contain concise descriptions of the actual records, with stable
+Choice options contain concise descriptions of the observed or synthetic records, with stable
 local labels mapped back to those records. Window descriptions use title, app,
 visibility, minimization, and geometry. Controls use role, label/value, advertised
 capabilities, available state, geometry, and up to two explicitly linked indexed
@@ -142,14 +161,16 @@ the selected record's exact `pid`/`window_id`, accessibility enabled and screens
 disabled. The adapter separates stdout/stderr and validates JSON and success
 shape, because some driver failures print plain text with exit code zero.
 
-Controls come from one saved snapshot. `element_index` is not an array offset;
+Real controls come from one saved snapshot. The synthetic Search branch takes no
+control snapshot and marks its observation source as `synthetic`.
+`element_index` is not an array offset;
 parent context comes only from explicit links to observed records. The structured
 `elements` array omits some containers visible in `tree_markdown`, and the default
 walk is bounded at 5,000 nodes / depth 25. This pipeline does not infer missing
 ancestry or claim full coverage. Windows 0.28.2 commonly reports
 `elements_complete:false`, including successful reads; that alone is not failure.
 
-Window identities are live OS identities. Control indices/tokens are bound to
+Real window identities are live OS identities. Control indices/tokens are bound to
 the recorded snapshot and its transport lifecycle. One-shot CLI transports end
 after their response, so exported handles are observation evidence, not reusable
 action authorization or a promise that a later call can use them. Any future

@@ -1,0 +1,358 @@
+{
+  "scope": "Observed on 2026-09-21; Windows CUA Driver 0.28.2. Selected live rows, not exhaustive fixtures. IDs/tokens are historical and must never be reused.",
+  "sanitization": "Unrelated windows, process lists, personal recommendations and screenshots omitted. Exact relevant observed IDs and fields retained.",
+  "closed": {
+    "driver_window_count": 13,
+    "shell_hwnd": [
+      {
+        "window_id": 131360,
+        "pid": 8700,
+        "process": "explorer",
+        "title": "",
+        "class": "Shell_TrayWnd",
+        "visible": true,
+        "cloaked": 0,
+        "dwm_result": 0
+      }
+    ],
+    "start_control": [
+      {
+        "depth": 3,
+        "name": "Start",
+        "role": "ControlType.Button",
+        "automation_id": "StartButton",
+        "class": "ToggleButton",
+        "pid": 8700,
+        "native_window_handle": 0,
+        "enabled": true,
+        "offscreen": true,
+        "keyboard_focusable": true,
+        "has_keyboard_focus": true,
+        "patterns": [
+          "TogglePatternIdentifiers.Pattern",
+          "ScrollItemPatternIdentifiers.Pattern"
+        ],
+        "bounds": {
+          "y": Infinity,
+          "width": -Infinity,
+          "height": -Infinity,
+          "x": Infinity
+        }
+      }
+    ],
+    "driver_taskbar_result": {
+      "content": [
+        {
+          "text": "No window with window_id 131360 exists. Call `list_windows({\"pid\": 8700})` for candidates.",
+          "type": "text"
+        }
+      ],
+      "isError": true,
+      "structuredContent": {
+        "code": "tool_invocation_failed"
+      }
+    }
+  },
+  "open": {
+    "driver_window_count": 15,
+    "start_window": [
+      {
+        "app_name": "StartMenuExperienceHost.exe",
+        "bounds": {
+          "height": 1692,
+          "width": 2880,
+          "x": 0,
+          "y": 0
+        },
+        "is_on_screen": true,
+        "layer": 0,
+        "minimized": false,
+        "pid": 7908,
+        "title": "Start",
+        "window_id": 66094,
+        "z_index": 0
+      }
+    ],
+    "discovery_tool_keys": [
+      "processes",
+      "windows"
+    ],
+    "start_snapshot": {
+      "app_name": "StartMenuExperienceHost.exe",
+      "element_count": 80,
+      "elements_complete": false,
+      "pid": 7908,
+      "returned_element_count": 80,
+      "snapshot_id": "s00000014",
+      "total_element_count": 80,
+      "window_bounds": {
+        "height": 1692,
+        "width": 2880,
+        "x": 0,
+        "y": 0
+      },
+      "window_id": 66094,
+      "window_title": "Start"
+    },
+    "selected_elements": [
+      {
+        "actions": [
+          "set_value",
+          "text"
+        ],
+        "depth": 2,
+        "element_index": 0,
+        "element_token": "s00000014:0",
+        "enabled": true,
+        "frame": {
+          "h": 48,
+          "w": 1152,
+          "x": 68,
+          "y": 401
+        },
+        "label": "Search box",
+        "role": "Edit"
+      },
+      {
+        "actions": [
+          "toggle"
+        ],
+        "depth": 1,
+        "element_index": 1,
+        "element_token": "s00000014:1",
+        "enabled": true,
+        "frame": {
+          "h": 48,
+          "w": 1104,
+          "x": 68,
+          "y": 401
+        },
+        "label": "Search for apps, settings, and documents",
+        "role": "Button",
+        "selected": true
+      },
+      {
+        "actions": [
+          "invoke"
+        ],
+        "depth": 3,
+        "element_index": 5,
+        "element_token": "s00000014:5",
+        "enabled": true,
+        "frame": {
+          "h": 47,
+          "w": 139,
+          "x": 1050,
+          "y": 508
+        },
+        "label": "Show all pinned apps",
+        "parent_index": 4,
+        "role": "Button"
+      },
+      {
+        "actions": [
+          "scroll"
+        ],
+        "depth": 4,
+        "element_index": 6,
+        "element_token": "s00000014:6",
+        "enabled": true,
+        "frame": {
+          "h": 252,
+          "w": 1158,
+          "x": 68,
+          "y": 569
+        },
+        "label": "Pinned",
+        "parent_index": 4,
+        "role": "List"
+      },
+      {
+        "actions": [
+          "invoke"
+        ],
+        "depth": 5,
+        "element_index": 7,
+        "element_token": "s00000014:7",
+        "enabled": true,
+        "frame": {
+          "h": 126,
+          "w": 144,
+          "x": 68,
+          "y": 569
+        },
+        "label": "Microsoft Edge",
+        "parent_index": 6,
+        "role": "ListItem"
+      },
+      {
+        "actions": [
+          "invoke"
+        ],
+        "depth": 5,
+        "element_index": 8,
+        "element_token": "s00000014:8",
+        "enabled": true,
+        "frame": {
+          "h": 126,
+          "w": 144,
+          "x": 212,
+          "y": 569
+        },
+        "label": "Word",
+        "parent_index": 6,
+        "role": "ListItem"
+      },
+      {
+        "actions": [
+          "invoke"
+        ],
+        "depth": 5,
+        "element_index": 9,
+        "element_token": "s00000014:9",
+        "enabled": true,
+        "frame": {
+          "h": 126,
+          "w": 144,
+          "x": 356,
+          "y": 569
+        },
+        "label": "Excel",
+        "parent_index": 6,
+        "role": "ListItem"
+      },
+      {
+        "actions": [
+          "invoke"
+        ],
+        "depth": 5,
+        "element_index": 10,
+        "element_token": "s00000014:10",
+        "enabled": true,
+        "frame": {
+          "h": 126,
+          "w": 144,
+          "x": 500,
+          "y": 569
+        },
+        "label": "PowerPoint",
+        "parent_index": 6,
+        "role": "ListItem"
+      },
+      {
+        "actions": [
+          "scroll"
+        ],
+        "depth": 3,
+        "element_index": 23,
+        "element_token": "s00000014:23",
+        "enabled": true,
+        "frame": {
+          "h": 167,
+          "w": 1170,
+          "x": 97,
+          "y": 931
+        },
+        "label": "Recommended",
+        "parent_index": 4,
+        "role": "List"
+      },
+      {
+        "actions": [
+          "invoke"
+        ],
+        "depth": 3,
+        "element_index": 30,
+        "element_token": "s00000014:30",
+        "enabled": true,
+        "frame": {
+          "h": 48,
+          "w": 139,
+          "x": 1050,
+          "y": 869
+        },
+        "label": "Show all",
+        "parent_index": 4,
+        "role": "Button"
+      },
+      {
+        "actions": [
+          "invoke"
+        ],
+        "depth": 2,
+        "element_index": 61,
+        "element_token": "s00000014:61",
+        "enabled": true,
+        "frame": {
+          "h": 60,
+          "w": 60,
+          "x": 1130,
+          "y": 1594
+        },
+        "label": "Power",
+        "role": "ListItem"
+      }
+    ]
+  },
+  "actions": {
+    "open-start": {
+      "content": [
+        {
+          "text": "Sent escape to the foreground application (scope:desktop).",
+          "type": "text"
+        }
+      ],
+      "structuredContent": {
+        "delivery": {
+          "mode": "not_applicable"
+        },
+        "effect": "unverifiable",
+        "route": "global_input"
+      }
+    },
+    "close-start-background": {
+      "content": [
+        {
+          "text": "\ud83d\udce8 Sent escape to pid 7908 via PostMessage (not verified). If it didn't land, retry with delivery_mode:\"foreground\".",
+          "type": "text"
+        }
+      ],
+      "structuredContent": {
+        "delivery": {
+          "mode": "background"
+        },
+        "effect": "unverifiable",
+        "escalation": {
+          "reason": "delivery_failed",
+          "target": "foreground"
+        },
+        "route": "synthetic_events"
+      }
+    },
+    "close-start-desktop": {
+      "content": [
+        {
+          "text": "Sent escape to the foreground application (scope:desktop).",
+          "type": "text"
+        }
+      ],
+      "structuredContent": {
+        "delivery": {
+          "mode": "not_applicable"
+        },
+        "effect": "unverifiable",
+        "route": "global_input"
+      }
+    }
+  },
+  "restored": {
+    "driver_window_count": 13,
+    "start_or_search_windows": [],
+    "visual_evidence_local_only": "raw/desktop-before-restore-click-0.png; Start closed, original Codex visible; no click followed"
+  },
+  "limitations": [
+    "elements_complete is false; pattern availability was read, not typing/search execution tested.",
+    "Later direct HWND enumeration returned empty; it was inconclusive, not negative UIA evidence.",
+    "Snapshot-bound element actions were not used. MCP lifecycle was retained for ordered investigation calls."
+  ]
+}

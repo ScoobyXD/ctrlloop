@@ -24,7 +24,7 @@ else:
 
 def main(argv: list[str] | None = None) -> int:
     project_dir = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description="Read and select one window and control without acting.")
+    parser = argparse.ArgumentParser(description="Select a window and control, including Start Menu search, without acting.")
     parser.add_argument("request", nargs="?", help="Original user request, passed unchanged to every Jev call")
     parser.add_argument("--request-file", type=Path, help="Read the exact request from a UTF-8 file")
     parser.add_argument("--env-file", type=Path, default=project_dir / ".env")
