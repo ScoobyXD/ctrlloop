@@ -27,11 +27,12 @@ else:
 
 def main(argv: list[str] | None = None) -> int:
     project_dir = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description="Select a window and control, including Start Menu search, without acting.")
+    parser = argparse.ArgumentParser(description="Select a window and control, optionally executing one CUA click.")
     parser.add_argument("request", nargs="?", help="Original user request, passed unchanged to every Jev call")
     parser.add_argument("--request-file", type=Path, help="Read the exact request from a UTF-8 file")
     parser.add_argument("--env-file", type=Path, default=project_dir / ".env")
     parser.add_argument("--driver", help="Path to the installed cua-driver.exe")
+    parser.add_argument("--click", action="store_true", help="Execute one click on the selected real control, return CUA's result, then stop")
     parser.add_argument("--max-elements", type=int, default=5000)
     parser.add_argument("--max-depth", type=int, default=25)
     parser.add_argument("--max-request-bytes", type=int, default=48_000)
@@ -55,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
             args.request_file.read_bytes().decode("utf-8")
             if args.request_file is not None else args.request
         )
-        report.append("run_started", request=original_request)
+        report.append("run_started", request=original_request, execute_click=args.click)
         if not original_request.strip():
             raise ValueError("The original request must be nonempty.")
         config = tomllib.loads((project_dir / "pyproject.toml").read_text(encoding="utf-8"))
@@ -79,11 +80,16 @@ def main(argv: list[str] | None = None) -> int:
             ) as client:
                 result = run_pipeline(
                     original_request, driver, ChoiceSelector(client, model=model, budget=budget),
-                    report=report,
+                    report=report, execute_click=args.click,
                 )
-        report.append("run_finished", result=result.to_dict())
+        try:
+            report.append("run_finished", result=result.to_dict())
+        except (OSError, ValueError):
+            if result.status != "action_returned":
+                raise
+            print("Could not save the completed run report; returning the native action result.", file=sys.stderr)
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
-        return 0 if result.status == "selected" else 2
+        return 0 if result.status in {"selected", "action_returned"} else 2
     except (DriverError, SelectionError, ValueError, OSError, TypeSafeError, KeyError) as error:
         # Raw SDK/OS messages may contain file content, request bodies, or credentials.
         if isinstance(error, (DriverError, SelectionError)) or type(error) is ValueError:

@@ -96,9 +96,9 @@ class DriverTests(unittest.TestCase):
         args = json.loads(runner.calls[0][1]["input"])
         self.assertEqual((args["max_elements"], args["max_depth"]), (80, 6))
 
-    def test_actions_cannot_be_requested_even_through_private_dispatch(self):
+    def test_other_actions_cannot_be_requested_even_through_private_dispatch(self):
         driver, runner = self.driver()
-        for tool in ("click", "type_text", "launch_app", "bring_to_front", "get_desktop_state", "serve"):
+        for tool in ("type_text", "launch_app", "bring_to_front", "get_desktop_state", "serve"):
             with self.subTest(tool=tool), self.assertRaises(DriverError):
                 driver._call(tool, {})
         self.assertEqual(runner.calls, [])

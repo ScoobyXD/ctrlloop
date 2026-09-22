@@ -1,6 +1,12 @@
-# CUA Driver 0.28.2: native Windows read contracts
+# CUA Driver 0.28.2: native Windows read and click contracts
 
-Verified on Windows on 2026-09-21. This reference covers `list_windows`, explicit window identity, `get_window_state` with accessibility enabled and screenshots disabled, and the distinct desktop-discovery tool `get_accessibility_tree`.
+Read behavior was verified on Windows on 2026-09-21. This reference covers
+`list_windows`, explicit window identity, `get_window_state` with accessibility
+enabled and screenshots disabled, and the distinct desktop-discovery tool
+`get_accessibility_tree`. The click input was checked against the installed
+0.28.2 binary; its output and cache contracts were checked in the matching release
+source. A separate disposable-control host smoke test verified the click path,
+as described below; the earlier saved read samples remain read-only evidence.
 
 ## Evidence and authoritative schemas
 
@@ -13,6 +19,7 @@ Verified on Windows on 2026-09-21. This reference covers `list_windows`, explici
 | [get_window_state input](schemas/get_window_state.input.schema.json) | Exact exported JSON Schema for tool arguments. |
 | [get_window_state output](schemas/get_window_state.output.schema.json) | Exact advertised JSON Schema for MCP `structuredContent`, including the success and refusal alternatives. |
 | [get_accessibility_tree input](schemas/get_accessibility_tree.input.schema.json) | Exact exported empty-object argument schema. No output schema is advertised for this tool. |
+| [click input](schemas/click.input.schema.json) | Exact input schema exported from the installed binary; includes more targeting modes than ctrlloop exposes. |
 
 The input schemas exported by `dump-docs` matched the live MCP `inputSchema` values. The files are preserved as exported, including any upstream omissions. In particular, the `list_windows` output schema requires `title` but omits its property definition; the version-matched Windows implementation and observed responses establish that it is a string.
 
@@ -161,7 +168,10 @@ The portable schema also permits nullable `value_description`, `min`, and `max`.
 
 `elements` is **not a lossless raw UIA tree**. The Windows builder excludes rows without an `element_index`. Non-actionable Pane/List ancestors can be present in `tree_markdown` yet absent from `elements`. The live Program Manager sample contains two indexed ListItems at depth 2 with no `parent_index`; the Pane and List are visible only in the Markdown hierarchy. This corrects the oversimplification that every visible tree row has a structured element record.
 
-Tokens and indices are tied to snapshots, not permanent UI objects. A newer snapshot of the same target supersedes old handles. Future action integration must honor the driver's lifecycle contract; the current scope only observes.
+Tokens and indices are tied to snapshots, not permanent UI objects. A newer
+snapshot of the same target supersedes old handles. The optional click consumes
+the original selected target without an intervening snapshot; see the cache
+contract below.
 
 ### Bounds, filtering, and completeness
 
@@ -212,9 +222,73 @@ For CLI consumption: retain exit code, stdout, and stderr separately; treat a no
 
 For MCP consumption: handle JSON-RPC errors first; then check `result.isError`, structured refusals, the expected success shape, and observation-quality fields. This preserves error structure better than parsing CLI text. The saved MCP examples show the actual envelopes; schemas alone do not specify the outer JSON-RPC framing.
 
+## 7. Single-click contract
+
+ctrlloop's `--click` option adds one `cua-driver call click` after the existing
+selection. The input is `{pid, window_id, element_token}` copied from the selected
+native records. If no token is present, it uses `{pid, window_id, element_index,
+snapshot_id}` from that same observation. Bare indices and guessed identifiers
+are not valid targets. Windows 0.28.2 has no `action: "press"` argument; omitting
+button, count, and delivery mode selects the default single left background click.
+
+The native public action result has required `effect` and `route`, with optional
+`delivery`, `evidence`, and `escalation`. This is the shape both established by the
+source and returned by the isolated host smoke test:
+
+```json
+{"effect":"unverifiable","route":"accessibility","delivery":{"mode":"background"}}
+```
+
+UIA delivery alone does not establish the user-visible effect. PostMessage uses
+`route: "synthetic_events"`. The public action contract does not expose private
+transport names or the older `path`/`verified` fields. A confirmed effect requires
+evidence; a partial effect carries a delivered count. See the versioned
+[ActionResult record](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/cua-driver-contract/src/outputs.rs)
+and [action projection](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/cua-driver-core/src/action_record.rs).
+
+Refusals use their native diagnostic shapes. For example, the token helper emits:
+
+```json
+{"status":"refused","refusal":{"code":"stale_element_token","message":"element_token is stale; call get_window_state again to refresh"}}
+```
+
+Background delivery errors can instead carry a top-level `code`, such as
+`background_unavailable`, `background_occluded`, or `background_uipi_blocked`,
+with an `escalation.recommended` hint. Keep these payloads intact; an escalation
+hint is not an automatic retry. A plain-text failure may still have CLI exit 0.
+The adapter handles actions separately from read-result validation and preserves
+parsed native failures in `DriverError.context["action_result"]`.
+
+The pipeline returns `action_returned` with the native `action_result` on a
+non-refused result, including `unverifiable` and `suspected_noop`. This reports
+driver facts, not completion of the original request. Native errors return CLI
+status `error` with `stage: "click"` and the completed selection. A synthetic
+target returns `no_action`. There is no post-action read, loop, extra Jev planner,
+typing, coordinate fallback, or foreground escalation.
+
+The [native cache](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/cua-driver-core/src/element_cache.rs)
+is scoped to the daemon/runtime, with snapshots indexed by PID and snapshot ID.
+Publishing a newer snapshot for the same window replaces the previous one. The
+[token contract](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/cua-driver-core/src/element_token.rs)
+also sets an eight-window cache limit per PID. Runtime changes, eviction, and
+window ownership changes can invalidate a target. CLI process exit cleans up its
+disposable session but does not itself retire the daemon's element cache.
+Keep observation and dispatch on the existing daemon; switching to bare Windows
+MCP would create a different runtime. See the [process model](https://cua.ai/docs/reference/cua-driver/process-model).
+
+The isolated host test used the production `CuaDriver` adapter and a disposable,
+nonactivating WinForms Test button. One `list_windows`, one `get_window_state`,
+and one `click` ran in separate CLI processes. The fixture's callback count was
+exactly one and it exited afterward; the harness made zero post-action driver
+reads. The callback established this isolated click's effect without adding
+runtime observation to the pipeline. The local result is in ignored
+`reports/isolated-click-result.json`. The sandbox's separate read returned
+`pipe_access_denied`; authorized host execution reached the installed daemon.
+
 ## Version-matched implementation references
 
-- [Windows tool definitions and output builders](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs): `ListWindowsTool`, `GetWindowStateTool`, `build_element_entry`, `GetAccessibilityTreeTool`.
+- [Windows tool definitions and output builders](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs): `ListWindowsTool`, `GetWindowStateTool`, `build_element_entry`, `GetAccessibilityTreeTool`, and `ClickTool`.
+- [Windows delivery refusals](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/platform-windows/src/input/delivery.rs): background error codes and diagnostic hints.
 - [UIA walker and node fields](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/platform-windows/src/uia/mod.rs): limits, role names, screen-coordinate rectangles, nearest indexed ancestor.
 - [Portable input/output records](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/cua-driver-contract/src/windows.rs): portable types and optional fields.
 - [CLI response serialization](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/cua-driver/src/cli.rs): `call` flattens structured results and falls back to text.

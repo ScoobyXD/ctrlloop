@@ -1,8 +1,8 @@
-"""Read-only Windows adapter for the installed CUA Driver 0.28.2 CLI.
+"""Windows adapter for the installed CUA Driver 0.28.2 CLI.
 
 The CLI flattens successful structured content onto stdout, but can also
 print tool errors there with exit code zero. Every response is validated.
-Snapshot handles returned here are observation data, not reusable actions.
+Native records and action results are retained without a parallel wire model.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any
 
 
 class DriverError(Exception):
-    """A sanitized driver transport, refusal, or observation-contract error."""
+    """A driver transport, refusal, or contract error with a safe summary."""
 
     def __init__(
         self, message: str, *, code: str = "driver_error", tool: str | None = None,
@@ -47,18 +47,24 @@ def _failure(tool: str, exit_code: int, diagnostic: str) -> DriverError:
     elif ("approval" in text or "authorization host" in text) and "unavailable" in text:
         code, reason = "approval_unavailable", "CUA requires an approval host that is unavailable."
     elif any(marker in text for marker in ("approval_required", "requires approval", "approval required")):
-        code, reason = "approval_required", "CUA requires approval for this read."
+        code, reason = "approval_required", "CUA requires approval for this call."
     elif any(marker in text for marker in (
         "permission denied", "permission_denied", "authorization denied",
         "access is denied", "access denied", "not authorized",
     )):
-        code, reason = "access_denied", "CUA denied access for this read."
+        code, reason = "access_denied", "CUA denied access for this call."
+    elif "stale_element_token" in text:
+        code, reason = "stale_element_token", "CUA rejected the stale snapshot target; no retry was attempted."
+    elif "snapshot_id_required" in text:
+        code, reason = "snapshot_id_required", "CUA requires the observed snapshot identity for this target."
+    elif "background_unavailable" in text:
+        code, reason = "background_unavailable", "CUA refused background delivery; no escalation was attempted."
     elif "belongs to pid" in text:
         code, reason = "window_owner_mismatch", "The window no longer belongs to the selected process; rediscover windows."
     elif any(marker in text for marker in ("invalid window handle", "window not found", "0x80070578")):
         code, reason = "window_unavailable", "The selected window is no longer available; rediscover windows."
     elif "timed out" in text or "timeout" in text:
-        code, reason = "driver_timeout", "The driver timed out while processing the read."
+        code, reason = "driver_timeout", "The driver timed out while processing the call."
     elif "daemon" in text and any(marker in text for marker in ("not running", "failed to connect", "connection refused")):
         code, reason = "daemon_unavailable", "The existing CUA daemon could not be reached."
     else:
@@ -74,6 +80,17 @@ def _integer(value: Any, minimum: int = 0, maximum: int | None = None) -> bool:
         type(value) is int
         and value >= minimum
         and (maximum is None or value <= maximum)
+    )
+
+
+def _action_diagnostic(payload: Mapping[str, Any]) -> str:
+    # Snapshot refusals have a nested {code, message}; background delivery
+    # errors have a top-level code. Keep both native forms in action_result.
+    refusal = payload.get("refusal")
+    records = (payload, refusal) if isinstance(refusal, Mapping) else (payload,)
+    return " ".join(
+        record[key] for record in records for key in ("code", "status", "refusal", "error", "message")
+        if isinstance(record.get(key), str)
     )
 
 
@@ -120,7 +137,7 @@ def _reject_json_constant(value: str) -> None:
 
 
 class CuaDriver:
-    """Discover windows and capture one accessibility snapshot without acting.
+    """Discover windows, capture accessibility state, and dispatch one click.
 
     Optional/nullable observation fields are preserved, including missing
     elements or snapshot identity. The pipeline decides whether that observation
@@ -150,8 +167,8 @@ class CuaDriver:
         self._runner = runner or subprocess.run
 
     def _call(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        if tool not in {"list_windows", "get_window_state"}:
-            raise DriverError("Only read-only CUA Driver tools are available.")
+        if tool not in {"list_windows", "get_window_state", "click"}:
+            raise DriverError("Only window reads and a single click are available.")
         try:
             result = self._runner(
                 [self.executable, "call", tool],
@@ -175,6 +192,15 @@ class CuaDriver:
         except UnicodeError:
             raise DriverError("CUA Driver output could not be decoded as UTF-8.") from None
         if result.returncode != 0:
+            if tool == "click":
+                try:
+                    payload = json.loads(result.stdout, parse_constant=_reject_json_constant)
+                except (TypeError, ValueError):
+                    payload = None
+                if isinstance(payload, dict):
+                    error = _failure(tool, result.returncode, _action_diagnostic(payload) or result.stderr)
+                    error.context["action_result"] = payload
+                    raise error
             # Do not inspect success-looking JSON/tree output as a diagnostic.
             diagnostic = result.stderr or (
                 result.stdout if not result.stdout.lstrip().startswith(("{", "[")) else ""
@@ -191,6 +217,10 @@ class CuaDriver:
             ) from None
         if not isinstance(payload, dict):
             raise DriverError(f"CUA Driver {tool} did not return an object.")
+        if tool == "click":
+            # Action facts use a different native contract from observations.
+            # In particular, an effect of "unverifiable" is a legitimate result.
+            return payload
         # The advertised refusal alternative has no stable value enum. None of
         # these markers is in the documented success payload, so fail closed.
         if any(key in payload for key in ("refusal", "status", "code", "error")):
@@ -201,6 +231,61 @@ class CuaDriver:
             raise _failure(tool, result.returncode, diagnostic)
         if "isError" in payload and payload["isError"] is not False:
             raise DriverError(f"CUA Driver {tool} returned a tool error.")
+        return payload
+
+    def click(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Dispatch native element-target arguments once; never retry or observe.
+
+        The caller must use the selected control from its pre-action snapshot.
+        The daemon rejects superseded tokens, including changes made by other
+        clients. A timeout or unreadable response leaves delivery unknown.
+        """
+        allowed = {"pid", "window_id", "element_token", "element_index", "snapshot_id"}
+        if not isinstance(arguments, Mapping) or set(arguments) - allowed:
+            raise DriverError("Click requires native window and snapshot-bound element arguments.",
+                              code="invalid_click_target", tool="click")
+        if (
+            not _integer(arguments.get("pid"), 1, 2**32 - 1)
+            or not _integer(arguments.get("window_id"), 1, 2**64 - 1)
+        ):
+            raise DriverError("Click requires a usable observed pid/window_id pair.",
+                              code="invalid_click_target", tool="click")
+        if "element_token" in arguments:
+            valid = (
+                isinstance(arguments["element_token"], str) and bool(arguments["element_token"].strip())
+                and not {"element_index", "snapshot_id"}.intersection(arguments)
+            )
+        else:
+            valid = (
+                _integer(arguments.get("element_index"))
+                and isinstance(arguments.get("snapshot_id"), str)
+                and bool(arguments["snapshot_id"].strip())
+            )
+        if not valid:
+            raise DriverError("Click requires an observed element_token or element_index with snapshot_id.",
+                              code="invalid_click_target", tool="click")
+        payload = self._call("click", arguments)
+        if (
+            any(key in payload for key in ("refusal", "code", "error"))
+            or ("isError" in payload and payload["isError"] is not False)
+            or ("status" in payload and payload["status"] != "success")
+            or payload.get("effect") == "refused"
+        ):
+            error = _failure("click", 0, _action_diagnostic(payload))
+            error.context["action_result"] = payload
+            raise error
+        # These are the public 0.28.2 ActionResult facts, not OS dispatch names.
+        effect, route = payload.get("effect"), payload.get("route")
+        if (
+            not isinstance(effect, str)
+            or effect not in {"confirmed", "partial", "unverifiable", "suspected_noop"}
+            or not isinstance(route, str)
+            or route not in {"accessibility", "synthetic_events", "global_input", "system_api", "dom", "trusted_input"}
+        ):
+            error = DriverError("CUA click returned no recognized action facts; delivery is unknown.",
+                                code="invalid_action_result", tool="click")
+            error.context["action_result"] = payload
+            raise error
         return payload
 
     def list_windows(self) -> list[dict[str, Any]]:

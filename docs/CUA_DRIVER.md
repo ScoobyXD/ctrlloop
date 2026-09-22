@@ -2,16 +2,19 @@
 
 CUA Driver **0.28.2** is installed on this machine. The official `cua-driver-serve` scheduled task is enabled with `RunLevel=Highest` and `LogonType=Interactive`, and was started and checked successfully. Installation and documentation were completed in the existing `main` checkout.
 
-This setup covers window discovery and native Windows accessibility reads. It does not add a GUI, browser automation, an action executor, or a Jev integration.
+The installation provides window discovery, native Windows accessibility reads,
+and native input tools. ctrlloop now connects Jev's existing selected control to
+one optional CUA click through the same CLI adapter.
 
 ## Exact interface reference
 
 Read the [versioned Windows input/output contract](cua-driver/0.28.2/README.md). It includes:
 
-- The three exact input JSON Schemas exported from the installed binary.
+- The read-tool and click input JSON Schemas exported from the installed binary.
 - The actual MCP output JSON Schemas advertised for `list_windows` and `get_window_state`.
 - Sanitized live request/response pairs, a readable accessibility tree, query behavior, and failure examples.
 - The difference between CLI stdout and MCP responses, including a CLI error-handling limitation.
+- The click result/refusal and snapshot-cache contracts from the matching release.
 
 ## Installation record
 
@@ -90,6 +93,31 @@ These explicit limits bound the initial walk; they do not promise a complete tre
 
 The CLI's successful result has `elements` and `tree_markdown` **at the top level**. A real CLI tool failure may print plain text and still return exit code zero; inspect the output as described in the versioned reference. Do not treat an empty tree as proof that an app has no controls.
 
+## Select and execute one click
+
+From the ctrlloop repository, with its dependencies and `TYPESAFE_API_KEY` configured:
+
+```powershell
+uv run --locked python src/main.py --click 'Click the Test button in my test window.'
+```
+
+Omit `--click` to keep selection-only behavior. The pipeline dispatches the
+selected record's `pid`, `window_id`, and `element_token` (or the matching index
+and snapshot pair), returns the native `action_result`, and stops. It does not
+take a post-action snapshot or retry. Synthetic Start Menu/Search selections
+return `no_action`; opening Start and typing are deferred.
+
+`action_returned`/exit 0 means the driver returned action facts, including an
+`unverifiable` or `suspected_noop` effect. It does not prove the application goal.
+Native failures retain their diagnostic payload and return `error`/exit 1.
+See [full CLI status and report details](../README.md#run).
+
+The standard daemon supports routine native clicks. A shell denied access to
+`\\.\pipe\cua-driver` cannot test them from that execution context; this is
+separate from whether the installed daemon has click support. Do not restart or
+reconfigure the working daemon to resolve a client access restriction. The
+UIAccess helper is an internal worker, not a public alternative endpoint.
+
 ## Verification artifacts
 
 - [Runtime verification record](cua-driver/0.28.2/runtime-verification.json)
@@ -98,5 +126,14 @@ The CLI's successful result has `elements` and `tree_markdown` **at the top leve
 - [Window discovery sample](cua-driver/0.28.2/examples/list_windows.output.json)
 
 Samples preserve real data structures but replace process/window identifiers and omit unrelated windows/processes. They are documentation examples, not live reusable targets. The verification record describes the redactions and actual observed counts.
+
+The single-click host smoke test used the production adapter with a disposable,
+nonactivating WinForms Test button. One discovery, one snapshot, and one click
+ran as separate CLI calls; the button received exactly one callback, there were
+zero post-action driver reads, and the fixture exited. The native result was
+`{"effect":"unverifiable","route":"accessibility","delivery":{"mode":"background"}}`.
+Its local result is in the ignored `reports/isolated-click-result.json`; it is not
+a replayable target. The sandbox's separate read failed with `pipe_access_denied`,
+while authorized host execution reached the daemon.
 
 Official references: [installation](https://cua.ai/docs/how-to-guides/driver/install), [Windows tools](https://cua.ai/docs/reference/cua-driver/mcp-tools-windows), [CLI](https://cua.ai/docs/reference/cua-driver/cli-reference), [platform support](https://cua.ai/docs/reference/cua-driver/platform-support).

@@ -1,7 +1,8 @@
-"""Select observed or registered synthetic windows and controls."""
+"""Select windows and controls, optionally dispatching one native click."""
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+import logging
 from typing import Any, Protocol
 
 if __package__:
@@ -16,10 +17,12 @@ else:
     from synthetic import DEFAULT_REGISTRY, SyntheticRegistry
 
 
-class ReadOnlyDriver(Protocol):
+class Driver(Protocol):
     def list_windows(self) -> list[dict[str, Any]]: ...
 
     def get_window_state(self, window: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def click(self, arguments: Mapping[str, Any]) -> dict[str, Any]: ...
 
 
 @dataclass
@@ -31,6 +34,7 @@ class PipelineResult:
     observation: dict[str, Any] = field(default_factory=dict)
     selections: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     reason: str | None = None
+    action_result: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -94,15 +98,17 @@ def control_candidates(elements: Sequence[dict[str, Any]]) -> list[Candidate]:
 
 
 def run_pipeline(
-    original_request: str, driver: ReadOnlyDriver, selector: ChoiceSelector,
+    original_request: str, driver: Driver, selector: ChoiceSelector,
     *, report: RunReport | None = None,
     synthetic: SyntheticRegistry = DEFAULT_REGISTRY,
+    execute_click: bool = False,
 ) -> PipelineResult:
-    """Return an observed or synthetic selection, without executing UI actions.
+    """Return a selection, optionally executing exactly one click, then stop.
 
     Real controls belong to their saved observations only. Synthetic controls
-    are semantic destinations, never fabricated driver handles. A later executor
-    must resolve them to live targets before acting.
+    are semantic destinations and cannot be clicked. Native click results report
+    action facts, not completion of the original request. No post-action read,
+    retry, foreground escalation, or extra Jev stage runs here.
     """
     windows = driver.list_windows()
     if report is not None:
@@ -182,4 +188,32 @@ def run_pipeline(
     if report is not None:
         report.append("control_selected", control=result.control, selections=control_selection.rounds)
     result.status = "selected"
+    if execute_click:
+        if result.window.get("synthetic") or result.control.get("synthetic"):
+            result.status = "no_action"
+            result.reason = "Synthetic targets have no live CUA click target; Start Menu search and typing are unsupported."
+            if report is not None:
+                report.append("action_skipped", reason=result.reason)
+            return result
+        arguments = {name: result.window.get(name) for name in ("pid", "window_id")}
+        token = result.control.get("element_token")
+        if isinstance(token, str) and token.strip():
+            arguments["element_token"] = token
+        else:
+            arguments.update(element_index=result.control.get("element_index"), snapshot_id=result.snapshot_id)
+        if report is not None:
+            report.append("action_requested", tool="click", arguments=arguments)
+        try:
+            result.action_result = driver.click(arguments)
+        except DriverError as error:
+            error.context.update(stage="click", selection=result.to_dict())
+            raise
+        result.status = "action_returned"
+        if report is not None:
+            try:
+                report.append("action_returned", tool="click", action_result=result.action_result)
+            except (OSError, ValueError):
+                # The click has already happened. Return its facts even when
+                # the report sink fails, so callers do not retry blindly.
+                logging.getLogger(__name__).warning("Could not save the action result to the run report; returning it directly.")
     return result

@@ -470,7 +470,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(client.call_args.kwargs["api_key"], "test-key")
         self.assertEqual(driver.call_args.kwargs["max_elements"], 5000)
         self.assertEqual(driver.call_args.kwargs["max_depth"], 25)
-        self.assertEqual(self.report.events[0], {"event": "run_started", "request": text})
+        self.assertEqual(self.report.events[0], {
+            "event": "run_started", "request": text, "execute_click": False,
+        })
+        self.assertFalse(pipeline.call_args.kwargs["execute_click"])
 
     def test_unreadable_request_file_still_leaves_a_closed_failure_report(self):
         with patch.object(Path, "read_bytes", side_effect=PermissionError("sensitive-file-path")):
@@ -523,6 +526,104 @@ class CliTests(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertEqual(output["status"], "no_windows")
 
+    def test_click_flag_forwards_once_and_returns_native_action_facts(self):
+        native_result = {
+            "effect": "unverifiable", "route": "accessibility", "delivery": {"mode": "background"},
+        }
+        result = PipelineResult(
+            "action_returned", window=make_window(), control=make_element(),
+            snapshot_id="snapshot-secret", action_result=native_result,
+        )
+
+        status, output, pipeline, _, driver = self.invoke(["--click", "Click Save"], result=result)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(output, result.to_dict())
+        pipeline.assert_called_once()
+        self.assertEqual(pipeline.call_args.args[0], "Click Save")
+        self.assertIs(pipeline.call_args.args[1], driver.return_value)
+        self.assertTrue(pipeline.call_args.kwargs["execute_click"])
+        self.assertEqual(self.report.events, [
+            {"event": "run_started", "request": "Click Save", "execute_click": True},
+            {"event": "run_finished", "result": result.to_dict()},
+        ])
+        self.assertTrue(self.report.closed)
+
+    def test_click_with_unsupported_target_returns_no_action_and_exit_two(self):
+        result = PipelineResult(
+            "no_action", window={"synthetic": True, "title": "Start Menu"},
+            control={"synthetic": True, "label": "Search"},
+            reason="Synthetic targets have no live CUA click target.",
+        )
+
+        status, output, pipeline, _, _ = self.invoke(["--click", "Open Start"], result=result)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(output, result.to_dict())
+        self.assertIsNone(output["action_result"])
+        self.assertTrue(pipeline.call_args.kwargs["execute_click"])
+        self.assertEqual(self.report.events[-1], {"event": "run_finished", "result": result.to_dict()})
+        self.assertTrue(self.report.closed)
+
+    def test_click_refusal_keeps_native_result_and_selection_in_output_and_report(self):
+        native_result = {
+            "status": "refused", "refusal": {
+                "code": "stale_element_token",
+                "message": "element_token is stale; call get_window_state again to refresh",
+            },
+        }
+        selected = PipelineResult(
+            "selected", window=make_window(), control=make_element(), snapshot_id="snapshot-secret",
+            selections={"windows": [], "controls": []},
+        )
+        error = DriverError(
+            "CUA rejected the stale element token.", code="stale_element_token", tool="click", exit_code=0,
+        )
+        error.context.update(stage="click", action_result=native_result, selection=selected.to_dict())
+
+        status, output, pipeline, _, _ = self.invoke(["--click", "Click Save"], error=error)
+
+        self.assertEqual(status, 1)
+        self.assertEqual(output, {
+            "status": "error", "error": str(error), "code": "stale_element_token", "tool": "click",
+            "exit_code": 0, "stage": "click", "action_result": native_result, "selection": selected.to_dict(),
+        })
+        pipeline.assert_called_once()
+        self.assertTrue(pipeline.call_args.kwargs["execute_click"])
+        self.assertEqual(self.report.events, [
+            {"event": "run_started", "request": "Click Save", "execute_click": True},
+            {"event": "run_error", **output},
+        ])
+        self.assertTrue(self.report.closed)
+
+    def test_completed_click_keeps_stdout_and_exit_zero_when_final_report_write_fails(self):
+        result = PipelineResult(
+            "action_returned", window=make_window(), control=make_element(),
+            action_result={
+                "effect": "unverifiable", "route": "accessibility", "delivery": {"mode": "background"},
+            },
+        )
+        append_original = RecordingReport.append
+        for report_error in (OSError("private-report-path"), ValueError("private-report-state")):
+            with self.subTest(error=type(report_error).__name__):
+                def append_until_finished(report, event, **data):
+                    if event == "run_finished":
+                        raise report_error
+                    append_original(report, event, **data)
+
+                with patch.object(RecordingReport, "append", autospec=True, side_effect=append_until_finished):
+                    status, output, pipeline, _, _ = self.invoke(["--click", "Click Save"], result=result)
+
+                self.assertEqual(status, 0)
+                self.assertEqual(output, result.to_dict())
+                pipeline.assert_called_once()
+                self.assertEqual(self.report.events, [
+                    {"event": "run_started", "request": "Click Save", "execute_click": True},
+                ])
+                self.assertIn("Could not save the completed run report", self.stderr.getvalue())
+                self.assertNotIn("private-report", self.stderr.getvalue())
+                self.assertTrue(self.report.closed)
+
     def test_os_errors_do_not_expose_raw_sensitive_message(self):
         status, output, _, _, _ = self.invoke(["Find Save"], error=OSError("secret-token-and-body"))
         self.assertEqual(status, 1)
@@ -550,7 +651,7 @@ class CliTests(unittest.TestCase):
         })
         pipeline.assert_called_once()
         self.assertEqual(self.report.events, [
-            {"event": "run_started", "request": "Find Save"},
+            {"event": "run_started", "request": "Find Save", "execute_click": False},
             {"event": "run_error", **output},
         ])
         self.assertTrue(self.report.closed)
@@ -562,7 +663,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(output, result.to_dict())
         self.assertEqual(self.report.events, [
-            {"event": "run_started", "request": "Find Save"},
+            {"event": "run_started", "request": "Find Save", "execute_click": False},
             {"event": "run_finished", "result": result.to_dict()},
         ])
         self.assertIs(pipeline.call_args.kwargs["report"], self.report)
@@ -581,7 +682,7 @@ class CliTests(unittest.TestCase):
                     self.invoke(["Find Save"], error=error)
                 self.assertIs(raised.exception, error)
                 self.assertEqual(self.report.events, [
-                    {"event": "run_started", "request": "Find Save"},
+                    {"event": "run_started", "request": "Find Save", "execute_click": False},
                     {"event": "run_interrupted", "error_type": type(error).__name__},
                 ])
                 self.assertTrue(self.report.closed)
@@ -618,7 +719,9 @@ class CliTests(unittest.TestCase):
                                     self.invoke(["Find Save"], error=original_error)
                                 self.assertIs(raised.exception, original_error)
                     close.assert_called_once()
-                    self.assertEqual(self.report.events, [{"event": "run_started", "request": "Find Save"}])
+                    self.assertEqual(self.report.events, [
+                        {"event": "run_started", "request": "Find Save", "execute_click": False},
+                    ])
                     self.assertIn("Could not append", self.stderr.getvalue())
                     self.assertIn("Could not close", self.stderr.getvalue())
                     self.assertNotIn("sensitive-write-error", self.stderr.getvalue())

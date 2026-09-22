@@ -1,15 +1,18 @@
 # ctrlloop
 
-The first Python milestone offers discovered desktop windows plus a synthetic
+The Python pipeline offers discovered desktop windows plus a synthetic
 **Start Menu** option. Jev chooses a window; a real window is inspected through
 Windows UI Automation, then its observed controls are offered for selection.
 Choosing Start Menu instead offers exactly one synthetic **Search** text field.
 The result is JSON containing the selected records, their observation information,
-and selection rounds.
+and selection rounds. Add `--click` to execute one CUA click on the selected real
+control, return its native action result, then stop.
 
-Selection retains identities in Python. It does not activate or focus windows,
-click, type, invoke controls, launch applications, or take screenshots. A request
-such as “Click Recycle Bin” only selects a candidate.
+Selection retains identities in Python. Without `--click`, a request such as
+“Click Recycle Bin” only selects a candidate. Click execution uses the control's
+existing snapshot-bound target and CUA's default background delivery. There is no
+post-action snapshot, retry, reselection, foreground escalation, coordinate
+fallback, typing, or additional Jev planning stage.
 
 The Start Menu route is available even when the real menu is closed. An observed
 Start window is represented by this same route, so it does not add a duplicate
@@ -22,10 +25,8 @@ Both Start Menu and Search records have `synthetic: true`. Search has role `Edit
 invented PID, window handle, element index/token, geometry, or snapshot identity.
 The existing singleton rule selects Search without an extra Jev request.
 
-This change supplies the selection target for a later computer-use executor.
-That executor must open Start, resolve its real search field in a fresh CUA
-snapshot, and type the supplied text. The selection pipeline itself does not yet
-perform those actions or generate the text to enter.
+With `--click`, a synthetic selection returns `no_action`: it has no live click
+target. Opening Start, resolving its search field, and typing are deferred.
 
 ## Defining synthetic windows and controls
 
@@ -90,6 +91,8 @@ From the repository root, with Python 3.11+ and `uv`:
 uv sync --locked
 # Set TYPESAFE_API_KEY in your process environment or local .env (not committed).
 uv run --locked python src/main.py 'Find the Recycle Bin control on the desktop.'
+# Opt in to exactly one click after selection:
+uv run --locked python src/main.py --click 'Click the Test button in my test window.'
 ```
 
 The dependencies remain pinned to `typesafe-sdk==0.7.1`,
@@ -115,10 +118,10 @@ uv run --locked python -m unittest discover -s tests -v
 
 The source modules live directly in `src/` and feed into `src/main.py`:
 
-- `driver.py` discovers windows and reads the selected window's accessibility state.
+- `driver.py` discovers windows, reads accessibility state, and dispatches one native click.
 - `selection.py` batches Jev Choice questions and advances one winner per group.
 - `synthetic.py` defines synthetic windows, their controls, and duplicate-matching rules.
-- `pipeline.py` connects window discovery, window selection, the snapshot read, and control selection.
+- `pipeline.py` connects discovery, selection, the snapshot read, and optional click execution.
 - `reporting.py` appends durable run events and captures the actual Jev HTTP bodies.
 - `main.py` provides the CLI, loads configuration, and prints the result.
 
@@ -136,17 +139,25 @@ with TypeSafeClient(model=PINNED_MODEL, retry=RetryPolicy(max_retries=0)) as cli
     print(result.to_dict())
 ```
 
+Pass `execute_click=True` to the same `run_pipeline` call to enable the click.
+It reuses the selected window/control dictionaries and adds the driver's native
+dictionary as `action_result`; no separate action-selection API is needed.
+
 The Python API raises `DriverError` or `SelectionError` for failures. The CLI
 reports them as `{"status":"error","error":"..."}` with exit code 1.
 Driver errors also include a safe diagnostic `code`, tool and process exit code
 when available. A failed window read retains its stage, selected window metadata,
-and completed window-selection rounds. Raw driver stdout/stderr and UI trees are
-not copied into error messages. An unknown driver failure is reported as unknown;
+and completed window-selection rounds. A click failure retains `stage: "click"`,
+the completed `selection`, and any parsed native `action_result`. Python callers
+can inspect these in `DriverError.context`. Raw driver stdout/stderr and UI trees
+are not copied into error messages. An unknown driver failure is reported as unknown;
 it is not automatically attributed to daemon access.
 
 | Status | Meaning | CLI exit |
 | --- | --- | --- |
 | `selected` | A real window/control or synthetic Start Menu/Search target was chosen | 0 |
+| `action_returned` | One click returned native action facts; its application effect may be unverified | 0 |
+| `no_action` | Click requested for a synthetic target without live CUA identifiers | 2 |
 | `no_windows` | No first-stage candidate selected; normally unreachable with the Start Menu option | 2 |
 | `no_controls` | A valid read returned no indexed controls, or a synthetic window defines no controls | 2 |
 | `observation_degraded` | A degraded read returned no indexed controls | 2 |
@@ -156,6 +167,11 @@ it is not automatically attributed to daemon access.
 Nonempty degraded observations remain selectable and retain their quality flags.
 `selected` means selection completed, not that the user's original UI operation
 was performed or that the chosen control is guaranteed to fulfill it.
+`action_returned` also does not claim the original request is complete. Inspect
+`action_result.effect`, `route`, and any `delivery`, `evidence`, or `escalation`.
+Effects such as `unverifiable` and `suspected_noop` still return exit 0 because the
+driver returned action facts; native refusals and failures return `error`/exit 1.
+A timeout or unreadable response leaves delivery unknown and is never retried.
 
 ## Debug in VS Code
 
@@ -168,7 +184,7 @@ folder is ignored by Git.
 
 Reports contain these milestones:
 
-- `run_started`: the original request.
+- `run_started`: the original request and the `execute_click` flag.
 - `windows_discovered`: the complete observed window list, in discovery order;
   it does not include the synthetic Start Menu option.
 - `jev_request`: the actual JSON body captured by the HTTP client's request hook
@@ -186,20 +202,25 @@ Reports contain these milestones:
   here even though they require no Jev request. The Start Menu and Search selections
   are marked `synthetic: true` in `window_selected` and `control_selected`. This
   route records no `window_observed` event because no live snapshot is taken.
+- `action_requested` and `action_returned`: native click arguments and returned
+  action facts when click execution is enabled. A synthetic selection instead
+  records `action_skipped` with its reason. A click failure ends with `run_error`.
 - `run_finished`, `run_error`, or `run_interrupted`: the result or failure reached.
 
 Every new entry is saved immediately: the updated document is written to a
 temporary file, flushed and synced, then atomically replaces the previous report.
 A timeout, driver failure, or invalid Jev response preserves earlier entries.
 An abrupt process kill may leave no terminal event, but the last saved report
-remains valid JSON. Failure to write a report stops the run before
-further work; failure to append a final error entry does not hide the original
-error. Reports intentionally contain user requests and UI titles/values, but no
-HTTP headers or raw exception messages.
+remains valid JSON. A report failure before dispatch stops the run before the
+click. If saving fails after a native action result has been captured, the CLI
+warns and still returns those facts so the report failure does not hide a
+possibly delivered action. Failure to append a final error entry also preserves
+the original error. Reports intentionally contain user requests, UI titles/values,
+and native action diagnostics, but no HTTP headers or raw exception messages.
 
 The reporter does not filter candidates, alter questions, change grouping, or
 choose winners. It observes the existing pipeline. The JSON returned on stdout
-keeps its existing shape.
+retains selection and observation information alongside the optional action result.
 
 Open this repository folder in VS Code and select **ctrlloop: step through main**
 in Run and Debug. Press **F5**, enter the original request, and the debugger pauses
@@ -256,10 +277,13 @@ synthetic “none” options.
 
 ## Observation limits
 
-The driver is called only through `list_windows({})` and `get_window_state` with
+Observation calls use `list_windows({})` and `get_window_state` with
 the selected record's exact `pid`/`window_id`, accessibility enabled and screenshots
 disabled. The adapter separates stdout/stderr and validates JSON and success
 shape, because some driver failures print plain text with exit code zero.
+With click enabled, the next and final driver call is `click` using the selected
+window's `pid`/`window_id` and the original `element_token`, or the matching
+`element_index`/`snapshot_id` pair when no token is present.
 
 Real controls come from one saved snapshot. The synthetic Search branch takes no
 control snapshot and marks its observation source as `synthetic`.
@@ -271,10 +295,21 @@ ancestry or claim full coverage. Windows 0.28.2 commonly reports
 `elements_complete:false`, including successful reads; that alone is not failure.
 
 Real window identities are live OS identities. Control indices/tokens are bound to
-the recorded snapshot and its transport lifecycle. One-shot CLI transports end
-after their response, so exported handles are observation evidence, not reusable
-action authorization or a promise that a later call can use them. Any future
-action milestone needs its own fresh observation and lifecycle design.
+the recorded snapshot in the running daemon. Separate one-shot CLI calls use that
+same daemon cache; ending the CLI process alone does not invalidate it. A newer
+snapshot of the same window, cache eviction, a runtime restart, or a changed
+window identity can invalidate the target. The pipeline takes no intervening
+snapshot and preserves CUA's stale-target refusal if another client supersedes it.
+Exported report handles are historical evidence, not permanent UI identifiers or
+authorization to replay an action. See the [versioned cache contract](docs/cua-driver/0.28.2/README.md#7-single-click-contract).
+
+A host smoke test with the production adapter used a disposable, nonactivating
+WinForms Test button. Separate `list_windows`, `get_window_state`, and `click`
+calls produced exactly one button callback and no post-action driver reads;
+the fixture then exited. CUA returned `effect: "unverifiable"`,
+`route: "accessibility"`, and background delivery. This confirms the isolated
+click path. The sandbox separately returned `pipe_access_denied`; host execution
+could reach the existing daemon.
 
 Implementation references: [TypeSafe Python usage](https://docs.typesafe.ai/sdk/python/usage),
 [Choice](https://docs.typesafe.ai/primitives/choice),
