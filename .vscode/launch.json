@@ -9,7 +9,7 @@
       "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "args": ["I want to open my hermes agent"],
+      "args": ["open slack"],
       "stopOnEntry": false,
       "justMyCode": true
     }

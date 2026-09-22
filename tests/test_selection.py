@@ -237,6 +237,36 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(distribution=distribution):
                 self.assert_bad_response(lambda response: setattr(next(iter(response.answers.values())), "probabilities", distribution))
 
+    def test_probability_total_accepts_up_to_three_percent_deviation(self):
+        distributions = {
+            "reported_99_percent": [0.08, 0.20, 0.05, 0.03, 0.04, 0.04, 0.04, 0.10, 0.20, 0.21],
+            "lower_boundary": [0.1] * 9 + [0.07],
+            "upper_boundary": [0.1] * 9 + [0.13],
+        }
+        for name, values in distributions.items():
+            with self.subTest(distribution=name):
+                def set_distribution(response):
+                    answer = next(iter(response.answers.values()))
+                    answer.probabilities = dict(zip(answer.probabilities, values, strict=True))
+
+                observed = candidates(10)
+                client = FakeClient(mutate=set_distribution, choose=lambda labels: labels[1])
+                result = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
+                self.assertIs(result.winner, observed[1])
+
+    def test_probability_total_rejects_more_than_three_percent_deviation(self):
+        for last_probability in (0.069, 0.131):
+            with self.subTest(last_probability=last_probability):
+                def set_distribution(response):
+                    answer = next(iter(response.answers.values()))
+                    values = [0.1] * 9 + [last_probability]
+                    answer.probabilities = dict(zip(answer.probabilities, values, strict=True))
+
+                client = FakeClient(mutate=set_distribution)
+                with self.assertRaisesRegex(SelectionError, "more than 3%"):
+                    ChoiceSelector(client).select(ORIGINAL, candidates(10), stage="controls")
+                self.assertEqual(len(client.calls), 1)
+
     def test_confidence_must_be_finite_probability(self):
         for value in (None, float("nan"), float("inf"), -0.1, 1.1, True, "1"):
             with self.subTest(value=value):
