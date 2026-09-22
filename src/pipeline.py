@@ -3,7 +3,6 @@
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
-import logging
 from typing import Any, Protocol
 
 if __package__:
@@ -159,16 +158,7 @@ def run_pipeline(
             error.context.update({"stage": "bring_to_front", "selection": result.to_dict()})
             raise
         if report is not None:
-            try:
-                report.append("action_returned", tool="bring_to_front", action_result=foreground_result)
-            except (OSError, ValueError):
-                # Focus changed even if the report write failed. Preserve that
-                # fact for callers and stop before taking any further action.
-                error = DriverError("The window was brought forward, but its result could not be saved.",
-                                    code="report_write_failed", tool="bring_to_front")
-                error.context.update(stage="bring_to_front", selection=result.to_dict(),
-                                     action_result=foreground_result)
-                raise error from None
+            report.append("action_returned", tool="bring_to_front", action_result=foreground_result)
         try:
             with (
                 report.span("control_acquisition", stage="controls", tool="get_window_state")
@@ -270,10 +260,5 @@ def run_pipeline(
                 raise
             result.status = "action_returned"
             if report is not None:
-                try:
-                    report.append("action_returned", tool="click", action_result=result.action_result)
-                except (OSError, ValueError):
-                    # The click has already happened. Return its facts even when
-                    # the report sink fails, so callers do not retry blindly.
-                    logging.getLogger(__name__).warning("Could not save the action result to the run report; returning it directly.")
+                report.append("action_returned", tool="click", action_result=result.action_result)
     return result

@@ -3,7 +3,6 @@
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-import json
 import logging
 import math
 from typing import Any, TYPE_CHECKING
@@ -24,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class SelectionError(Exception):
-    """A request cannot be packed or a Jev response cannot be used safely."""
+    """Jev rejected a complete round or its response cannot be used safely."""
 
 
 @dataclass(frozen=True)
@@ -34,32 +33,10 @@ class Candidate:
     record: dict[str, Any]
 
 
-@dataclass(frozen=True)
-class RequestBudget:
-    # UTF-8 JSON bytes are a conservative packing heuristic, NOT a tokenizer.
-    # Leave headroom for the API's 64k total / 32k state+one-question limits.
-    max_request_bytes: int = 48_000
-    max_question_bytes: int = 24_000
-
-    def __post_init__(self) -> None:
-        for value in (self.max_request_bytes, self.max_question_bytes):
-            if type(value) is not int or value <= 0:
-                raise ValueError("Request byte budgets must be positive integers.")
-
-
 @dataclass
 class Selection:
     winner: Candidate | None
     rounds: list[dict[str, Any]] = field(default_factory=list)
-
-
-def _request_bytes(state: str, questions: Mapping[str, Choice], model: str) -> int:
-    body = {
-        "model": model,
-        "state": state,
-        "questions": {key: question.model_dump() for key, question in questions.items()},
-    }
-    return len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
 def _probability(value: Any) -> bool:
@@ -76,43 +53,21 @@ class ChoiceSelector:
         client: Any,
         *,
         model: str = PINNED_MODEL,
-        budget: RequestBudget | None = None,
     ) -> None:
         if model != PINNED_MODEL:
             raise ValueError(f"This experiment requires {PINNED_MODEL}.")
         self.client = client
         self.model = model
-        self.budget = budget or RequestBudget()
-
-    def _pack(self, state: str, questions: dict[str, Choice]) -> list[dict[str, Choice]]:
-        batches: list[dict[str, Choice]] = []
-        batch: dict[str, Choice] = {}
-        for key, question in questions.items():
-            single_size = _request_bytes(state, {key: question}, self.model)
-            if single_size > min(
-                self.budget.max_question_bytes, self.budget.max_request_bytes
-            ):
-                raise SelectionError(
-                    "The unchanged request plus one candidate group exceeds the "
-                    "configured byte budget. Increase the budget within service "
-                    "limits or supply a shorter original request."
-                )
-            proposed = {**batch, key: question}
-            if batch and _request_bytes(state, proposed, self.model) > self.budget.max_request_bytes:
-                batches.append(batch)
-                batch = {}
-            batch[key] = question
-        if batch:
-            batches.append(batch)
-        return batches
 
     def _judge(
         self, state: str, questions: dict[str, Choice], *, report: "RunReport | None" = None,
     ) -> tuple[dict[str, str], dict]:
         try:
-            # This interval includes SDK encoding/decoding and any HTTP attempts.
-            # The report's HTTP hooks expose the narrower observed wire interval.
-            with report.span("selection.sdk_call") if report else nullcontext({}) as sdk_timing:
+            # SDK time includes request encoding and response decoding. The
+            # report's HTTP timing separately measures the client-observed call.
+            with report.span(
+                "selection.sdk_call", question_keys=list(questions),
+            ) if report else nullcontext({}) as sdk_timing:
                 response = self.client.system_one(
                     state=state, questions=questions, model=self.model
                 )
@@ -120,12 +75,18 @@ class ChoiceSelector:
             # No request bodies, UI content, credentials, or raw HTTP responses in errors.
             status = getattr(error, "status", None)
             safe_status = status if type(status) is int else "unavailable"
+            if status in (413, 422):
+                raise SelectionError(
+                    f"Jev rejected the complete round (HTTP {safe_status}); verify "
+                    "the service request limits and question format. The round "
+                    "was not split into smaller calls."
+                ) from None
             raise SelectionError(
                 f"TypeSafe request failed: {type(error).__name__} (HTTP {safe_status})."
             ) from None
 
         with report.span("selection.response_validation") if report else nullcontext({}) as validation_timing:
-            choices, trace = self._validate_response(state, questions, response)
+            choices, trace = self._validate_response(questions, response)
         if report:
             trace.update(
                 sdk_span_id=sdk_timing["span_id"],
@@ -134,7 +95,7 @@ class ChoiceSelector:
         return choices, trace
 
     def _validate_response(
-        self, state: str, questions: dict[str, Choice], response: Any
+        self, questions: dict[str, Choice], response: Any
     ) -> tuple[dict[str, str], dict]:
         returned_model = getattr(response, "model", None)
         logger.info("Jev requested_model=%s response_model=%r", self.model, returned_model)
@@ -187,7 +148,6 @@ class ChoiceSelector:
             "question_keys": list(questions),
             "requested_model": self.model,
             "response_model": returned_model,
-            "request_bytes": _request_bytes(state, questions, self.model),
             **tokens,
         }
 
@@ -219,50 +179,30 @@ class ChoiceSelector:
                         for group_index, group in enumerate(groups):
                             key = f"{round_id}_g{group_index}"
                             group_keys.append(key)
-                            if len(group) > 1:
-                                questions[key] = Choice(
-                                    instructions=QUESTION,
-                                    criteria={candidate.key: candidate.description for candidate in group},
-                                )
-                    with report.span("selection.packing") if report else nullcontext({}) as packing_timing:
-                        packed = self._pack(original_request, questions)
-                        question_batches = {
-                            key: f"{round_id}_b{batch_index}"
-                            for batch_index, batch in enumerate(packed) for key in batch
-                        }
-                    # Finish every independent batch in this round before constructing the next.
-                    chosen: dict[str, str] = {}
-                    batches = []
-                    for batch_index, batch in enumerate(packed):
-                        batch_id = f"{round_id}_b{batch_index}"
-                        with report.span(
-                            "selection.batch", batch_id=batch_id, question_keys=list(batch),
-                        ) if report else nullcontext({}) as batch_timing:
-                            answers, trace = self._judge(original_request, batch, report=report)
-                            chosen.update(answers)
-                            trace["batch_id"] = batch_id
-                            if report:
-                                trace["span_id"] = batch_timing["span_id"]
-                            batches.append(trace)
+                            questions[key] = Choice(
+                                instructions=QUESTION,
+                                criteria={candidate.key: candidate.description for candidate in group},
+                            )
+                    # Every group's question belongs in this round's single call.
+                    chosen, api_call = self._judge(original_request, questions, report=report)
                     with report.span("selection.advancement") if report else nullcontext({}) as advancement_timing:
                         winners = []
                         group_traces = []
                         for key, group in zip(group_keys, groups, strict=True):
-                            winner_key = group[0].key if len(group) == 1 else chosen[key]
+                            winner_key = chosen[key]
                             winner = next(candidate for candidate in group if candidate.key == winner_key)
                             winners.append(winner)
                             group_traces.append({
-                                "question_key": key if len(group) > 1 else None,
+                                "question_key": key,
                                 "options": [candidate.key for candidate in group],
                                 "winner": winner.key,
-                                "forwarded": len(group) == 1,
-                                "batch_id": question_batches.get(key),
                             })
                         round_trace = {
                             "candidate_count": len(current),
+                            "group_count": len(groups),
                             "winner_count": len(winners),
                             "groups": group_traces,
-                            "batches": batches,
+                            "api_call": api_call,
                             "round": round_number,
                             "round_id": round_id,
                         }
@@ -271,7 +211,6 @@ class ChoiceSelector:
                         round_trace.update(
                             span_id=round_timing["span_id"],
                             grouping_span_id=grouping_timing["span_id"],
-                            packing_span_id=packing_timing["span_id"],
                             advancement_span_id=advancement_timing["span_id"],
                         )
                     rounds.append(round_trace)

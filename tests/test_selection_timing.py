@@ -10,7 +10,7 @@ import httpx2
 from typesafe_sdk import RetryPolicy, TypeSafeClient, TypeSafeError
 
 from src.reporting import RunReport
-from src.selection import ChoiceSelector, PINNED_MODEL, RequestBudget, SelectionError
+from src.selection import ChoiceSelector, PINNED_MODEL, SelectionError
 from tests.test_selection import EXPECTED_QUESTION, FakeClient, ORIGINAL, candidates
 
 
@@ -29,6 +29,7 @@ class SelectionTimingTests(unittest.TestCase):
         shutil.rmtree(target)
 
     def events(self, report):
+        report.close()
         return json.loads(report.path.read_text(encoding="utf-8"))
 
     def assert_paired(self, events):
@@ -47,14 +48,13 @@ class SelectionTimingTests(unittest.TestCase):
             self.assertIn(finish["status"], {"ok", "error", "interrupted"})
         return starts, finishes
 
-    def test_timings_preserve_batched_requests_and_link_every_group(self):
+    def test_timings_preserve_one_call_per_round_and_link_every_group(self):
         observed = candidates(41)
-        budget = RequestBudget(max_request_bytes=2000, max_question_bytes=1500)
         plain = FakeClient()
-        baseline = ChoiceSelector(plain, budget=budget).select(ORIGINAL, observed, stage="controls")
+        baseline = ChoiceSelector(plain).select(ORIGINAL, observed, stage="controls")
         timed = FakeClient()
         with RunReport(self.path) as report:
-            result = ChoiceSelector(timed, budget=budget).select(
+            result = ChoiceSelector(timed).select(
                 ORIGINAL, observed, stage="controls", report=report,
             )
             events = self.events(report)
@@ -71,7 +71,7 @@ class SelectionTimingTests(unittest.TestCase):
                     question.criteria,
                     {key: descriptions[key] for key in question.criteria},
                 )
-        self.assertTrue(any(len(call["questions"]) > 1 for call in timed.calls))
+        self.assertEqual([len(call["questions"]) for call in timed.calls], [5, 1])
         starts, finishes = self.assert_paired(events)
         self.assertTrue(all(e["status"] == "ok" for e in finishes.values()))
         self.assertEqual(
@@ -81,26 +81,21 @@ class SelectionTimingTests(unittest.TestCase):
         self.assertFalse(any("question" in e["operation"] for e in starts.values()))
         for round_trace in result.rounds:
             self.assertEqual(starts[round_trace["span_id"]]["round"], round_trace["round"])
-            for batch in round_trace["batches"]:
-                sdk = starts[batch["sdk_span_id"]]
-                validation = starts[batch["response_validation_span_id"]]
-                self.assertEqual(sdk["batch_id"], batch["batch_id"])
-                self.assertEqual(sdk["question_keys"], batch["question_keys"])
-                self.assertEqual(sdk["stage"], "controls")
-                self.assertLess(
-                    events.index(finishes[batch["sdk_span_id"]]), events.index(validation),
-                )
-                for question_key in batch["question_keys"]:
-                    group = next(g for g in round_trace["groups"] if g["question_key"] == question_key)
-                    self.assertEqual(group["batch_id"], batch["batch_id"])
-                    self.assertIn(group["winner"], group["options"])
+            api_call = round_trace["api_call"]
+            sdk = starts[api_call["sdk_span_id"]]
+            validation = starts[api_call["response_validation_span_id"]]
+            self.assertEqual(sdk["round_id"], round_trace["round_id"])
+            self.assertEqual(sdk["question_keys"], api_call["question_keys"])
+            self.assertEqual(sdk["stage"], "controls")
+            self.assertLess(
+                events.index(finishes[api_call["sdk_span_id"]]), events.index(validation),
+            )
             for group in round_trace["groups"]:
-                if group["forwarded"]:
-                    self.assertIsNone(group["batch_id"])
-                    self.assertIsNone(group["question_key"])
+                self.assertIn(group["question_key"], api_call["question_keys"])
+                self.assertIn(group["winner"], group["options"])
         self.assertFalse(any(e["event"].startswith("selection_") for e in events))
 
-    def test_http_questions_and_probabilities_share_the_batch_interval(self):
+    def test_http_questions_and_probabilities_share_the_single_round_call(self):
         wire_calls = []
 
         def handler(request):
@@ -133,25 +128,26 @@ class SelectionTimingTests(unittest.TestCase):
                 )
             events = self.events(report)
         self.assertEqual(len(wire_calls), 2)
-        self.assertEqual(len(wire_calls[0]["questions"]), 2)
+        self.assertEqual(len(wire_calls[0]["questions"]), 3)
+        self.assertEqual(list(wire_calls[0]["questions"]["controls_r1_g2"]["criteria"]), ["candidate_0020"])
         self.assertEqual(list(wire_calls[1]["questions"]), ["controls_r2_g0"])
         starts, _ = self.assert_paired(events)
         requests = [e for e in events if e["event"] == "jev_request"]
         responses = [e for e in events if e["event"] == "jev_response"]
         for request, response, round_trace in zip(requests, responses, result.rounds, strict=True):
-            batch = round_trace["batches"][0]
+            api_call = round_trace["api_call"]
             self.assertEqual(request["request_id"], response["request_id"])
             for event in (request, response):
-                self.assertEqual(event["batch_id"], batch["batch_id"])
                 self.assertEqual(event["round_id"], round_trace["round_id"])
-                self.assertEqual(event["question_keys"], batch["question_keys"])
-            self.assertEqual(list(request["body"]["questions"]), batch["question_keys"])
-            self.assertEqual(list(response["body"]["answers"]), batch["question_keys"])
-            self.assertEqual(starts[batch["sdk_span_id"]]["batch_id"], request["batch_id"])
+                self.assertEqual(event["question_keys"], api_call["question_keys"])
+                self.assertNotIn("batch_id", event)
+            self.assertEqual(list(request["body"]["questions"]), api_call["question_keys"])
+            self.assertEqual(list(response["body"]["answers"]), api_call["question_keys"])
+            self.assertEqual(starts[api_call["sdk_span_id"]]["round_id"], request["round_id"])
             for answer in response["body"]["answers"].values():
                 self.assertIn("probabilities", answer)
 
-    def test_batch_failure_closes_timings_and_propagates_original_error(self):
+    def test_round_call_failure_closes_timings_and_propagates_original_error(self):
         client = FakeClient()
         system_one = client.system_one
 
@@ -163,16 +159,16 @@ class SelectionTimingTests(unittest.TestCase):
         client.system_one = fail_second
         with RunReport(self.path) as report:
             with self.assertRaises(SelectionError):
-                ChoiceSelector(client, budget=RequestBudget(2000, 1500)).select(
+                ChoiceSelector(client).select(
                     ORIGINAL, candidates(40), stage="controls", report=report,
                 )
             events = self.events(report)
             self.assertNotIn("private failure details", report.path.read_text(encoding="utf-8"))
         _, finishes = self.assert_paired(events)
-        batches = [e for e in finishes.values() if e["operation"] == "selection.batch"]
+        calls = [e for e in finishes.values() if e["operation"] == "selection.sdk_call"]
         self.assertEqual(
-            [(e["batch_id"], e["status"]) for e in batches],
-            [("controls_r1_b0", "ok"), ("controls_r1_b1", "error")],
+            [(e["round_id"], e["status"]) for e in calls],
+            [("controls_r1", "ok"), ("controls_r2", "error")],
         )
         self.assertFalse(any(e["event"].startswith("selection_") for e in events))
 
@@ -201,7 +197,7 @@ class SelectionTimingTests(unittest.TestCase):
         interrupted = [e for e in finishes.values() if e.get("error_type") == "KeyboardInterrupt"]
         self.assertEqual(
             {e["operation"] for e in interrupted},
-            {"selection", "selection.round", "selection.batch", "selection.sdk_call"},
+            {"selection", "selection.round", "selection.sdk_call"},
         )
         self.assertTrue(all(e["status"] == "interrupted" for e in interrupted))
 
@@ -220,22 +216,19 @@ class SelectionTimingTests(unittest.TestCase):
         self.assertEqual(validation["status"], "error")
         self.assertFalse(any(e["event"].startswith("selection_") for e in events))
 
-    def test_validation_and_packing_failures_do_not_issue_requests(self):
-        for prompt, observed, expected_operation in (
-            ("", candidates(2), "selection.validation"),
-            ("x" * 5000, candidates(2), "selection.packing"),
-        ):
-            with self.subTest(operation=expected_operation), RunReport(self.path) as report:
+    def test_invalid_selection_does_not_issue_requests(self):
+        for prompt in ("", "   "):
+            with self.subTest(prompt=prompt), RunReport(self.path) as report:
                 client = FakeClient()
-                with self.assertRaises((ValueError, SelectionError)):
-                    ChoiceSelector(client, budget=RequestBudget(1000, 800)).select(
-                        prompt, observed, stage="windows", report=report,
+                with self.assertRaises(ValueError):
+                    ChoiceSelector(client).select(
+                        prompt, candidates(2), stage="windows", report=report,
                     )
                 events = self.events(report)
                 self.assertEqual(client.calls, [])
                 starts, finishes = self.assert_paired(events)
                 self.assertFalse(any(e["operation"] == "selection.sdk_call" for e in starts.values()))
-                failed = next(e for e in finishes.values() if e["operation"] == expected_operation)
+                failed = next(e for e in finishes.values() if e["operation"] == "selection.validation")
                 self.assertIn("error_type", failed)
 
     def test_empty_or_singleton_has_validation_timing_and_no_inference(self):

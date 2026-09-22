@@ -140,33 +140,6 @@ class ClickPipelineTests(unittest.TestCase):
                 ])
                 self.assertEqual(len(client.calls), 1)
 
-    def test_failed_post_action_report_keeps_the_native_result_and_does_not_retry(self):
-        for report_error in (OSError("private-report-path"), ValueError("private-report-state")):
-            with self.subTest(error=type(report_error).__name__):
-                driver, runner, client = self.set_up_run()
-                report = RecordingReport()
-                append_original = report.append
-
-                def append_until_action(event, **data):
-                    if event == "action_returned" and data.get("tool") != "bring_to_front":
-                        raise report_error
-                    append_original(event, **data)
-
-                with patch.object(report, "append", side_effect=append_until_action):
-                    with self.assertLogs("src.pipeline", level="WARNING") as logged:
-                        result = run_pipeline(
-                            "Click Save", driver, ChoiceSelector(client), execute_click=True, report=report,
-                        )
-
-                self.assertEqual(result.status, "action_returned")
-                self.assertEqual(result.action_result, ACTION_RESULT)
-                self.assertEqual([call[0][-1] for call in runner.calls], [
-                    "list_windows", "bring_to_front", "get_window_state", "click",
-                ])
-                self.assertEqual(report.events[-1]["event"], "action_requested")
-                self.assertIn("Could not save the action result", " ".join(logged.output))
-                self.assertNotIn("private-report", " ".join(logged.output))
-
     def test_failed_pre_action_report_stops_before_dispatch(self):
         for report_error in (OSError("report write failed"), ValueError("report closed")):
             with self.subTest(error=type(report_error).__name__):

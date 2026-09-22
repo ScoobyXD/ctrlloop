@@ -13,6 +13,7 @@ from uuid import uuid4
 import httpx2
 
 from src import main as cli
+from src import reporting
 from src.pipeline import PipelineResult
 from src.reporting import RunReport
 
@@ -54,9 +55,10 @@ class ReportingTimingTests(unittest.TestCase):
         shutil.rmtree(target)
 
     def events(self, report):
+        report.close()
         return json.loads(report.path.read_text(encoding="utf-8"))
 
-    def test_submillisecond_work_excludes_own_writes_and_wall_clock_adjustment(self):
+    def test_final_report_write_is_separate_from_work_and_wall_clock_adjustment(self):
         clock = Clock()
         with patch("src.reporting.perf_counter_ns", clock), RunReport(
             self.directory, origin_ns=clock.now, origin_wall_ns=1_700_000_000_000_000_000,
@@ -68,7 +70,7 @@ class ReportingTimingTests(unittest.TestCase):
                 clock.advance(2_000_000)
                 write(document)
 
-            with patch.object(report, "_write_document", side_effect=slow_write):
+            with patch.object(report, "_write_document", side_effect=slow_write) as writer:
                 with report.span("outer") as outer:
                     with report.span("native_action") as action:
                         clock.advance(125_123)
@@ -76,22 +78,31 @@ class ReportingTimingTests(unittest.TestCase):
                     with patch("src.reporting.time_ns", return_value=0):
                         report.append("milestone")
                 report.append("run_finished")
-            events = self.events(report)
+                writer.assert_not_called()
+                self.assertFalse(report.path.exists())
+                completion = report.close()
+                writer.assert_called_once()
+                events = self.events(report)
         start = next(e for e in events if e["event"] == "timing_started" and e["span_id"] == action["span_id"])
         self.assertAlmostEqual(action["duration_ms"], 0.125123)
-        self.assertAlmostEqual(action["started_elapsed_ms"] - start["elapsed_ms"], 2.0)
+        self.assertAlmostEqual(action["started_elapsed_ms"] - start["elapsed_ms"], 0.0)
+        self.assertNotIn("started_elapsed_ms", start)
+        self.assertNotIn("_started_ns", start)
         self.assertEqual(action["parent_span_id"], outer["span_id"])
-        self.assertAlmostEqual(outer["duration_ms"], 6.125123)
+        self.assertAlmostEqual(outer["duration_ms"], 0.125123)
         self.assertEqual([e["elapsed_ms"] for e in events], sorted(e["elapsed_ms"] for e in events))
         self.assertEqual([e["timestamp"] for e in events], sorted(e["timestamp"] for e in events))
         self.assertLess(datetime.fromisoformat(events[0]["timestamp"]), datetime.fromisoformat(events[-1]["timestamp"]))
         summary = events[-1]["timing"]
         self.assertEqual(summary["origin"], "test_clock")
-        self.assertAlmostEqual(summary["duration_ms"], 10.125123)
+        self.assertAlmostEqual(summary["duration_ms"], 0.125123)
         self.assertIsNone(summary["time_to_first_jev_request_ms"])
-        self.assertEqual(summary["report_write_count"], 6)  # Empty file plus five preceding events.
-        self.assertAlmostEqual(summary["report_write_duration_ms"], 10.0)
-        self.assertAlmostEqual(summary["report_append_duration_ms"], 10.0)
+        self.assertEqual(summary["end_boundary"], "operational_end_before_report_generation")
+        self.assertNotIn("report_write_count", summary)
+        self.assertEqual(completion["report_write_count"], 1)
+        self.assertAlmostEqual(completion["report_generation_duration_ms"], 2.0)
+        self.assertAlmostEqual(completion["report_write_duration_ms"], 2.0)
+        self.assertAlmostEqual(completion["through_report_duration_ms"], 2.125123)
 
     def test_span_closes_on_error_and_interrupt_without_disclosing_exception_message(self):
         for failure in (RuntimeError("private detail"), KeyboardInterrupt("private detail")):
@@ -109,7 +120,7 @@ class ReportingTimingTests(unittest.TestCase):
                 self.assertTrue(all(e["status"] == expected for e in ends))
                 self.assertNotIn("private detail", report.path.read_text(encoding="utf-8"))
 
-    def test_timing_write_failures_propagate_without_recovery(self):
+    def test_timing_capture_failures_propagate_without_recovery(self):
         with RunReport(self.directory) as report:
             append = report.append
 
@@ -124,37 +135,65 @@ class ReportingTimingTests(unittest.TestCase):
                         pass
             self.assertTrue(all(e["event"] == "timing_started" for e in self.events(report)))
 
-    def test_http_interval_includes_request_hook_write_but_excludes_response_write(self):
+    def test_api_interval_excludes_capture_encoding_and_report_write_but_includes_full_body(self):
         clock = Clock()
         with patch("src.reporting.perf_counter_ns", clock), RunReport(self.directory) as report:
             write = report._write_document
+            append = report.append
+
+            def slow_capture(event, **data):
+                if event == "jev_request":
+                    clock.advance(3_000_000)
+                elif event == "jev_response":
+                    clock.advance(4_000_000)
+                append(event, **data)
 
             def slow_write(document):
                 clock.advance(2_000_000)
                 write(document)
 
             def handler(request):
+                self.assertFalse(report.path.exists())
                 clock.advance(5_000_000)
                 return httpx2.Response(200, stream=TimedStream(clock))
 
-            with patch.object(report, "_write_document", side_effect=slow_write), httpx2.Client(
+            with patch.object(report, "_write_document", side_effect=slow_write) as writer, patch.object(
+                report, "append", side_effect=slow_capture,
+            ), patch("src.reporting._body_fields", wraps=reporting._body_fields) as body_decode, httpx2.Client(
                 transport=httpx2.MockTransport(handler),
                 event_hooks={"request": [report.on_request], "response": [report.on_response]},
             ) as client:
-                with report.span("selection.sdk_call", stage="controls", round=1,
-                                 batch_id="controls_r1_b0", question_keys=["controls_r1_g0", "controls_r1_g1"]):
-                    client.post("https://example.com", json={"questions": {"controls_r1_g0": {}, "controls_r1_g1": {}}})
+                with report.span("selection.round", stage="controls", round=1, round_id="controls_r1"):
+                    with report.span("selection.sdk_call", question_keys=["controls_r1_g0", "controls_r1_g1"]):
+                        clock.advance(7_000_000)  # Local request preparation before the HTTP hook.
+                        client.post("https://example.com", json={"questions": {"controls_r1_g0": {}, "controls_r1_g1": {}}})
+                    with report.span("selection.response_validation"):
+                        clock.advance(2_000_000)
+                    with report.span("selection.advancement"):
+                        clock.advance(1_000_000)
                 report.append("run_finished")
-            events = self.events(report)
+                writer.assert_not_called()
+                body_decode.assert_not_called()
+                events = self.events(report)
+                writer.assert_called_once()
+                self.assertEqual(body_decode.call_count, 2)
         request = next(e for e in events if e["event"] == "jev_request")
         response = next(e for e in events if e["event"] == "jev_response")
         self.assertEqual(response["request_id"], request["request_id"])
-        self.assertEqual(response["batch_id"], request["batch_id"])
+        self.assertEqual(response["round_id"], request["round_id"])
         self.assertEqual(response["question_keys"], ["controls_r1_g0", "controls_r1_g1"])
-        self.assertAlmostEqual(response["duration_ms"], 7.375)
+        self.assertEqual(request["start_boundary"], "prepared_request_before_transport")
+        self.assertAlmostEqual(request["request_preparation_duration_ms"], 10.0)
+        self.assertAlmostEqual(response["duration_ms"], 5.375)
         self.assertAlmostEqual(response["response_body_read_duration_ms"], 0.375)
-        self.assertAlmostEqual(response["response_headers_elapsed_ms"] - request["elapsed_ms"], 7.0)
+        self.assertAlmostEqual(response["response_headers_elapsed_ms"] - request["elapsed_ms"], 5.0)
         self.assertAlmostEqual(events[-1]["timing"]["time_to_first_jev_request_ms"], request["elapsed_ms"])
+        sdk = next(e for e in events if e["event"] == "timing_finished")
+        self.assertAlmostEqual(sdk["duration_ms"], 19.375)
+        round_timing = next(e for e in events if e["event"] == "timing_finished" and e["operation"] == "selection.round")
+        self.assertAlmostEqual(round_timing["response_processing_duration_ms"], 7.0)
+        self.assertEqual(round_timing["response_processing_started_elapsed_ms"], response["finished_elapsed_ms"])
+        self.assertAlmostEqual(round_timing["response_processing_finished_elapsed_ms"], 22.375)
 
     def test_request_without_response_ends_at_observed_sdk_error_or_interrupt(self):
         for failure in (httpx2.ConnectError("private transport detail"), KeyboardInterrupt("private interrupt")):
@@ -166,14 +205,14 @@ class ReportingTimingTests(unittest.TestCase):
                     "request": [report.on_request], "response": [report.on_response],
                 }) as client:
                     with self.assertRaises(type(failure)) as raised:
-                        with report.span("selection.sdk_call", batch_id="controls_r1_b0"):
+                        with report.span("selection.sdk_call", round_id="controls_r1"):
                             client.post("https://example.com", json={})
                 self.assertIs(raised.exception, failure)
                 events = self.events(report)
                 request = next(e for e in events if e["event"] == "jev_request")
                 unfinished = next(e for e in events if e["event"] == "jev_request_unfinished")
                 self.assertEqual(unfinished["request_id"], request["request_id"])
-                self.assertEqual(unfinished["batch_id"], request["batch_id"])
+                self.assertEqual(unfinished["round_id"], request["round_id"])
                 self.assertEqual(unfinished["end_boundary"], "sdk_call_exit_without_complete_response")
                 self.assertEqual(unfinished["finished_elapsed_ms"], events[-1]["finished_elapsed_ms"])
                 self.assertNotIn("private", report.path.read_text(encoding="utf-8"))

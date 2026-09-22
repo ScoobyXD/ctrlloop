@@ -82,8 +82,9 @@ result = run_pipeline(original_request, driver, selector, synthetic=registry)
 This example is not enabled by default. Window keys must be nonempty and unique;
 `window_` is reserved for discovered windows. Control keys must be nonempty and
 unique within their window. Duplicate or reserved keys fail at registry creation.
-A single control advances without Jev; multiple controls use the existing batched
-selector. A definition with no controls returns `no_controls`. Passing
+A single control advances without Jev; multiple controls use the same selection
+rounds, with one API call per round. A definition with no controls returns
+`no_controls`. Passing
 `SyntheticRegistry(())` disables synthetic options and their replacement rules.
 Observed windows otherwise retain their original identity, order, and keys.
 
@@ -123,10 +124,10 @@ uv run --locked python -m unittest discover -s tests -v
 The source modules live directly in `src/` and feed into `src/main.py`:
 
 - `driver.py` discovers and activates windows, reads accessibility state, and dispatches native clicks.
-- `selection.py` batches Jev Choice questions and advances one winner per group.
+- `selection.py` sends all group questions in one Jev call per round and advances one winner per group.
 - `synthetic.py` defines synthetic windows, their controls, and duplicate-matching rules.
 - `pipeline.py` connects window selection, activation, a fresh snapshot, control selection, and optional clicking.
-- `reporting.py` appends durable run events and captures the actual Jev HTTP bodies.
+- `reporting.py` collects events and actual Jev HTTP bodies in memory, then writes the report once at the end.
 - `main.py` provides the CLI, loads configuration, and prints the result.
 
 From the repository root, `uv run --locked python -m src.main` also runs the CLI.
@@ -179,13 +180,12 @@ A timeout or unreadable response leaves delivery unknown and is never retried.
 
 ## Debug in VS Code
 
-The CLI automatically creates a unique `reports/run-*.json` file in this project
-once reporting initialization succeeds and prints its full path to stderr. The
-same behavior applies in VS Code; no additional launch arguments are needed. The
-file is an indented JSON array of
-events with a UTC timestamp and event name. Nested objects and arrays expand onto
-separate lines. Open or export the file while the run is still in progress. The
-folder is ignored by Git.
+The CLI chooses a unique `reports/run-*.json` path in this project and prints it
+to stderr. Events and timestamps stay in memory during execution; the file is
+created once at the end. The same behavior applies in VS Code without additional
+launch arguments. The completed file is an indented JSON array of events with UTC
+timestamps and event names. Nested objects and arrays expand onto separate lines.
+The folder is ignored by Git.
 
 Reports contain these milestones:
 
@@ -195,7 +195,8 @@ Reports contain these milestones:
 - `jev_request`: the actual JSON body captured by the HTTP client's request hook
   after SDK serialization and before network access, plus a request ID, URL, method,
   and byte count. Its `body` contains the exact JSON fields and values sent to Jev,
-  including every batched question and candidate description. JSON whitespace is
+  including every group question and candidate description for the round. JSON
+  whitespace is
   normalized by the report writer; this is not a dump of Python object internals.
 - `jev_response`: the response body before SDK/selection validation, associated
   with the same request ID. `body.answers` retains every chosen label, confidence,
@@ -213,22 +214,23 @@ Reports contain these milestones:
 - `run_finished`, `run_error`, or `run_interrupted`: the result or failure reached.
 
 The same event array includes monotonic elapsed timings for startup, discovery,
-candidate preparation, selection rounds/batches, foreground activation, UIA reads,
+candidate preparation, selection rounds, foreground activation, UIA reads,
 and optional action preparation/invocation. See [reading run timings](docs/timing.md)
-for event correlation, bottleneck inspection, and measurement limits. Jev questions
-in one batch share one observed request interval; native action return latency does
-not establish a visible UI change or completion of the original request.
+for event correlation, bottleneck inspection, and measurement limits. All group
+questions in a round share one observed API call duration; native action return
+latency does not establish a visible UI change or completion of the original request.
 
-Every new entry is saved immediately: the updated document is written to a
-temporary file, flushed and synced, then atomically replaces the previous report.
-A timeout, driver failure, or invalid Jev response preserves earlier entries.
-An abrupt process kill may leave no terminal event, but the last saved report
-remains valid JSON. A report failure before dispatch stops the run before the
-click. If saving fails after a native action result has been captured, the CLI
-warns and still returns those facts so the report failure does not hide a
-possibly delivered action. Failure to append a final error entry also preserves
-the original error. Reports intentionally contain user requests, UI titles/values,
-and native action diagnostics, but no HTTP headers or raw exception messages.
+The reporter retains each event in memory without serializing or copying the
+entire event history. Once the operational result and normal client cleanup are
+complete, it serializes the full report and writes it once. Report generation and
+writing are timed separately from the operational run; their completed duration
+is returned in the JSON result on stdout. No second write is needed to insert the
+duration of the report's own write.
+
+Ordinary failures and interruptions produce a final report when the process can
+finish normally. An abrupt process termination can lose the in-memory report.
+Reports intentionally contain user requests, UI titles/values, and native action
+diagnostics, but no HTTP headers or raw exception messages.
 
 The reporter does not filter candidates, alter questions, change grouping, or
 choose winners. It observes the existing pipeline. The JSON returned on stdout
@@ -254,10 +256,10 @@ VS Code's graphical breakpoints. See the [VS Code Python debugger guide](https:/
 
 Start Menu is prepended to the first-stage options. Other real windows preserve
 the driver's observed order, as do controls from real snapshots. Each group contains at most ten
-candidates and receives one Choice question. One winner from every group advances
-in group order; winners are regrouped in tens until one remains. A singleton is
-forwarded in Python without an API request. For 1,000 candidates, the round counts
-are `1000 -> 100 -> 10 -> 1`. Group size ten is fixed for this experiment.
+candidates and receives one group question using Jev Choice. One winner from
+every group advances in group order; winners are regrouped in tens until one
+remains. If selection starts with only one candidate, no round or API call is
+needed. For 1,000 candidates, the round counts are `1000 -> 100 -> 10 -> 1`. Group size ten is fixed for this experiment.
 
 Every question uses this exact text:
 
@@ -272,15 +274,17 @@ ancestors. Description text is capped at 240 characters (120 for ancestor labels
 the full observed records remain local and the original prompt is never shortened.
 No PID, HWND, snapshot token, screenshot, or redundant full tree is sent as state.
 
-Independent group questions are packed together; the next round begins only after
-all batches in the preceding round finish. The default packing caps are 48,000
-UTF-8 JSON bytes per request and 24,000 bytes for the state plus one question and
-request envelope. `--max-request-bytes` and `--max-question-bytes` configure these
-caps. These are conservative **byte heuristics, not exact token counts or a service
-limit guarantee**. They leave headroom for the documented 64k total and 32k
-state-plus-longest-question limits. An oversized group fails explicitly; the code
-does not split its options or silently truncate the prompt. Actual input/output
-token usage is retained per batch. Review it when adjusting caps.
+**Every selection round makes exactly one API call containing all its group
+questions.** The next round starts after that response is processed, because it
+needs the previous round's winners. For 392 control candidates, the rounds are
+`392 -> 40 -> 4 -> 1`: 40 group questions in one call, then four in one call,
+then one in one call.
+
+There is no byte-based request splitting or request-budget CLI configuration.
+Actual service limits still apply; an oversized request fails explicitly rather
+than being split into extra calls or having candidates silently removed. Actual
+input/output token usage is retained for each round's API call. See
+[main workflow](docs/main-workflow.md) for the workflow and timing contract.
 
 Returned model identity, question keys, answer type, option labels, probability
 shape, and usage are validated. Confidence and probabilities never rank winners

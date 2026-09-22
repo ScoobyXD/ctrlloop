@@ -1,6 +1,7 @@
-"""Readable run reports and public HTTP hooks for the actual Jev payloads."""
+"""Buffer run observations and HTTP timings; write one report at completion."""
 
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import math
@@ -36,7 +37,7 @@ def _body_fields(content: bytes) -> dict[str, Any]:
 
 
 class RunReport:
-    """Keep each completed observation durable without reconstructing API data.
+    """Collect observations in memory and serialize them once on close.
 
     Reports intentionally include request and observed UI content. HTTP headers,
     URL credentials/query strings, and exception messages are never recorded by
@@ -56,15 +57,14 @@ class RunReport:
         self._first_request_ns: int | None = None
         self._write_ns = 0
         self._write_count = 0
-        self._append_ns = 0
+        self._finished_ns: int | None = None
+        self._completion_timing: dict[str, Any] = {}
         directory = directory.resolve()
-        directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         self.path = directory / f"run-{stamp}-{uuid4().hex}.json"
         self._events: list[dict[str, Any]] = []
         self._closed = False
         self._request_count = 0
-        self._write("[]\n")
 
     def _write(self, text: str) -> None:
         started_ns = perf_counter_ns()
@@ -106,7 +106,9 @@ class RunReport:
         return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
     def _context(self) -> dict[str, Any]:
-        return self._contexts[-1].copy() if self._contexts else {}
+        if not self._contexts:
+            return {}
+        return {key: value for key, value in self._contexts[-1].items() if key != "_started_ns"}
 
     def _summary(self, at_ns: int) -> dict[str, Any]:
         return {
@@ -115,34 +117,25 @@ class RunReport:
             "time_to_first_jev_request_ms": (
                 self._elapsed_ms(self._first_request_ns) if self._first_request_ns is not None else None
             ),
-            "report_write_duration_ms": self._write_ns / 1_000_000,
-            "report_write_count": self._write_count,
-            "report_append_duration_ms": self._append_ns / 1_000_000,
-            "end_boundary": "terminal_event_before_its_serialization_and_write",
+            "end_boundary": "operational_end_before_report_generation",
         }
 
     def append(self, event: str, *, _at_ns: int | None = None, **data: Any) -> None:
         if self._closed:
             raise ValueError("Cannot append to a closed run report")
-        entered_ns = perf_counter_ns()
-        at_ns = entered_ns if _at_ns is None else _at_ns
+        at_ns = perf_counter_ns() if _at_ns is None else _at_ns
         record = {
-            "timestamp": self._timestamp(at_ns),
+            "_at_ns": at_ns,
             "elapsed_ms": self._elapsed_ms(at_ns),
             "event": event,
             **self._context(),
             **data,
         }
         if event in {"run_finished", "run_error", "run_interrupted"}:
+            self._finished_ns = at_ns
             record["timing"] = self._summary(at_ns)
-        try:
-            text = json.dumps([*self._events, record], ensure_ascii=False, allow_nan=False, indent=2) + "\n"
-            # Snapshot nested data so later caller mutations cannot rewrite history.
-            events = json.loads(text)
-            self._write(text)
-            self._events = events
-        finally:
-            self._append_ns += perf_counter_ns() - entered_ns
+        # Copy only the new observation. Immutable HTTP bytes need no copy or parse.
+        self._events.append(deepcopy(record))
 
     def _new_span(self, operation: str, data: dict[str, Any]) -> dict[str, Any]:
         self._span_count += 1
@@ -159,7 +152,6 @@ class RunReport:
         span.update(
             started_elapsed_ms=self._elapsed_ms(started_ns),
             finished_elapsed_ms=self._elapsed_ms(finished_ns),
-            started_at=self._timestamp(started_ns), finished_at=self._timestamp(finished_ns),
             duration_ms=(finished_ns - started_ns) / 1_000_000, status=status,
         )
         if error is not None:
@@ -168,17 +160,11 @@ class RunReport:
 
     @contextmanager
     def span(self, operation: str, **data: Any):
-        """Time work, excluding its own durable boundary writes.
-
-        The saved start is an intent boundary. The completed event also carries
-        the actual work start (after that write). Child events/writes remain part
-        of their parent's elapsed time. This records boundaries without adding
-        recovery, retries, or suppression of reporting exceptions.
-        """
+        """Record operation boundaries in memory using a monotonic clock."""
         span = self._new_span(operation, data)
         self.append("timing_started", **span)
         started_ns = perf_counter_ns()
-        self._contexts.append(span.copy())
+        self._contexts.append({**span, "_started_ns": started_ns})
         failure = None
         try:
             yield span
@@ -200,24 +186,36 @@ class RunReport:
     def record_interval(
         self, operation: str, started_ns: int, finished_ns: int, **data: Any,
     ) -> None:
-        """Backfill measured work that could not safely write a start boundary."""
+        """Retain boundaries for work measured before the reporter was ready."""
         span = self._new_span(operation, {**data, "recorded_after_completion": True})
         self.append("timing_started", _at_ns=started_ns, **span)
         self._finish_span(span, started_ns, finished_ns, "ok")
 
     def on_request(self, request: httpx2.Request) -> None:
-        """Record final SDK-encoded data before the network attempt begins."""
-        started_ns = perf_counter_ns()
+        """Capture the prepared request, then start timing before transport."""
         self._request_count += 1
         request_id = self._request_count
         request.extensions[_REQUEST_ID_EXTENSION] = request_id
         content = request.content
         self.append(
-            "jev_request", _at_ns=started_ns, request_id=request_id, method=request.method,
+            "jev_request", request_id=request_id, method=request.method,
             url=str(request.url.copy_with(userinfo=b"", query=None, fragment=None)),
-            body_bytes=len(content), **_body_fields(content),
+            body_bytes=len(content), body=content,
+            start_boundary="prepared_request_before_transport",
         )
-        self._pending_requests[request_id] = {"started_ns": started_ns, "context": self._context()}
+        record = self._events[-1]
+        pending = {"context": self._context()}
+        self._pending_requests[request_id] = pending
+        # All payload capture precedes this boundary. Only lightweight timing
+        # assignments remain before httpx hands the encoded request to transport.
+        started_ns = perf_counter_ns()
+        pending["started_ns"] = started_ns
+        record["_at_ns"] = started_ns
+        record["elapsed_ms"] = self._elapsed_ms(started_ns)
+        if pending["context"].get("operation") == "selection.sdk_call":
+            sdk_start = self._contexts[-1]["_started_ns"]
+            record["request_preparation_duration_ms"] = (started_ns - sdk_start) / 1_000_000
+        record["started_elapsed_ms"] = record["elapsed_ms"]
         if self._first_request_ns is None:
             self._first_request_ns = started_ns
 
@@ -244,7 +242,7 @@ class RunReport:
         self.append(
             "jev_response", _at_ns=finished_ns, request_id=request_id, **timing,
             status_code=response.status_code,
-            **_body_fields(content),
+            body=content,
         )
 
     def _request_timing(self, request_id: int | None, finished_ns: int, headers_ns: int) -> dict[str, Any]:
@@ -256,10 +254,11 @@ class RunReport:
             "end_boundary": "response_body_read",
         }
         if pending is not None:
-            timing.update(
-                **pending["context"], started_elapsed_ms=self._elapsed_ms(pending["started_ns"]),
-                duration_ms=(finished_ns - pending["started_ns"]) / 1_000_000,
-            )
+            timing.update({
+                **pending["context"],
+                "started_elapsed_ms": self._elapsed_ms(pending["started_ns"]),
+                "duration_ms": (finished_ns - pending["started_ns"]) / 1_000_000,
+            })
         return timing
 
     def _finish_pending_requests(self, span_id: int, finished_ns: int, error: BaseException | None) -> None:
@@ -270,16 +269,68 @@ class RunReport:
                 continue
             del self._pending_requests[request_id]
             self.append(
-                "jev_request_unfinished", _at_ns=finished_ns, **pending["context"],
-                request_id=request_id, started_elapsed_ms=self._elapsed_ms(pending["started_ns"]),
-                finished_elapsed_ms=self._elapsed_ms(finished_ns),
-                duration_ms=(finished_ns - pending["started_ns"]) / 1_000_000,
-                end_boundary="sdk_call_exit_without_complete_response",
-                error_type=type(error).__name__ if error is not None else None,
+                "jev_request_unfinished", _at_ns=finished_ns, **{
+                    **pending["context"], "request_id": request_id,
+                    "started_elapsed_ms": self._elapsed_ms(pending["started_ns"]),
+                    "finished_elapsed_ms": self._elapsed_ms(finished_ns),
+                    "duration_ms": (finished_ns - pending["started_ns"]) / 1_000_000,
+                    "end_boundary": "sdk_call_exit_without_complete_response",
+                    "error_type": type(error).__name__ if error is not None else None,
+                },
             )
 
-    def close(self) -> None:
+    def close(self) -> dict[str, Any]:
+        """Serialize/write once; return timings only knowable after that write."""
+        if self._closed:
+            return self._completion_timing.copy()
         self._closed = True
+        started_ns = perf_counter_ns()
+        if self._finished_ns is None:
+            self._finished_ns = started_ns
+        try:
+            responses = {
+                event["round_id"]: event for event in self._events
+                if event["event"] == "jev_response" and "round_id" in event
+            }
+            advancements = {
+                event["round_id"]: event for event in self._events
+                if event["event"] == "timing_finished" and event["operation"] == "selection.advancement"
+                and "round_id" in event
+            }
+            events = []
+            for saved in self._events:
+                record = {"timestamp": self._timestamp(saved["_at_ns"])}
+                record.update({key: value for key, value in saved.items() if key != "_at_ns"})
+                if record["event"] == "timing_finished":
+                    for field in ("started", "finished"):
+                        at_ns = self._origin_ns + round(record[f"{field}_elapsed_ms"] * 1_000_000)
+                        record[f"{field}_at"] = self._timestamp(at_ns)
+                    if record["operation"] == "selection.round":
+                        round_id = record.get("round_id")
+                        if round_id in responses and round_id in advancements:
+                            start = responses[round_id]["finished_elapsed_ms"]
+                            finish = advancements[round_id]["finished_elapsed_ms"]
+                            record.update(
+                                response_processing_started_elapsed_ms=start,
+                                response_processing_finished_elapsed_ms=finish,
+                                response_processing_duration_ms=finish - start,
+                            )
+                if isinstance(record.get("body"), bytes):
+                    record.update(_body_fields(record.pop("body")))
+                events.append(record)
+            text = json.dumps(events, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._write(text)
+        finally:
+            finished_ns = perf_counter_ns()
+            self._completion_timing = {
+                **self._summary(self._finished_ns),
+                "report_generation_duration_ms": (finished_ns - started_ns) / 1_000_000,
+                "report_write_duration_ms": self._write_ns / 1_000_000,
+                "report_write_count": self._write_count,
+                "through_report_duration_ms": self._elapsed_ms(finished_ns),
+            }
+        return self._completion_timing.copy()
 
     def __enter__(self) -> Self:
         return self

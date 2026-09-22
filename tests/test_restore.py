@@ -86,25 +86,6 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(json.loads(runner.calls[1][1]["input"]),
                          {"pid": selected["pid"], "window_id": selected["window_id"]})
 
-    def test_report_failure_after_activation_preserves_completed_action(self):
-        for failure in (OSError("private path"), ValueError("closed report")):
-            runner = FakeRunner({"windows": [window()]}, RESTORED)
-            report = RecordingReport()
-            append = report.append
-
-            def record(event, **data):
-                if event == "action_returned":
-                    raise failure
-                append(event, **data)
-
-            with patch.object(report, "append", side_effect=record):
-                with self.assertRaises(DriverError) as raised:
-                    run_pipeline("open slack", CuaDriver(executable="fake", runner=runner),
-                                 ChoiceSelector(ChoosingClient()), report=report)
-            self.assertEqual(raised.exception.code, "report_write_failed")
-            self.assertEqual(raised.exception.context["action_result"], RESTORED)
-            self.assertEqual([c[0][-1] for c in runner.calls], ["list_windows", "bring_to_front"])
-
     def test_unreadable_activation_response_stops_without_retry(self):
         for response in (
             subprocess.CompletedProcess([], 0, "foreground_unavailable", ""),

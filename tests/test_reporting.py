@@ -1,4 +1,4 @@
-"""Durable run reports and final SDK HTTP payload capture, entirely offline."""
+"""End-of-run reports and final SDK HTTP payload capture, entirely offline."""
 
 from datetime import datetime, timedelta
 import json
@@ -60,37 +60,46 @@ class ReportTests(unittest.TestCase):
             raise ValueError("Unexpected test cleanup path")
         shutil.rmtree(target)
 
-    def test_each_event_is_immediately_readable_and_synced(self):
+    def test_events_stay_in_memory_until_one_final_write(self):
         with RunReport(self.path / "nested") as report:
             self.assertTrue(report.path.is_absolute())
             self.assertEqual(report.path.suffix, ".json")
-            self.assertEqual(read_events(report.path), [])
-            with patch("src.reporting.os.fsync", wraps=os.fsync) as sync:
+            self.assertFalse(report.path.exists())
+            with patch("src.reporting.os.fsync", wraps=os.fsync) as sync, patch(
+                "src.reporting.json.dumps", wraps=json.dumps,
+            ) as encode, patch("src.reporting.json.loads", wraps=json.loads) as decode:
                 report.append("windows_observed", windows=[{"title": "résumé\nsecond line"}])
+                report.append("completed", status="selected")
+                self.assertFalse(report.path.exists())
+                sync.assert_not_called()
+                encode.assert_not_called()
+                decode.assert_not_called()
+                timing = report.close()
+                self.assertEqual(timing["report_write_count"], 1)
+                sync.assert_called_once()
+                encode.assert_called_once()
+                decode.assert_not_called()
+                self.assertEqual(report.close(), timing)
+                sync.assert_called_once()
                 first = read_events(report.path)
                 self.assertIn('\n  {\n    "timestamp":', report.path.read_text(encoding="utf-8"))
-                self.assertEqual(len(first), 1)
+                self.assertEqual(len(first), 2)
                 self.assertEqual(first[0]["windows"], [{"title": "résumé\nsecond line"}])
                 self.assertEqual(first[0]["event"], "windows_observed")
                 self.assertEqual(datetime.fromisoformat(first[0]["timestamp"]).utcoffset(), timedelta(0))
                 self.assertTrue(first[0]["timestamp"].endswith("Z"))
-                report.append("completed", status="selected")
-                self.assertEqual(len(read_events(report.path)), 2)
-                self.assertEqual(sync.call_count, 2)
 
-    def test_failed_update_preserves_previous_document_and_discards_failed_event(self):
+    def test_failed_final_write_leaves_no_partial_report_and_is_not_retried(self):
         for operation in ("os.fsync", "os.replace"):
             with self.subTest(operation=operation), RunReport(self.path) as report:
-                report.append("saved")
-                previous = report.path.read_bytes()
-                with patch(f"src.reporting.{operation}", side_effect=OSError("disk failure")):
+                report.append("completed")
+                with patch(f"src.reporting.{operation}", side_effect=OSError("disk failure")) as failing:
                     with self.assertRaises(OSError):
-                        report.append("not_saved")
-                self.assertEqual(report.path.read_bytes(), previous)
-                self.assertEqual([event["event"] for event in read_events(report.path)], ["saved"])
+                        report.close()
+                    report.close()
+                    failing.assert_called_once()
+                self.assertFalse(report.path.exists())
                 self.assertEqual(list(self.path.glob("*.tmp")), [])
-                report.append("next")
-                self.assertEqual([event["event"] for event in read_events(report.path)], ["saved", "next"])
 
     def test_later_mutations_do_not_change_saved_events(self):
         windows = [{"title": "original"}]
@@ -98,11 +107,16 @@ class ReportTests(unittest.TestCase):
             report.append("windows_observed", windows=windows)
             windows[0]["title"] = "changed"
             report.append("completed")
+            report.close()
             self.assertEqual(read_events(report.path)[0]["windows"], [{"title": "original"}])
 
     def test_separate_runs_have_unique_paths_and_restrictive_posix_mode(self):
         with RunReport(self.path) as first, RunReport(self.path) as second:
             self.assertNotEqual(first.path, second.path)
+            self.assertFalse(first.path.exists())
+            self.assertFalse(second.path.exists())
+            first.close()
+            second.close()
             self.assertTrue(first.path.exists())
             self.assertTrue(second.path.exists())
             if os.name == "posix":
@@ -146,13 +160,14 @@ class ReportTests(unittest.TestCase):
 
         def handler(request):
             wire_requests.append(request.content)
-            # The request report must already be on disk before the transport starts.
-            self.assertEqual(read_events(report.path)[-1]["event"], "jev_request")
+            # Transport must never wait for a report write.
+            self.assertFalse(report.path.exists())
             self.assertEqual(request.headers["authorization"], "Bearer secret-api-key")
             return httpx2.Response(200, json=expected_response, headers={"set-cookie": "secret-cookie"})
 
         with RunReport(self.path) as report:
             result = self.sdk_call(report, handler)
+            report.close()
             events = read_events(report.path)
             self.assertEqual([event["event"] for event in events], ["jev_request", "jev_response"])
             request_event, response_event = events
@@ -176,6 +191,7 @@ class ReportTests(unittest.TestCase):
         with RunReport(self.path) as report:
             with self.assertRaises(TypeSafeError):
                 self.sdk_call(report, handler)
+            report.close()
             events = read_events(report.path)
             self.assertEqual([event["event"] for event in events], ["jev_request"])
             self.assertNotIn("secret transport diagnostic", report.path.read_text(encoding="utf-8"))
@@ -191,6 +207,7 @@ class ReportTests(unittest.TestCase):
             with self.subTest(status=status, content=content), RunReport(self.path) as report:
                 with self.assertRaises(TypeSafeError):
                     self.sdk_call(report, lambda request: httpx2.Response(status, content=content))
+                report.close()
                 event = read_events(report.path)[-1]
                 self.assertEqual(event["event"], "jev_response")
                 self.assertEqual(event["status_code"], status)
@@ -218,6 +235,7 @@ class ReportTests(unittest.TestCase):
                     content=json.dumps({"index": index}).encode("utf-8"),
                     headers={"authorization": "Bearer secret-header"},
                 )
+            report.close()
             events = read_events(report.path)
             self.assertEqual([event["request_id"] for event in events], [1, 1, 2, 2])
             self.assertEqual([json.loads(body) for body in sent], [{"index": 0}, {"index": 1}])
@@ -233,6 +251,7 @@ class ReportTests(unittest.TestCase):
             with self.subTest(number=number), RunReport(self.path) as report:
                 with self.assertRaises(TypeSafeError):
                     self.sdk_call(report, lambda request: httpx2.Response(200, content=content))
+                report.close()
                 event = read_events(report.path)[-1]
                 self.assertEqual(event["event"], "jev_response")
                 self.assertEqual(event["body_text"], content.decode("utf-8"))
@@ -250,6 +269,7 @@ class ReportTests(unittest.TestCase):
                         client.post("https://example.com", json={"state": "test"})
                 self.assertIs(raised.exception, error)
                 self.assertTrue(stream.closed)
+                report.close()
                 events = read_events(report.path)
                 self.assertEqual([event["event"] for event in events], ["jev_request", "jev_response_error"])
                 self.assertEqual(events[-1]["request_id"], events[0]["request_id"])
@@ -267,6 +287,7 @@ class ReportTests(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt) as raised:
                     report.on_response(response)
             self.assertIs(raised.exception, original)
+            report.close()
             self.assertEqual([event["event"] for event in read_events(report.path)], ["jev_request"])
         response.close()
 

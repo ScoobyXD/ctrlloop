@@ -26,6 +26,10 @@ class RecordingReport:
         self.path = Path("reports") / "test-run.json"
         self.events = []
         self.closed = False
+        self.close_count = 0
+        self.timing = {"duration_ms": 20, "report_generation_duration_ms": 5,
+                       "report_write_duration_ms": 3, "report_write_count": 1,
+                       "through_report_duration_ms": 25}
         self._span_id = 0
 
     def append(self, event, **data):
@@ -45,6 +49,8 @@ class RecordingReport:
 
     def close(self):
         self.closed = True
+        self.close_count += 1
+        return self.timing
 
     def on_request(self, request):
         pass
@@ -497,7 +503,7 @@ class CliTests(unittest.TestCase):
         with patch.object(Path, "read_bytes", side_effect=PermissionError("sensitive-file-path")):
             status, output, pipeline, client, driver = self.invoke(["--request-file", "request.txt"])
         self.assertEqual(status, 1)
-        self.assertEqual(self.report.events, [{"event": "run_error", **output}])
+        self.assertEqual(self.report.events, [{"event": "run_error", **self.without_timing(output)}])
         self.assertNotIn("sensitive-file-path", json.dumps(self.report.events))
         self.assertTrue(self.report.closed)
         pipeline.assert_not_called()
@@ -527,7 +533,7 @@ class CliTests(unittest.TestCase):
         client.assert_not_called()
         driver.assert_not_called()
         self.http_client.assert_not_called()
-        self.assertEqual(self.report.events[-1], {"event": "run_error", **output})
+        self.assertEqual(self.report.events[-1], {"event": "run_error", **self.without_timing(output)})
         self.assertTrue(self.report.closed)
 
     def test_changed_model_pin_fails_before_network_or_driver_calls(self):
@@ -556,7 +562,7 @@ class CliTests(unittest.TestCase):
         status, output, pipeline, _, driver = self.invoke(["--click", "Click Save"], result=result)
 
         self.assertEqual(status, 0)
-        self.assertEqual(output, result.to_dict())
+        self.assertEqual(output, {**result.to_dict(), "timing": self.report.timing})
         pipeline.assert_called_once()
         self.assertEqual(pipeline.call_args.args[0], "Click Save")
         self.assertIs(pipeline.call_args.args[1], driver.return_value)
@@ -577,7 +583,7 @@ class CliTests(unittest.TestCase):
         status, output, pipeline, _, _ = self.invoke(["--click", "Open Start"], result=result)
 
         self.assertEqual(status, 2)
-        self.assertEqual(output, result.to_dict())
+        self.assertEqual(output, {**result.to_dict(), "timing": self.report.timing})
         self.assertIsNone(output["action_result"])
         self.assertTrue(pipeline.call_args.kwargs["execute_click"])
         self.assertEqual(self.report.events[-1], {"event": "run_finished", "result": result.to_dict()})
@@ -605,12 +611,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output, {
             "status": "error", "error": str(error), "code": "stale_element_token", "tool": "click",
             "exit_code": 0, "stage": "click", "action_result": native_result, "selection": selected.to_dict(),
+            "timing": self.report.timing,
         })
         pipeline.assert_called_once()
         self.assertTrue(pipeline.call_args.kwargs["execute_click"])
         self.assertEqual(self.report.events, [
             {"event": "run_started", "request": "Click Save", "execute_click": True},
-            {"event": "run_error", **output},
+            {"event": "run_error", **self.without_timing(output)},
         ])
         self.assertTrue(self.report.closed)
 
@@ -621,15 +628,13 @@ class CliTests(unittest.TestCase):
                 "effect": "unverifiable", "route": "accessibility", "delivery": {"mode": "background"},
             },
         )
-        append_original = RecordingReport.append
         for report_error in (OSError("private-report-path"), ValueError("private-report-state")):
             with self.subTest(error=type(report_error).__name__):
-                def append_until_finished(report, event, **data):
-                    if event == "run_finished":
-                        raise report_error
-                    append_original(report, event, **data)
+                def fail_close(report):
+                    report.closed = True
+                    raise report_error
 
-                with patch.object(RecordingReport, "append", autospec=True, side_effect=append_until_finished):
+                with patch.object(RecordingReport, "close", autospec=True, side_effect=fail_close) as close:
                     status, output, pipeline, _, _ = self.invoke(["--click", "Click Save"], result=result)
 
                 self.assertEqual(status, 0)
@@ -637,7 +642,9 @@ class CliTests(unittest.TestCase):
                 pipeline.assert_called_once()
                 self.assertEqual(self.report.events, [
                     {"event": "run_started", "request": "Click Save", "execute_click": True},
+                    {"event": "run_finished", "result": result.to_dict()},
                 ])
+                close.assert_called_once()
                 self.assertIn("Could not save the completed run report", self.stderr.getvalue())
                 self.assertNotIn("private-report", self.stderr.getvalue())
                 self.assertTrue(self.report.closed)
@@ -666,20 +673,21 @@ class CliTests(unittest.TestCase):
             "code": "driver_call_failed", "tool": "get_window_state", "exit_code": 1,
             "stage": "get_window_state", "window": make_window(),
             "selections": {"windows": []},
+            "timing": self.report.timing,
         })
         pipeline.assert_called_once()
         self.assertEqual(self.report.events, [
             {"event": "run_started", "request": "Find Save", "execute_click": False},
-            {"event": "run_error", **output},
+            {"event": "run_error", **self.without_timing(output)},
         ])
         self.assertTrue(self.report.closed)
 
-    def test_success_attaches_wire_hooks_and_reports_result_without_changing_stdout(self):
+    def test_success_attaches_wire_hooks_and_returns_report_timing_with_operational_result(self):
         result = PipelineResult("selected", window=make_window(), control=make_element())
         status, output, pipeline, client, _ = self.invoke(["Find Save"], result=result)
 
         self.assertEqual(status, 0)
-        self.assertEqual(output, result.to_dict())
+        self.assertEqual(output, {**result.to_dict(), "timing": self.report.timing})
         self.assertEqual(self.report.events, [
             {"event": "run_started", "request": "Find Save", "execute_click": False},
             {"event": "run_finished", "result": result.to_dict()},
@@ -692,6 +700,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.report_factory.call_args.args[0], Path(self.cli.__file__).resolve().parents[1] / "reports")
         self.assertIn(str(self.report.path), self.stderr.getvalue())
         self.assertTrue(self.report.closed)
+        self.assertEqual(self.report.close_count, 1)
 
     def test_interrupt_keeps_terminal_event_and_closes_report_before_propagating(self):
         for error in (KeyboardInterrupt(), SystemExit(3)):
@@ -740,8 +749,8 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(self.report.events, [
                         {"event": "run_started", "request": "Find Save", "execute_click": False},
                     ])
-                    self.assertIn("Could not append", self.stderr.getvalue())
-                    self.assertIn("Could not close", self.stderr.getvalue())
+                    self.assertIn("Could not buffer", self.stderr.getvalue())
+                    self.assertIn("Could not write", self.stderr.getvalue())
                     self.assertNotIn("sensitive-write-error", self.stderr.getvalue())
                     self.assertNotIn("sensitive-close-error", self.stderr.getvalue())
 
@@ -752,6 +761,10 @@ class CliTests(unittest.TestCase):
         pipeline.assert_not_called()
         client.assert_not_called()
         driver.assert_not_called()
+
+    @staticmethod
+    def without_timing(output):
+        return {key: value for key, value in output.items() if key != "timing"}
 
 
 if __name__ == "__main__":

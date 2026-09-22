@@ -23,13 +23,13 @@ if __package__:
     from .driver import CuaDriver, DriverError
     from .pipeline import run_pipeline
     from .reporting import RunReport
-    from .selection import ChoiceSelector, PINNED_MODEL, RequestBudget, SelectionError
+    from .selection import ChoiceSelector, PINNED_MODEL, SelectionError
 else:
     # Direct script execution puts src on the import path.
     from driver import CuaDriver, DriverError
     from pipeline import run_pipeline
     from reporting import RunReport
-    from selection import ChoiceSelector, PINNED_MODEL, RequestBudget, SelectionError
+    from selection import ChoiceSelector, PINNED_MODEL, SelectionError
 
 _IMPORT_FINISHED_NS = perf_counter_ns()
 
@@ -48,8 +48,6 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
     parser.add_argument("--click", action="store_true", help="Execute one click on the selected real control, return CUA's result, then stop")
     parser.add_argument("--max-elements", type=int, default=5000)
     parser.add_argument("--max-depth", type=int, default=25)
-    parser.add_argument("--max-request-bytes", type=int, default=48_000)
-    parser.add_argument("--max-question-bytes", type=int, default=24_000)
     args = parser.parse_args(argv)
     if (args.request is None) == (args.request_file is None):
         parser.error("provide exactly one request argument or --request-file")
@@ -62,6 +60,8 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
     # SDK debug logs can contain UI state; this CLI logs only the model identity.
     logging.getLogger("typesafe_sdk").setLevel(logging.WARNING)
     report = None
+    output = None
+    exit_code = 1
     try:
         report_initialization_ns = perf_counter_ns()
         report = RunReport(
@@ -96,7 +96,6 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
             api_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
             if not api_key:
                 raise ValueError("TYPESAFE_API_KEY is missing; set it in the environment or --env-file.")
-            budget = RequestBudget(args.max_request_bytes, args.max_question_bytes)
         with report.span("initialization.driver"):
             driver = CuaDriver(
                 executable=args.driver, max_elements=args.max_elements, max_depth=args.max_depth
@@ -113,7 +112,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
             ) as client:
                 report.record_interval("initialization.typesafe_client", sdk_initialization_ns, perf_counter_ns())
                 with report.span("initialization.selector"):
-                    selector = ChoiceSelector(client, model=model, budget=budget)
+                    selector = ChoiceSelector(client, model=model)
                 with report.span("pipeline"):
                     result = run_pipeline(
                         original_request, driver, selector,
@@ -121,19 +120,13 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
                     )
                 cleanup_started_ns = perf_counter_ns()
         report.record_interval("client_cleanup", cleanup_started_ns, perf_counter_ns())
-        # Prepare stdout before the final boundary so its cost is in the total.
+        # Finish preparing the operational result before generating the report.
         output_started_ns = perf_counter_ns()
-        output_json = json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
+        output = result.to_dict()
         output_finished_ns = perf_counter_ns()
-        report.record_interval("result_serialization", output_started_ns, output_finished_ns)
-        try:
-            report.append("run_finished", result=result.to_dict())
-        except (OSError, ValueError):
-            if result.status != "action_returned":
-                raise
-            print("Could not save the completed run report; returning the native action result.", file=sys.stderr)
-        print(output_json)
-        return 0 if result.status in {"selected", "action_returned"} else 2
+        report.record_interval("result_preparation", output_started_ns, output_finished_ns)
+        report.append("run_finished", result=output)
+        exit_code = 0 if result.status in {"selected", "action_returned"} else 2
     except (DriverError, SelectionError, ValueError, OSError, TypeSafeError, KeyError) as error:
         # Raw SDK/OS messages may contain file content, request bodies, or credentials.
         if isinstance(error, (DriverError, SelectionError)) or type(error) is ValueError:
@@ -143,8 +136,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
         details = error.details() if isinstance(error, DriverError) else {}
         output = {"status": "error", "error": message, **details}
         _report_failure(report, "run_error", **output)
-        print(json.dumps(output, ensure_ascii=False))
-        return 1
+        exit_code = 1
     except (KeyboardInterrupt, SystemExit) as error:
         _report_failure(report, "run_interrupted", error_type=type(error).__name__)
         raise
@@ -154,9 +146,22 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
     finally:
         if report is not None:
             try:
-                report.close()
-            except OSError:
-                print("Could not close the run report cleanly; inspect its last complete entry.", file=sys.stderr)
+                timing = report.close()
+                if output is not None:
+                    output["timing"] = timing
+            except (OSError, ValueError) as error:
+                if output is not None and output["status"] == "action_returned":
+                    print("Could not save the completed run report; returning the native action result.", file=sys.stderr)
+                else:
+                    print("Could not write the final run report.", file=sys.stderr)
+                    if output is not None and output["status"] != "error":
+                        output = {
+                            "status": "error",
+                            "error": f"Pipeline failed: {type(error).__name__}. Check local configuration and connectivity.",
+                        }
+                        exit_code = 1
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return exit_code
 
 
 def _report_failure(report: RunReport | None, event: str, **details) -> None:
@@ -165,7 +170,7 @@ def _report_failure(report: RunReport | None, event: str, **details) -> None:
         try:
             report.append(event, **details)
         except (OSError, ValueError):
-            print("Could not append the final report entry; earlier entries remain on disk.", file=sys.stderr)
+            print("Could not buffer the final report entry.", file=sys.stderr)
 
 
 if __name__ == "__main__":

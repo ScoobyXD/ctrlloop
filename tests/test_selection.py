@@ -4,7 +4,8 @@ import json
 from types import SimpleNamespace
 import unittest
 
-from typesafe_sdk import Choice, TypeSafeError
+import httpx2
+from typesafe_sdk import Choice, TypeSafeAPIError, TypeSafeError
 
 from src.selection import (
     Candidate,
@@ -12,7 +13,6 @@ from src.selection import (
     GROUP_SIZE,
     PINNED_MODEL,
     QUESTION,
-    RequestBudget,
     SelectionError,
 )
 
@@ -73,7 +73,7 @@ class SelectionTests(unittest.TestCase):
                 self.assertIsInstance(question, Choice)
                 self.assertEqual(question.instructions, EXPECTED_QUESTION)
                 self.assertLessEqual(len(question.criteria), 10)
-                self.assertGreater(len(question.criteria), 1)
+                self.assertGreaterEqual(len(question.criteria), 1)
                 for key, description in question.criteria.items():
                     self.assertEqual(description, descriptions[key])
                     self.assertNotIn("private_context", description)
@@ -84,7 +84,10 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(QUESTION, EXPECTED_QUESTION)
 
     def test_required_candidate_counts_and_one_winner_per_group(self):
-        cases = {0: [], 1: [], 9: [9], 10: [10], 11: [11, 2], 1000: [1000, 100, 10]}
+        cases = {
+            0: [], 1: [], 9: [9], 10: [10], 11: [11, 2],
+            392: [392, 40, 4], 1000: [1000, 100, 10],
+        }
         for count, round_counts in cases.items():
             with self.subTest(count=count):
                 observed = candidates(count)
@@ -92,26 +95,23 @@ class SelectionTests(unittest.TestCase):
                 result = ChoiceSelector(client).select(ORIGINAL, observed, stage="windows")
                 self.assertIs(result.winner, observed[-1] if observed else None)
                 self.assertEqual([r["candidate_count"] for r in result.rounds], round_counts)
-                if count <= 1:
-                    self.assertEqual(client.calls, [])
-                else:
-                    self.assertGreater(len(client.calls), 0)
+                self.assertEqual(len(client.calls), len(round_counts))
                 expected_keys = [candidate.key for candidate in observed]
-                for round_trace in result.rounds:
+                for round_trace, call in zip(result.rounds, client.calls, strict=True):
                     expected_groups = [expected_keys[i : i + 10] for i in range(0, len(expected_keys), 10)]
                     self.assertEqual([g["options"] for g in round_trace["groups"]], expected_groups)
                     expected_keys = [group[-1] for group in expected_groups]
                     self.assertEqual([g["winner"] for g in round_trace["groups"]], expected_keys)
                     self.assertEqual(round_trace["winner_count"], len(expected_groups))
-                    asked_keys = [g["question_key"] for g in round_trace["groups"] if len(g["options"]) > 1]
-                    batched_keys = [key for batch in round_trace["batches"] for key in batch["question_keys"]]
-                    self.assertEqual(batched_keys, asked_keys)
-                    for batch in round_trace["batches"]:
-                        self.assertEqual(batch["requested_model"], PINNED_MODEL)
-                        self.assertEqual(batch["response_model"], PINNED_MODEL)
-                        self.assertEqual(batch["input_tokens"], 101)
-                        self.assertEqual(batch["output_tokens"], 17)
-                        self.assertGreater(batch["request_bytes"], 0)
+                    self.assertEqual(round_trace["group_count"], len(expected_groups))
+                    asked_keys = [g["question_key"] for g in round_trace["groups"]]
+                    api_call = round_trace["api_call"]
+                    self.assertEqual(api_call["question_keys"], asked_keys)
+                    self.assertEqual(list(call["questions"]), asked_keys)
+                    self.assertEqual(api_call["requested_model"], PINNED_MODEL)
+                    self.assertEqual(api_call["response_model"], PINNED_MODEL)
+                    self.assertEqual(api_call["input_tokens"], 101)
+                    self.assertEqual(api_call["output_tokens"], 17)
                 self.assert_request_contract(client, observed)
 
     def test_same_request_and_question_for_both_stages(self):
@@ -122,24 +122,38 @@ class SelectionTests(unittest.TestCase):
                 ChoiceSelector(client).select(ORIGINAL, observed, stage=stage)
                 self.assert_request_contract(client, observed)
 
-    def test_independent_questions_batch_and_all_batches_finish_before_next_round(self):
-        observed = candidates(100)
+    def test_392_candidates_use_one_call_per_round_with_all_group_questions(self):
+        observed = candidates(392)
+        # Exceed the former 48,000-byte heuristic without changing descriptions.
+        for candidate in observed:
+            candidate.description["context"] = "x" * 1000
         client = FakeClient()
-        budget = RequestBudget(max_request_bytes=2000, max_question_bytes=1500)
-        result = ChoiceSelector(client, budget=budget).select(ORIGINAL, observed, stage="controls")
-        self.assertGreater(len(result.rounds[0]["batches"]), 1)
-        self.assertTrue(any(len(call["questions"]) > 1 for call in client.calls))
-        expected_call_keys = [batch["question_keys"] for round_trace in result.rounds for batch in round_trace["batches"]]
-        self.assertEqual([list(call["questions"]) for call in client.calls], expected_call_keys)
-        first_round_calls = len(result.rounds[0]["batches"])
-        for call in client.calls[:first_round_calls]:
-            for question in call["questions"].values():
-                self.assertEqual(len(question.criteria), 10)
-        final_question = next(iter(client.calls[first_round_calls]["questions"].values()))
-        self.assertEqual(list(final_question.criteria), [c.key for c in observed[9::10]])
-        for round_trace in result.rounds:
-            for batch in round_trace["batches"]:
-                self.assertLessEqual(batch["request_bytes"], budget.max_request_bytes)
+        result = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
+        self.assertEqual([len(call["questions"]) for call in client.calls], [40, 4, 1])
+        self.assertEqual([len(q.criteria) for q in client.calls[0]["questions"].values()], [10] * 39 + [2])
+        self.assertEqual(
+            [list(call["questions"]) for call in client.calls],
+            [round_trace["api_call"]["question_keys"] for round_trace in result.rounds],
+        )
+        self.assertEqual(
+            [key for q in client.calls[0]["questions"].values() for key in q.criteria],
+            [candidate.key for candidate in observed],
+        )
+        expected_winners = [c.key for c in observed[9::10]] + [observed[-1].key]
+        self.assertEqual(
+            [key for q in client.calls[1]["questions"].values() for key in q.criteria],
+            expected_winners,
+        )
+        self.assert_request_contract(client, observed)
+
+    def test_trailing_singleton_gets_one_group_question_in_the_same_call(self):
+        observed = candidates(11)
+        client = FakeClient()
+        result = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
+        self.assertEqual([len(call["questions"]) for call in client.calls], [2, 1])
+        singleton = client.calls[0]["questions"]["controls_r1_g1"]
+        self.assertEqual(singleton.criteria, {observed[-1].key: observed[-1].description})
+        self.assertEqual(result.rounds[0]["groups"][1]["question_key"], "controls_r1_g1")
 
     def test_choice_controls_winner_even_at_zero_confidence(self):
         def flat_distribution(response):
@@ -172,30 +186,38 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(list(final_question.criteria), [observed[9].key, observed[19].key])
         self.assertIs(result.winner, observed[19])
 
-    def test_oversize_prompt_or_group_fails_before_any_request(self):
-        for prompt, observed in (("x" * 5000, candidates(2)), (ORIGINAL, candidates(2))):
+    def test_large_prompt_or_group_is_submitted_unchanged_in_one_call(self):
+        for prompt, observed in (("é" * 50_000, candidates(2)), (ORIGINAL, candidates(2))):
             with self.subTest(prompt_length=len(prompt)):
                 if prompt == ORIGINAL:
-                    observed[0].description["label"] = "x" * 5000
+                    observed[0].description["label"] = "x" * 50_000
                 client = FakeClient()
-                with self.assertRaises(SelectionError):
-                    ChoiceSelector(client, budget=RequestBudget(1000, 800)).select(prompt, observed, stage="controls")
-                self.assertEqual(client.calls, [])
+                ChoiceSelector(client).select(prompt, observed, stage="controls")
+                self.assertEqual(len(client.calls), 1)
+                self.assertEqual(client.calls[0]["state"], prompt)
+                question = next(iter(client.calls[0]["questions"].values()))
+                self.assertEqual(question.criteria, {c.key: c.description for c in observed})
 
-    def test_request_budget_counts_utf8_bytes(self):
-        client = FakeClient()
-        with self.assertRaises(SelectionError):
-            ChoiceSelector(client, budget=RequestBudget(1500, 1500)).select("é" * 900, candidates(2), stage="windows")
-        self.assertEqual(client.calls, [])
+    def test_service_rejecting_round_surfaces_error_without_splitting_or_dropping(self):
+        class RejectingClient(FakeClient):
+            def system_one(self, **kwargs):
+                self.calls.append(kwargs)
+                raise TypeSafeAPIError(status, {"detail": "private service detail"}, httpx2.Headers())
+
+        for status in (413, 422):
+            with self.subTest(status=status):
+                client = RejectingClient()
+                with self.assertRaisesRegex(SelectionError, f"complete round.*HTTP {status}") as caught:
+                    ChoiceSelector(client).select(ORIGINAL, candidates(392), stage="controls")
+                self.assertEqual(len(client.calls), 1)
+                self.assertEqual(len(client.calls[0]["questions"]), 40)
+                self.assertNotIn("private service detail", str(caught.exception))
 
     def test_invalid_config_or_duplicate_identity_fails_without_api_calls(self):
         client = FakeClient()
         for model in ("jev", "jev-latest", "jev-1.12.0"):
             with self.subTest(model=model), self.assertRaises(ValueError):
                 ChoiceSelector(client, model=model)
-        for value in (0, -1, True, 1.5):
-            with self.subTest(budget=value), self.assertRaises(ValueError):
-                RequestBudget(max_request_bytes=value)
         observed = candidates(2)
         with self.assertRaises(ValueError):
             ChoiceSelector(client).select(ORIGINAL, [observed[0], observed[0]], stage="windows")
