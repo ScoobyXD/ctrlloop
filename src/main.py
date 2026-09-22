@@ -40,12 +40,11 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
     origin_wall_ns = _MODULE_WALL_NS if _include_imports else time_ns()
     origin_label = "main_module_after_time_import" if _include_imports else "main_call"
     project_dir = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description="Select and bring a real window forward, then select a control and optionally click it.")
-    parser.add_argument("request", nargs="?", help="Original user request, passed unchanged to every Jev call")
+    parser = argparse.ArgumentParser(description="Run the Jev/CUA loop until the task completes, stops, or is interrupted.")
+    parser.add_argument("request", nargs="?", help="Original user request, preserved in every Jev call")
     parser.add_argument("--request-file", type=Path, help="Read the exact request from a UTF-8 file")
     parser.add_argument("--env-file", type=Path, default=project_dir / ".env")
     parser.add_argument("--driver", help="Path to the installed cua-driver.exe")
-    parser.add_argument("--click", action="store_true", help="Execute one click on the selected real control, return CUA's result, then stop")
     parser.add_argument("--max-elements", type=int, default=5000)
     parser.add_argument("--max-depth", type=int, default=25)
     args = parser.parse_args(argv)
@@ -84,7 +83,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
                 args.request_file.read_bytes().decode("utf-8")
                 if args.request_file is not None else args.request
             )
-        report.append("run_started", request=original_request, execute_click=args.click)
+        report.append("run_started", request=original_request)
         with report.span("initialization.configuration"):
             if not original_request.strip():
                 raise ValueError("The original request must be nonempty.")
@@ -116,7 +115,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
                 with report.span("pipeline"):
                     result = run_pipeline(
                         original_request, driver, selector,
-                        report=report, execute_click=args.click,
+                        report=report,
                     )
                 cleanup_started_ns = perf_counter_ns()
         report.record_interval("client_cleanup", cleanup_started_ns, perf_counter_ns())
@@ -126,7 +125,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
         output_finished_ns = perf_counter_ns()
         report.record_interval("result_preparation", output_started_ns, output_finished_ns)
         report.append("run_finished", result=output)
-        exit_code = 0 if result.status in {"selected", "action_returned"} else 2
+        exit_code = 0 if result.status == "completed" else 2
     except (DriverError, SelectionError, ValueError, OSError, TypeSafeError, KeyError) as error:
         # Raw SDK/OS messages may contain file content, request bodies, or credentials.
         if isinstance(error, (DriverError, SelectionError)) or type(error) is ValueError:
@@ -150,7 +149,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
                 if output is not None:
                     output["timing"] = timing
             except (OSError, ValueError) as error:
-                if output is not None and output["status"] == "action_returned":
+                if output is not None and output.get("action_result") is not None:
                     print("Could not save the completed run report; returning the native action result.", file=sys.stderr)
                 else:
                     print("Could not write the final run report.", file=sys.stderr)

@@ -1,9 +1,10 @@
 # Main workflow
 
-This document defines the workflow and timing behavior implemented by the selector,
-reporter, and CLI. [Reading run timings](timing.md) maps these requirements to the
-report fields. The selector sends one complete request per round, and the reporter
-buffers observations until the operational run ends.
+This is the authoritative explanation of the basic Jev-driven control loop in
+`src/pipeline.py`, its selector, reporter, and CLI. [Reading run timings](timing.md)
+maps the workflow to report fields. Every run executes the loop: select a control,
+deliver its CUA click, wait for settling, observe, and judge the next step. The loop
+has no iteration cap. Selecting a real window also brings it to the foreground.
 
 The two central requirements are:
 
@@ -21,12 +22,13 @@ The two central requirements are:
 | Round | Evaluate the current groups together, select one winner per group, and advance those winners. |
 | API call | One request to Jev containing all group questions for that round. |
 | Stage | A larger part of the workflow, such as window selection, control acquisition, or control selection. |
+| Iteration / pass | One observation pass in the loop; it may contain several selection rounds, or wait without selecting or executing another control. |
 
 Use these terms consistently in documentation, reports, and explanations. For
 example, say "40 groups, each with one question, sent in one API call." Do not
 describe this as 40 API calls or as 40 questions about an individual candidate.
 
-## Main sequence
+## First pass
 
 1. Receive the user's original request. Preserve its meaning and pass the original
    request unchanged to Jev during selection.
@@ -36,22 +38,68 @@ describe this as 40 API calls or as 40 questions about an individual candidate.
 5. Read that window's Windows accessibility tree and construct control candidates
    from the returned observation. Preserve the observation's identities so that
    the selected control maps back to the correct native target.
-6. Select a control using the same rounds described below.
-7. Map the selected control to the existing CUA action. In execution mode, invoke
-   the action and record its returned result. In selection-only mode, return the
-   selected control without invoking it.
-8. Finish the operational run, then generate and write the report from the records
-   collected in memory.
+6. Narrow controls using the same rounds described below. Add one
+   conditional settling-time question for each finalist to the final control
+   selection request.
+7. Execute the winning control's click, wait for CUA to return, then wait the winning
+   candidate's selected settling time and capture fresh state.
+8. Continue with the later-pass questions and routing below. At the end, generate
+   and write the report once from the records collected in memory.
 
-Existing synthetic destinations retain their existing behavior; they are not
-invented live windows or controls. This specification changes selection request
-organization and reporting, not the supported actions.
+**Do not ask the three loop questions on this first pass.** There is no previous
+action and observation pair to compare yet. Window/control selection runs using
+the original user request and the observed candidate descriptions.
 
-The current scope ends after selection or the existing single action returns.
-It does not introduce a repeated action loop, polling, additional Jev questions,
-50/100/150 ms estimates, adaptive waits, or new retry/recovery behavior. An action
-return is not proof that the UI changed or the user's task completed. A future
-observe-and-repeat workflow needs its own design.
+Existing synthetic destinations retain their existing behavior. Start Menu offers
+the synthetic Search field; neither has a native execution target. Selecting it
+returns `no_action`. Opening Start and typing are deferred.
+
+## Second and subsequent passes
+
+After the selected wait has finished, discover the available windows and observe
+the current window again. Supply Jev the original goal, concise previous and
+current observations, and the relevant last-action facts. The comparison must
+include both observations; a current snapshot alone cannot establish change.
+Retain only this local comparison context, without a new memory framework.
+
+Ask these three independent yes/no Choice questions in **one Jev API call**:
+
+1. Did anything meaningfully change?
+2. Are we done with the user's requested task?
+3. Do we need another window to continue?
+
+The questions judge the observed result in the context of the goal. Code then
+routes the answers in this order:
+
+| Result | Next step |
+| --- | --- |
+| Done | Stop and return the result and report, regardless of the other answers. |
+| Unfinished, changed, another window needed | Repeat window selection using the fresh discovery, bring the selected window forward, capture its controls, and select a control. |
+| Unfinished, changed, current window appropriate | Reuse the current window and select from its freshly observed controls. |
+| Unfinished, unchanged | Ask whether to wait longer or report an error, as below. |
+
+Fresh control candidates always come from the current snapshot. Never replay an
+old snapshot's target. Each later control selection uses the final-round timing
+batch before executing another click. A normal CUA response alone never marks the
+user's goal complete. Native failures and unknown delivery keep the existing
+error/uncertainty handling; this loop does not add automatic action retries.
+
+### Unchanged state: wait longer or error
+
+Send a Choice question with `wait` and `error` options, plus an independent
+conditional additional-wait Choice question, in one request. The timing question
+assumes that waiting is chosen and uses the same six options below. Retain both
+answers, then consume the timing only for `wait`.
+
+For `wait`, sleep for the selected interval and capture another fresh observation,
+then ask the same three loop questions. **Do not repeat the previous action.**
+For `error`, stop and report that no meaningful progress was observed. Repeated
+waits continue through the same observation and judgment steps.
+
+The last-action context includes code-computed `requested_wait_ms_so_far`, the
+cumulative scheduled settling time already allowed after that action. It
+includes additional waits, excludes CUA duration, and is not a measurement of
+actual elapsed wall time. The measured wait durations remain in the report.
 
 ## Selection rounds: one API call per round
 
@@ -66,18 +114,22 @@ Apply the same procedure to window candidates and control candidates:
 6. If multiple candidates remain, regroup the winners and start the next round.
    If only one remains, selection is complete; do not start another round or call.
 
-If the entire selection starts with only one candidate, that candidate is already
-the winner and no selection round is needed. A round otherwise covers all current
-candidates; do not turn subsets into extra "rounds" to bypass the one-call rule.
+If the entire selection starts with only one candidate, it is already the winner
+and needs no selection question. An executable singleton still needs
+its conditional timing question through the same selector. Its trace contains
+one timing-only round and a deterministic group with `question_key: null`; no
+redundant selection question is invented. A round otherwise
+covers all current candidates; do not turn subsets into extra "rounds" to bypass
+the one-call rule.
 
 The question means:
 
 > Which of these candidates best matches the user's original request?
 
-The existing equivalent question wording can remain. There are no additional
-questions per candidate and no time-estimate questions. Keep the shared state and
-candidate descriptions minimal while retaining the information needed to choose.
-Keep the Jev model pinned to `jev-1.13.0`.
+Final control-selection questions explicitly include the observed
+app/browser identity so the original request is interpreted in its actual window
+context. Keep shared state and candidate descriptions minimal while retaining
+the information needed to choose. Keep the Jev model pinned to `jev-1.13.0`.
 
 All groups within a round are independent. Their questions belong in the same
 API call. The next round depends on the previous round's winners and therefore
@@ -104,6 +156,95 @@ That is **three control-selection rounds and three API calls**, not five calls.
 For the example run with 17 window candidates, window selection adds two rounds
 and two calls: 17 candidates become 2 winners, then 1 winner. The complete
 selection therefore uses **five API calls** across both stages.
+
+The last control request also contains four timing questions, one
+for each finalist. That request has five questions in total and is still one API
+call. The three later-pass judgments and any wait/error judgment are separate
+batched calls; they are not additional window/control selection rounds.
+
+## Final control selection and settling time
+
+Only the **final** control-selection request includes a separate conditional
+Choice timing question for **every finalist**, alongside the question choosing
+the winning control. Intermediate narrowing rounds do not ask timing questions.
+Each timing question identifies its candidate action and the observed app/browser
+context explicitly. Its meaning is:
+
+> After CUA finishes delivering this candidate action in [observed app/browser],
+> how much additional time should this browser/app need for the resulting state
+> to become ready for the next step?
+
+Use identity actually present in the window/snapshot, such as the observed app
+name and window title; do not guess a browser from the user's request. Keep the
+original user request available as context. The premise is that **this particular
+candidate's action is executed**. A timing answer cannot depend on the selection
+answer in the same batch, because all questions are evaluated independently.
+This follows TypeSafe's [speculative fan-out](https://docs.typesafe.ai/patterns/fan-out)
+pattern. Retain all timing answers and their full probabilities, then use only
+the winning candidate's timing.
+
+Timing uses Choice, not Score. These are the exact options and code mappings:
+
+| Choice option | Scheduled wait (milliseconds) |
+| --- | ---: |
+| `<50ms` | 50 |
+| `100ms` | 100 |
+| `200ms` | 200 |
+| `300ms` | 300 |
+| `400ms` | 400 |
+| `>500ms` | 500 |
+
+The endpoint mapping is deliberate: `>500ms` schedules a first observation after
+500 ms and does not assert that the app is ready. The unchanged-state branch can
+wait again. Code performs this mapping and all elapsed-time arithmetic; Jev does
+not calculate a delay or date.
+
+The ordering is strictly sequential:
+
+```text
+Final control selection + every finalist's conditional timing (one Jev call)
+Choose winning control and its timing
+START native action duration
+    Call CUA and wait for its action result
+END native action duration
+START additional app/browser settling wait
+    Sleep the selected 50 / 100 / 200 / 300 / 400 / 500 ms
+END settling wait
+Capture fresh state
+Ask the three later-pass questions together
+```
+
+The settling timer starts **after the CUA call returns**, never at dispatch.
+It does not include CUA execution duration. Its value estimates additional app
+settling time, not how long CUA needs to deliver the action. A new snapshot is
+captured only after the wait; concurrent action/snapshot handling is unnecessary.
+
+## Running the loop
+
+From the repository root, with the configured TypeSafe credentials and CUA daemon:
+
+```powershell
+uv run --locked python src/main.py 'Complete the click-only task in my test app.'
+```
+
+The same existing Python API is `run_pipeline(request, driver, selector)`.
+It always executes the loop; callers can supply `sleep=` for deterministic
+testing. See the [README](../README.md#run) for setup and
+client construction, and [report timing](timing.md) for report hooks.
+
+There is **no maximum iteration count**. Each pass records its iteration number
+and continues until Jev judges the task complete, an error or unsupported/unavailable
+observation stops progress, or the user interrupts the run. `completed` means Jev
+judged the goal complete; `unchanged_error` means the unchanged-state question
+chose error. Existing observation, synthetic-target, and native error outcomes
+remain available.
+
+This increment supports the existing clicks and foreground activation. It does
+not add typing, scrolling, keyboard shortcuts, Start Menu execution, action
+retries, coordinate fallback, a general planner, durable memory, advanced loading
+detection, or a recovery framework. Accessibility coverage and model judgments
+remain limited by their observed evidence. Tests use fake Jev/CUA and a fake
+clock/sleeper; they do not demonstrate success on arbitrary live desktop tasks.
 
 ## Timing boundaries
 
@@ -162,6 +303,8 @@ by the number of questions and present that as per-question latency.
 | Response processing | After response receipt, before decoding/validation | Validated choices and advancing winners are ready |
 | Action preparation | Before mapping the selected control to native arguments | Arguments are ready for dispatch |
 | Native action | Immediately before invoking the action adapter | Adapter returns the action result |
+| Settling wait | After the native action returns, or a wait-longer answer is consumed | The selected sleep returns, before fresh observation |
+| Later-pass judgment | Before preparing the batched three questions or wait/error questions | Validated answers are available for routing |
 | Total operational run | Earliest recorded application boundary | Operational result and normal client cleanup are complete, before report generation |
 | Report generation and writing | After the operational run, before constructing the final JSON | The single final report write completes |
 
@@ -209,7 +352,12 @@ The completed report must make it easy to see:
   API call duration.
 - Every group's candidates, exact question, returned probabilities, selected
   winner, and separately reported confidence where available.
+- Every finalist's timing question and answer, the consumed winning timing,
+  loop judgments, iteration number, route, and actual settling-wait duration.
 - The recorded start/finish boundaries connecting these durations and events.
+
+Selection round names can repeat in later passes. Correlate them using
+`(iteration, round_id)` and span/request identities, never `round_id` alone.
 
 Report generation and writing happen after the operational run and must be
 measured separately. Their complete duration is only known after the file write

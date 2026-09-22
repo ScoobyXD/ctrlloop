@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from src.driver import DriverError
 from src import main as cli
-from src.pipeline import run_pipeline
+from pipeline_fixtures import select_once
 from src.reporting import RunReport
 from src.selection import ChoiceSelector, QUESTION
 from test_driver import foreground_result
@@ -120,8 +120,8 @@ class PipelineTimingTests(unittest.TestCase):
             self.clock.advance(250)
 
         with patch.object(report, "_write_document", side_effect=slow_write) as write:
-            result = run_pipeline("Click Save", driver, ChoiceSelector(ChoosingClient()),
-                                  report=report, execute_click=True)
+            result = select_once("Click Save", driver, ChoiceSelector(ChoosingClient()),
+                                  report=report, deliver_click=True)
             report.append("run_finished", result=result.to_dict())
             write.assert_not_called()
             self.assertFalse(report.path.exists())
@@ -170,10 +170,10 @@ class PipelineTimingTests(unittest.TestCase):
         }
         plain_driver = TimedDriver(self.clock, **many_candidates)
         timed_driver = TimedDriver(self.clock, **many_candidates)
-        plain = run_pipeline("Click Save", plain_driver, ChoiceSelector(plain_client), execute_click=True)
+        plain = select_once("Click Save", plain_driver, ChoiceSelector(plain_client), deliver_click=True)
         with RunReport(self.directory) as report:
-            timed = run_pipeline("Click Save", timed_driver, ChoiceSelector(timed_client),
-                                 report=report, execute_click=True)
+            timed = select_once("Click Save", timed_driver, ChoiceSelector(timed_client),
+                                 report=report, deliver_click=True)
 
         def requests(client):
             return [
@@ -229,12 +229,20 @@ class PipelineTimingTests(unittest.TestCase):
             self.clock.advance(delay)
             return False
 
+        def completed_pipeline(*args, **kwargs):
+            # Isolate the CLI cleanup/report boundary from loop routing. The
+            # shared stages still incur their deterministic fake driver costs.
+            result = select_once(*args, **kwargs, deliver_click=True)
+            result.status = "completed"
+            return result
+
         with (
             patch.object(cli, "perf_counter_ns", side_effect=self.clock),
             patch.dict("os.environ", {"TYPESAFE_API_KEY": "fixture-key"}, clear=True),
             patch.object(cli, "load_dotenv"),
             patch.object(cli, "RunReport", side_effect=make_report),
             patch.object(cli, "CuaDriver", return_value=driver),
+            patch.object(cli, "run_pipeline", side_effect=completed_pipeline),
             patch.object(cli, "TypeSafeClient") as sdk,
             patch.object(cli.httpx2, "Client") as http,
             patch("sys.stdout", stdout), patch("sys.stderr", io.StringIO()),
@@ -242,11 +250,11 @@ class PipelineTimingTests(unittest.TestCase):
             sdk.return_value.__enter__.return_value = client
             sdk.return_value.__exit__.side_effect = lambda *args: finish_client("sdk", 2)
             http.return_value.__exit__.side_effect = lambda *args: finish_client("http", 3)
-            status = cli.main(["--click", "Click Save"])
+            status = cli.main(["Click Save"])
 
         self.assertEqual(status, 0)
         output = json.loads(stdout.getvalue())
-        self.assertEqual(output["status"], "action_returned")
+        self.assertEqual(output["status"], "completed")
         self.assertEqual(output["action_result"], driver.native_result)
         timing = output["timing"]
         self.assertEqual(timing["duration_ms"], 65)
@@ -272,8 +280,8 @@ class PipelineTimingTests(unittest.TestCase):
                     driver = TimedDriver(self.clock, fail_tool=tool, failure=error)
                     with RunReport(self.directory) as report:
                         with self.assertRaises(type(error)) as raised:
-                            run_pipeline("Click Save", driver, ChoiceSelector(ChoosingClient()),
-                                         report=report, execute_click=True)
+                            select_once("Click Save", driver, ChoiceSelector(ChoosingClient()),
+                                         report=report, deliver_click=True)
                     self.assertIs(raised.exception, error)
                     finished = self.finished(report, operation)
                     self.assertEqual(finished["status"], "interrupted" if isinstance(error, KeyboardInterrupt) else "error")
@@ -292,8 +300,8 @@ class PipelineTimingTests(unittest.TestCase):
         ):
             with self.subTest(expected=expected):
                 with RunReport(self.directory) as report:
-                    result = run_pipeline("Click Save", driver, ChoiceSelector(ChoosingClient()),
-                                          report=report, execute_click=True)
+                    result = select_once("Click Save", driver, ChoiceSelector(ChoosingClient()),
+                                          report=report, deliver_click=True)
                 self.assertEqual(result.status, expected)
                 operations = {event.get("operation") for event in self.events(report)}
                 self.assertNotIn("native_action", operations)
@@ -318,8 +326,8 @@ class PipelineTimingTests(unittest.TestCase):
 
                     with patch.object(report, "append", side_effect=fail_start):
                         with self.assertRaises(type(error)) as raised:
-                            run_pipeline("Click Save", driver, ChoiceSelector(ChoosingClient()),
-                                         report=report, execute_click=True)
+                            select_once("Click Save", driver, ChoiceSelector(ChoosingClient()),
+                                         report=report, deliver_click=True)
                 self.assertIs(raised.exception, error)
                 self.assertNotIn("click", [tool for tool, _ in driver.calls])
                 expected = "error" if isinstance(error, OSError) else "interrupted"

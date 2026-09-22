@@ -97,6 +97,7 @@ class ReportingTimingTests(unittest.TestCase):
         self.assertEqual(summary["origin"], "test_clock")
         self.assertAlmostEqual(summary["duration_ms"], 0.125123)
         self.assertIsNone(summary["time_to_first_jev_request_ms"])
+        self.assertEqual(summary["jev_api_call_count"], 0)
         self.assertEqual(summary["end_boundary"], "operational_end_before_report_generation")
         self.assertNotIn("report_write_count", summary)
         self.assertEqual(completion["report_write_count"], 1)
@@ -195,6 +196,44 @@ class ReportingTimingTests(unittest.TestCase):
         self.assertEqual(round_timing["response_processing_started_elapsed_ms"], response["finished_elapsed_ms"])
         self.assertAlmostEqual(round_timing["response_processing_finished_elapsed_ms"], 22.375)
 
+    def test_repeated_round_ids_correlate_response_processing_with_their_iteration(self):
+        clock = Clock()
+        with patch("src.reporting.perf_counter_ns", clock), RunReport(self.directory) as report:
+            def handler(request):
+                clock.advance(5_000_000)
+                return httpx2.Response(200, json={"ok": True})
+
+            with httpx2.Client(transport=httpx2.MockTransport(handler), event_hooks={
+                "request": [report.on_request], "response": [report.on_response],
+            }) as client:
+                for iteration, processing_ms in ((1, 3), (2, 7)):
+                    with report.span("loop.iteration", iteration=iteration):
+                        for stage in ("windows", "controls"):
+                            with report.span("selection.round", stage=stage, round=1, round_id=f"{stage}_r1"):
+                                with report.span("selection.sdk_call"):
+                                    client.post("https://example.com", json={})
+                                with report.span("selection.response_validation"):
+                                    clock.advance((processing_ms - 1) * 1_000_000)
+                                with report.span("selection.advancement"):
+                                    clock.advance(1_000_000)
+            events = self.events(report)
+
+        rounds = [e for e in events if e["event"] == "timing_finished" and e["operation"] == "selection.round"]
+        self.assertEqual(report.close()["jev_api_call_count"], 4)
+        self.assertEqual(len(rounds), 4)
+        responses = {
+            (e["iteration"], e["round_id"]): e for e in events if e["event"] == "jev_response"
+        }
+        advancements = {
+            (e["iteration"], e["round_id"]): e for e in events
+            if e["event"] == "timing_finished" and e["operation"] == "selection.advancement"
+        }
+        for record in rounds:
+            key = (record["iteration"], record["round_id"])
+            self.assertEqual(record["response_processing_duration_ms"], {1: 3, 2: 7}[record["iteration"]])
+            self.assertEqual(record["response_processing_started_elapsed_ms"], responses[key]["finished_elapsed_ms"])
+            self.assertEqual(record["response_processing_finished_elapsed_ms"], advancements[key]["finished_elapsed_ms"])
+
     def test_request_without_response_ends_at_observed_sdk_error_or_interrupt(self):
         for failure in (httpx2.ConnectError("private transport detail"), KeyboardInterrupt("private interrupt")):
             with self.subTest(type=type(failure).__name__), RunReport(self.directory) as report:
@@ -233,7 +272,7 @@ class ReportingTimingTests(unittest.TestCase):
             client = stack.enter_context(patch.object(cli, "TypeSafeClient"))
             client.return_value.__exit__.side_effect = cleanup_error
             stack.enter_context(patch.object(cli, "run_pipeline", side_effect=error,
-                                            return_value=result or PipelineResult("selected")))
+                                            return_value=result or PipelineResult("completed")))
             stack.enter_context(redirect_stdout(output))
             stack.enter_context(redirect_stderr(errors))
             status = cli.main(["Find Save"], _include_imports=include_imports)
@@ -256,7 +295,7 @@ class ReportingTimingTests(unittest.TestCase):
         self.assertEqual(events[-1]["timing"]["duration_ms"], events[-1]["elapsed_ms"])
 
     def test_cleanup_failure_uses_original_cli_error_path(self):
-        result = PipelineResult("action_returned", action_result={"effect": "unverifiable"})
+        result = PipelineResult("completed", action_result={"effect": "unverifiable"})
         status, output, errors = self.invoke_cli(result=result, cleanup_error=OSError("private cleanup"))
         self.assertEqual(status, 1)
         self.assertEqual(output["status"], "error")

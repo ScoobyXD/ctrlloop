@@ -114,6 +114,7 @@ class RunReport:
         return {
             "origin": self.origin_label,
             "duration_ms": self._elapsed_ms(at_ns),
+            "jev_api_call_count": self._request_count,
             "time_to_first_jev_request_ms": (
                 self._elapsed_ms(self._first_request_ns) if self._first_request_ns is not None else None
             ),
@@ -289,11 +290,11 @@ class RunReport:
             self._finished_ns = started_ns
         try:
             responses = {
-                event["round_id"]: event for event in self._events
+                (event.get("iteration"), event["round_id"]): event for event in self._events
                 if event["event"] == "jev_response" and "round_id" in event
             }
             advancements = {
-                event["round_id"]: event for event in self._events
+                (event.get("iteration"), event["round_id"]): event for event in self._events
                 if event["event"] == "timing_finished" and event["operation"] == "selection.advancement"
                 and "round_id" in event
             }
@@ -306,10 +307,10 @@ class RunReport:
                         at_ns = self._origin_ns + round(record[f"{field}_elapsed_ms"] * 1_000_000)
                         record[f"{field}_at"] = self._timestamp(at_ns)
                     if record["operation"] == "selection.round":
-                        round_id = record.get("round_id")
-                        if round_id in responses and round_id in advancements:
-                            start = responses[round_id]["finished_elapsed_ms"]
-                            finish = advancements[round_id]["finished_elapsed_ms"]
+                        round_key = (record.get("iteration"), record.get("round_id"))
+                        if round_key in responses and round_key in advancements:
+                            start = responses[round_key]["finished_elapsed_ms"]
+                            finish = advancements[round_key]["finished_elapsed_ms"]
                             record.update(
                                 response_processing_started_elapsed_ms=start,
                                 response_processing_finished_elapsed_ms=finish,

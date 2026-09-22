@@ -1,5 +1,10 @@
 # Add a synthetic Start menu option to Jev's window selection
 
+Historical handoff for the synthetic-selection milestone. The current
+[main workflow](../main-workflow.md) supersedes its descriptions of reporting,
+request batching, and single-pass behavior; synthetic Start/Search execution
+remains deferred.
+
 Work in `C:\Users\Jonat\ctrlloop`. Read the repository's `AGENTS.md` instructions and inspect the existing code before editing. Preserve unrelated uncommitted work.
 
 Implement a selection-only milestone: offer Jev an explicit option named **Open Start menu (Windows Search)** alongside the observed windows. The target is the Windows Start menu, with the search field across its top. Do not execute that action yet.

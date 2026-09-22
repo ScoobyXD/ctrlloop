@@ -1,10 +1,11 @@
-"""Offline checks for registry-defined windows and the common selection pipeline."""
+"""Offline checks for registry-defined windows and shared selection stages."""
 
 import json
 from types import SimpleNamespace
 import unittest
 
-from src.pipeline import run_pipeline, window_candidates
+from src.pipeline import window_candidates
+from pipeline_fixtures import select_once
 from test_driver import foreground_result
 from test_pipeline import RecordingReport
 from src.selection import Candidate, ChoiceSelector, PINNED_MODEL
@@ -179,7 +180,7 @@ class SyntheticPipelineTests(unittest.TestCase):
         client = ChoosingClient()
         report = RecordingReport()
         request = "  Search with my launcher.\r\n"
-        result = run_pipeline(
+        result = select_once(
             request, driver, ChoiceSelector(client), synthetic=registry, report=report,
         )
 
@@ -230,7 +231,7 @@ class SyntheticPipelineTests(unittest.TestCase):
         control = {"element_index": 7, "role": "Edit", "label": "Search", "element_token": "real:7"}
         driver = ObservingDriver([start], {"snapshot_id": "real", "elements": [control]})
         client = ChoosingClient()
-        result = run_pipeline("Search Start", driver, ChoiceSelector(client), synthetic=SyntheticRegistry([]))
+        result = select_once("Search Start", driver, ChoiceSelector(client), synthetic=SyntheticRegistry([]))
 
         self.assertEqual(result.status, "selected")
         self.assertIs(result.window, start)
@@ -244,7 +245,7 @@ class SyntheticPipelineTests(unittest.TestCase):
         driver = ObservingDriver()
         client = ChoosingClient()
         report = RecordingReport()
-        result = run_pipeline(
+        result = select_once(
             "Open launcher", driver, ChoiceSelector(client),
             synthetic=SyntheticRegistry([]), report=report,
         )
@@ -260,7 +261,7 @@ class SyntheticPipelineTests(unittest.TestCase):
         driver = ObservingDriver()
         client = ChoosingClient()
         report = RecordingReport()
-        result = run_pipeline(
+        result = select_once(
             "Use launcher", driver, ChoiceSelector(client), synthetic=registry, report=report,
         )
         self.assertEqual(result.status, "no_controls")
@@ -278,10 +279,10 @@ class SyntheticPipelineTests(unittest.TestCase):
     def test_mutating_one_pipeline_result_does_not_change_later_results(self):
         registry = SyntheticRegistry([definition()])
         client = ChoosingClient()
-        first = run_pipeline("Use launcher", ObservingDriver(), ChoiceSelector(client), synthetic=registry)
+        first = select_once("Use launcher", ObservingDriver(), ChoiceSelector(client), synthetic=registry)
         first.window["title"] = "Changed"
         first.control["actions"].clear()
-        second = run_pipeline("Use launcher", ObservingDriver(), ChoiceSelector(client), synthetic=registry)
+        second = select_once("Use launcher", ObservingDriver(), ChoiceSelector(client), synthetic=registry)
 
         self.assertEqual(second.window["title"], "Application launcher")
         self.assertEqual(second.control["actions"], ["type_text"])
