@@ -27,6 +27,61 @@ That executor must open Start, resolve its real search field in a fresh CUA
 snapshot, and type the supplied text. The selection pipeline itself does not yet
 perform those actions or generate the text to enter.
 
+## Defining synthetic windows and controls
+
+[src/synthetic.py](src/synthetic.py) is the single place for built-in synthetic
+options. `START_MENU` defines the existing window, Search control, and rule that
+replaces an observed Start window. `DEFAULT_REGISTRY` lists enabled definitions
+in their selection order. To add another built-in option, define it beside
+`START_MENU` and include it in that registry; no pipeline or selector edits are
+needed.
+
+A `SyntheticWindow` groups existing `Candidate` objects:
+
+| Field | Purpose |
+| --- | --- |
+| `window` | Stable key, concise Jev description, and local window record |
+| `controls` | Ordered tuple of candidates offered when this window wins |
+| `matches_observed` | Optional pure predicate identifying real windows this definition replaces |
+
+The registry adds `synthetic: true` to records and returns independent copies so
+caller edits and earlier results cannot change later selections. Use semantic
+`target` names and advertised actions in local records; these definitions contain
+no invented HWNDs, element tokens, or snapshots. Actions describe intent only;
+they do not implement execution. Matchers must not mutate observed records.
+
+For an application-specific registry, reuse the same definitions and inject it:
+
+```python
+from src.pipeline import run_pipeline
+from src.selection import Candidate
+from src.synthetic import START_MENU, SyntheticRegistry, SyntheticWindow
+
+launcher = SyntheticWindow(
+    window=Candidate(
+        "app_launcher",
+        {"title": "App Launcher", "purpose": "Find an installed application."},
+        {"title": "App Launcher", "target": "app_launcher"},
+    ),
+    controls=(Candidate(
+        "search",
+        {"role": "Edit", "label": "Search", "input_type": "text"},
+        {"role": "Edit", "label": "Search", "input_type": "text",
+         "actions": ["type_text"], "target": "app_launcher_search"},
+    ),),
+)
+registry = SyntheticRegistry((START_MENU, launcher))
+result = run_pipeline(original_request, driver, selector, synthetic=registry)
+```
+
+This example is not enabled by default. Window keys must be nonempty and unique;
+`window_` is reserved for discovered windows. Control keys must be nonempty and
+unique within their window. Duplicate or reserved keys fail at registry creation.
+A single control advances without Jev; multiple controls use the existing batched
+selector. A definition with no controls returns `no_controls`. Passing
+`SyntheticRegistry(())` disables synthetic options and their replacement rules.
+Observed windows otherwise retain their original identity, order, and keys.
+
 ## Run
 
 From the repository root, with Python 3.11+ and `uv`:
@@ -62,6 +117,7 @@ The source modules live directly in `src/` and feed into `src/main.py`:
 
 - `driver.py` discovers windows and reads the selected window's accessibility state.
 - `selection.py` batches Jev Choice questions and advances one winner per group.
+- `synthetic.py` defines synthetic windows, their controls, and duplicate-matching rules.
 - `pipeline.py` connects window discovery, window selection, the snapshot read, and control selection.
 - `reporting.py` appends durable run events and captures the actual Jev HTTP bodies.
 - `main.py` provides the CLI, loads configuration, and prints the result.
@@ -92,7 +148,7 @@ it is not automatically attributed to daemon access.
 | --- | --- | --- |
 | `selected` | A real window/control or synthetic Start Menu/Search target was chosen | 0 |
 | `no_windows` | No first-stage candidate selected; normally unreachable with the Start Menu option | 2 |
-| `no_controls` | A valid read returned no indexed controls | 2 |
+| `no_controls` | A valid read returned no indexed controls, or a synthetic window defines no controls | 2 |
 | `observation_degraded` | A degraded read returned no indexed controls | 2 |
 | `observation_unavailable` | Structured controls or their snapshot identity were unavailable | 2 |
 | `error` | Driver, configuration, or Jev request/response failure | 1 |

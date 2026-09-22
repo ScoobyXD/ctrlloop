@@ -11,10 +11,11 @@ from unittest.mock import patch
 
 from src.driver import DriverError
 from src.pipeline import (
-    PipelineResult, START_MENU_KEY, START_MENU_SEARCH_KEY, control_candidates,
+    PipelineResult, control_candidates,
     run_pipeline, window_candidates,
 )
 from src.selection import ChoiceSelector, PINNED_MODEL, QUESTION
+from src.synthetic import START_MENU_KEY, START_MENU_SEARCH_KEY
 
 
 class RecordingReport:
