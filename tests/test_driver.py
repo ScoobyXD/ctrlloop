@@ -1,12 +1,9 @@
-"""Contract tests for the read-only CLI boundary; no desktop access needed."""
+"""Contract tests for the native MCP boundary; no desktop access needed."""
 
 from copy import deepcopy
 import json
-import os
 from pathlib import Path
-import subprocess
 import unittest
-from unittest.mock import patch
 
 from src.driver import CuaDriver, DriverError
 
@@ -49,88 +46,70 @@ def state(**updates):
     return record
 
 
-class FakeRunner:
+def tool_result(payload=None, *, text=None, is_error=False):
+    """Build the native MCP envelope without changing the native payload."""
+    result = {"content": [], "isError": is_error}
+    if payload is not None:
+        result["structuredContent"] = payload
+    if text is not None:
+        result["content"].append({"type": "text", "text": text})
+    return result
+
+
+class FakeTransport:
     def __init__(self, *responses):
         self.responses = list(responses)
         self.calls = []
+        self.close_calls = 0
 
-    def __call__(self, args, **kwargs):
-        self.calls.append((args, kwargs))
+    def call(self, tool, arguments):
+        self.calls.append((tool, dict(arguments)))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        if isinstance(response, subprocess.CompletedProcess):
+        if isinstance(response, dict) and ("content" in response or "structuredContent" in response):
             return response
-        return subprocess.CompletedProcess(args, 0, json.dumps(response), "private diagnostic")
+        return tool_result(response)
+
+    def close(self):
+        self.close_calls += 1
 
 
 class DriverTests(unittest.TestCase):
     def driver(self, *responses, **kwargs):
-        runner = FakeRunner(*responses)
-        return CuaDriver(executable="fake-cua", runner=runner, **kwargs), runner
+        transport = FakeTransport(*responses)
+        return CuaDriver(executable="fake-cua", transport=transport, **kwargs), transport
 
     def test_only_two_read_calls_and_exact_arguments(self):
         observed_window = window(custom_metadata={"retained": True})
         observed_state = state()
-        driver, runner = self.driver({"windows": [observed_window]}, observed_state)
+        driver, transport = self.driver({"windows": [observed_window]}, observed_state)
         windows = driver.list_windows()
         snapshot = driver.get_window_state(windows[0])
         self.assertEqual(windows, [observed_window])
         self.assertEqual(snapshot, observed_state)
-        self.assertEqual([call[0] for call in runner.calls], [
-            ["fake-cua", "call", "list_windows"],
-            ["fake-cua", "call", "get_window_state"],
+        self.assertEqual([call[0] for call in transport.calls], [
+            "list_windows", "get_window_state",
         ])
-        self.assertEqual(json.loads(runner.calls[0][1]["input"]), {})
-        self.assertEqual(json.loads(runner.calls[1][1]["input"]), {
+        self.assertEqual(transport.calls[0][1], {})
+        self.assertEqual(transport.calls[1][1], {
             "pid": 4242, "window_id": 123456,
             "include_accessibility_tree": True, "include_screenshot": False,
             "max_elements": 5000, "max_depth": 25,
         })
-        for _, options in runner.calls:
-            self.assertFalse(options["shell"])
-            self.assertTrue(options["capture_output"])
-            self.assertEqual(options["encoding"], "utf-8")
-            self.assertEqual(options["timeout"], 60.0)
-            self.assertNotIn("stderr", options)
-            if os.name == "nt":
-                self.assertEqual(options["creationflags"], subprocess.CREATE_NO_WINDOW)
 
-    def test_custom_limits_and_timeout(self):
-        driver, runner = self.driver(state(), max_elements=80, max_depth=6, timeout=12)
+    def test_custom_snapshot_limits(self):
+        driver, transport = self.driver(state(), max_elements=80, max_depth=6, timeout=12)
         driver.get_window_state(window())
-        self.assertEqual(runner.calls[0][1]["timeout"], 12)
-        args = json.loads(runner.calls[0][1]["input"])
+        args = transport.calls[0][1]
         self.assertEqual((args["max_elements"], args["max_depth"]), (80, 6))
 
-    def test_telemetry_is_disabled_for_all_calls_without_changing_parent_environment(self):
-        for inherited in ({}, {"CUA_DRIVER_RS_TELEMETRY_ENABLED": "1", "CUA_TELEMETRY_ENABLED": "1"}):
-            with self.subTest(inherited=inherited), patch.dict(
-                os.environ, {"PATH": "preserved-path", "CTRLOOP_TEST_ENV": "preserved", **inherited},
-                clear=True,
-            ):
-                parent_environment = dict(os.environ)
-                observed = window()
-                driver, runner = self.driver(
-                    {"windows": [observed]}, foreground_result(observed), state(),
-                    {"effect": "unverifiable", "route": "accessibility"},
-                )
-                driver.list_windows()
-                driver.bring_to_front({"pid": 4242, "window_id": 123456})
-                driver.get_window_state(observed)
-                driver.click({"pid": 4242, "window_id": 123456, "element_token": "observed:17"})
-                for _, options in runner.calls:
-                    self.assertEqual(options["env"], {
-                        **parent_environment, "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0",
-                    })
-                self.assertEqual(dict(os.environ), parent_environment)
-
     def test_other_actions_cannot_be_requested_even_through_private_dispatch(self):
-        driver, runner = self.driver()
+        driver, transport = self.driver()
         for tool in ("type_text", "launch_app", "get_desktop_state", "serve"):
             with self.subTest(tool=tool), self.assertRaises(DriverError):
                 driver._call(tool, {})
-        self.assertEqual(runner.calls, [])
+        self.assertEqual(transport.calls, [])
 
     def test_sanitized_recorded_samples_pass(self):
         examples = Path(__file__).resolve().parents[1] / "docs/cua-driver/0.28.2/examples"
@@ -148,11 +127,11 @@ class DriverTests(unittest.TestCase):
 
     def test_partial_nullable_window_fields_are_preserved(self):
         record = window(pid=None, minimized=None, layer=None, on_current_space=None, space_ids=None)
-        driver, runner = self.driver({"windows": [record]})
+        driver, transport = self.driver({"windows": [record]})
         self.assertEqual(driver.list_windows(), [record])
         with self.assertRaisesRegex(DriverError, "usable observed"):
             driver.get_window_state(record)
-        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(len(transport.calls), 1)
 
     def test_partial_nullable_control_fields_are_preserved(self):
         control = element(
@@ -180,28 +159,33 @@ class DriverTests(unittest.TestCase):
             snapshot = state(elements=[], degraded=degraded, returned_element_count=0)
             if degraded:
                 snapshot.update(degraded_reason="UIA unavailable", escalation={"recommended": "foreground"})
-            driver, runner = self.driver(snapshot)
+            driver, transport = self.driver(snapshot)
             self.assertEqual(driver.get_window_state(window()), snapshot)
-            self.assertEqual(len(runner.calls), 1)
+            self.assertEqual(len(transport.calls), 1)
 
     def test_degraded_partial_snapshot_can_be_used(self):
         snapshot = state(degraded=True, degraded_reason="partial MSAA fallback", truncated=True)
         driver, _ = self.driver(snapshot)
         self.assertEqual(driver.get_window_state(window()), snapshot)
 
-    def test_zero_exit_plain_text_and_invalid_json_are_errors(self):
-        for stdout in ("private tool failure", "", "[]", "null", '{"windows":NaN}'):
-            with self.subTest(stdout=stdout):
-                driver, _ = self.driver(subprocess.CompletedProcess([], 0, stdout, "private stderr"))
+    def test_plain_text_and_invalid_json_are_errors(self):
+        for text in ("private tool failure", "", "[]", "null", '{"windows":NaN}'):
+            with self.subTest(text=text):
+                driver, _ = self.driver(tool_result(text=text))
                 with self.assertRaises(DriverError) as raised:
                     driver.list_windows()
                 self.assertNotIn("private", str(raised.exception))
 
-    def test_nonzero_exit_is_sanitized_even_when_stdout_looks_successful(self):
-        driver, _ = self.driver(subprocess.CompletedProcess([], 1, '{"windows":[]}', "private secret"))
-        with self.assertRaisesRegex(DriverError, "exit 1") as raised:
+    def test_mcp_error_is_sanitized_even_with_successful_looking_payload(self):
+        driver, _ = self.driver(tool_result({"windows": []}, text="private secret", is_error=True))
+        with self.assertRaises(DriverError) as raised:
             driver.list_windows()
         self.assertNotIn("private", str(raised.exception))
+
+    def test_json_text_fallback_preserves_native_payload(self):
+        observed = window()
+        driver, _ = self.driver(tool_result(text=json.dumps({"windows": [observed]})))
+        self.assertEqual(driver.list_windows(), [observed])
 
     def test_driver_diagnostics_distinguish_transport_provider_and_target_failures(self):
         cases = (
@@ -217,26 +201,29 @@ class DriverTests(unittest.TestCase):
         )
         for diagnostic, code in cases:
             with self.subTest(code=code):
-                driver, _ = self.driver(subprocess.CompletedProcess(
-                    [], 1, '{"tree_markdown":"private snapshot"}', diagnostic + " private-secret"
-                ))
+                failure = tool_result(
+                    {"tree_markdown": "private snapshot"},
+                    text=diagnostic + " private-secret", is_error=True,
+                )
+                # Unavailable daemon failures allow one read-only retry.
+                driver, _ = self.driver(failure, failure)
                 with self.assertRaises(DriverError) as raised:
                     driver.get_window_state(window())
                 self.assertEqual(raised.exception.details(), {
-                    "code": code, "tool": "get_window_state", "exit_code": 1,
+                    "code": code, "tool": "get_window_state",
                 })
                 self.assertNotIn("private", str(raised.exception))
                 if code != "pipe_access_denied" and code != "daemon_unavailable":
                     self.assertNotIn("daemon", str(raised.exception))
 
-    def test_zero_exit_tool_error_preserves_recognized_diagnostic(self):
-        driver, _ = self.driver(subprocess.CompletedProcess(
-            [], 0, "window_id 17 belongs to pid 42, not pid 43", ""
+    def test_text_tool_error_preserves_recognized_diagnostic(self):
+        driver, _ = self.driver(tool_result(
+            text="window_id 17 belongs to pid 42, not pid 43", is_error=True,
         ))
         with self.assertRaises(DriverError) as raised:
             driver.get_window_state(window())
         self.assertEqual(raised.exception.code, "window_owner_mismatch")
-        self.assertEqual(raised.exception.exit_code, 0)
+        self.assertIsNone(raised.exception.exit_code)
 
     def test_structured_permission_refusal_has_safe_diagnostic_code(self):
         driver, _ = self.driver({"code": "permission_denied", "error": "private-secret"})
@@ -260,7 +247,6 @@ class DriverTests(unittest.TestCase):
     def test_transport_exceptions_are_sanitized(self):
         errors = [
             FileNotFoundError("private path"), PermissionError("private diagnostic"),
-            subprocess.TimeoutExpired("private command", 10, output="private stdout", stderr="private stderr"),
             UnicodeDecodeError("utf-8", b"\xff", 0, 1, "private payload"),
         ]
         for error in errors:
@@ -270,13 +256,146 @@ class DriverTests(unittest.TestCase):
                     driver.list_windows()
                 self.assertNotIn("private", str(raised.exception))
 
-    def test_selected_identity_invalid_before_subprocess(self):
+    def test_read_reconnects_once_using_the_same_transport(self):
+        for tool, response in (("list_windows", {"windows": [window()]}), ("get_window_state", state())):
+            for code in ("transport_disconnected", "client_timeout", "daemon_unavailable"):
+                with self.subTest(tool=tool, code=code):
+                    driver, transport = self.driver(DriverError("Connection unavailable.", code=code), response)
+                    observed = (driver.list_windows() if tool == "list_windows"
+                                else driver.get_window_state(window()))
+                    self.assertEqual(observed, response["windows"] if tool == "list_windows" else response)
+                    self.assertEqual([call[0] for call in transport.calls], [tool, tool])
+                    self.assertEqual(transport.calls[0], transport.calls[1])
+                    self.assertEqual(transport.close_calls, 1)
+
+    def test_repeated_read_disconnect_stops_after_one_retry(self):
+        for tool in ("list_windows", "get_window_state"):
+            with self.subTest(tool=tool):
+                errors = [DriverError("Connection unavailable.", code="transport_disconnected") for _ in range(2)]
+                driver, transport = self.driver(*errors, {"windows": []})
+                with self.assertRaises(DriverError) as raised:
+                    if tool == "list_windows":
+                        driver.list_windows()
+                    else:
+                        driver.get_window_state(window())
+                self.assertIs(raised.exception, errors[-1])
+                self.assertEqual([call[0] for call in transport.calls], [tool, tool])
+                self.assertEqual(len(transport.responses), 1)
+
+    def test_action_connection_loss_never_replays_the_action(self):
+        for tool in ("click", "bring_to_front"):
+            for code in ("transport_disconnected", "client_timeout"):
+                with self.subTest(tool=tool, code=code):
+                    failure = DriverError("Action response unavailable.", code=code)
+                    driver, transport = self.driver(failure, {"effect": "confirmed", "route": "accessibility"})
+                    target = {"pid": 4242, "window_id": 123456}
+                    if tool == "click":
+                        target["element_token"] = "old-token"
+                    with self.assertRaises(DriverError) as raised:
+                        getattr(driver, tool)(target)
+                    self.assertIs(raised.exception, failure)
+                    self.assertEqual(transport.calls, [(tool, target)])
+                    self.assertEqual(transport.close_calls, 1)
+                    self.assertEqual(len(transport.responses), 1)
+
+    def test_recovery_requires_a_fresh_snapshot_and_its_exact_target(self):
+        action_result = {"effect": "confirmed", "route": "accessibility"}
+        for kind in ("token", "index"):
+            with self.subTest(kind=kind):
+                old_snapshot = state(snapshot_id="old-snapshot", elements=[element(element_token="old-token")])
+                fresh_snapshot = state(snapshot_id="fresh-snapshot", elements=[
+                    element(element_index=31, element_token="fresh-token"),
+                ])
+                driver, transport = self.driver(
+                    old_snapshot, DriverError("Response lost.", code="transport_disconnected"),
+                    {"windows": [window()]}, fresh_snapshot, action_result,
+                )
+                identity = {"pid": 4242, "window_id": 123456}
+                old_target = {**identity, **({"element_token": "old-token"} if kind == "token" else {
+                    "element_index": 17, "snapshot_id": "old-snapshot",
+                })}
+                fresh_target = {**identity, **({"element_token": "fresh-token"} if kind == "token" else {
+                    "element_index": 31, "snapshot_id": "fresh-snapshot",
+                })}
+                driver.get_window_state(window())
+                with self.assertRaises(DriverError):
+                    driver.click(old_target)
+                with self.assertRaises(DriverError):
+                    driver.click(old_target)
+                self.assertEqual(len(transport.calls), 2)
+
+                # Rediscovering windows alone cannot validate a control token.
+                driver.list_windows()
+                with self.assertRaises(DriverError):
+                    driver.click(old_target)
+                self.assertEqual(len(transport.calls), 3)
+                driver.get_window_state(window())
+                unobserved_target = {**fresh_target, **({"element_token": "never-observed"} if kind == "token" else {
+                    "element_index": 999,
+                })}
+                invalid_targets = [old_target, unobserved_target, {**fresh_target, "window_id": 123457}]
+                if kind == "index":
+                    invalid_targets.append({**fresh_target, "snapshot_id": "old-snapshot"})
+                for target in invalid_targets:
+                    with self.subTest(target=target), self.assertRaises(DriverError):
+                        driver.click(target)
+                self.assertEqual(len(transport.calls), 4)
+                self.assertEqual(driver.click(fresh_target), action_result)
+                self.assertEqual(transport.calls[-1], ("click", fresh_target))
+                self.assertEqual(len(transport.calls), 5)
+
+    def test_newer_snapshot_supersedes_the_recovery_snapshot(self):
+        action_result = {"effect": "confirmed", "route": "accessibility"}
+        driver, transport = self.driver(
+            DriverError("Connection lost.", code="transport_disconnected"),
+            state(snapshot_id="recovered", elements=[element(element_token="recovered-token")]),
+            action_result,
+            state(snapshot_id="newest", elements=[element(element_token="newest-token")]),
+            action_result,
+        )
+        identity = {"pid": 4242, "window_id": 123456}
+        recovered_target = {**identity, "element_token": "recovered-token"}
+        driver.get_window_state(window())
+        driver.click(recovered_target)
+        driver.get_window_state(window())
+        with self.assertRaises(DriverError):
+            driver.click(recovered_target)
+        self.assertEqual(len(transport.calls), 4)
+        self.assertEqual(driver.click({**identity, "element_token": "newest-token"}), action_result)
+        self.assertEqual(len(transport.calls), 5)
+
+    def test_close_is_idempotent_and_a_closed_driver_cannot_read(self):
+        driver, transport = self.driver({"windows": []})
+        driver.list_windows()
+        driver.close()
+        driver.close()
+        self.assertEqual(transport.close_calls, 1)
+        for tool in ("list_windows", "get_window_state"):
+            with self.subTest(tool=tool), self.assertRaises(DriverError) as raised:
+                if tool == "list_windows":
+                    driver.list_windows()
+                else:
+                    driver.get_window_state(window())
+            self.assertEqual(raised.exception.code, "driver_closed")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_context_closes_on_failure_without_idle_health_calls(self):
+        driver, transport = self.driver()
+        with self.assertRaisesRegex(RuntimeError, "request failed"):
+            with driver as active:
+                self.assertIs(active, driver)
+                self.assertEqual(transport.calls, [])
+                raise RuntimeError("request failed")
+        self.assertEqual(transport.close_calls, 1)
+        self.assertEqual(transport.calls, [])
+
+    def test_selected_identity_invalid_before_transport(self):
         for field in ("pid", "window_id"):
             for invalid in (None, 0, -1, True, "4242", 1.5, 2**65):
-                driver, runner = self.driver()
+                driver, transport = self.driver()
                 with self.subTest(field=field, invalid=invalid), self.assertRaises(DriverError):
                     driver.get_window_state(window(**{field: invalid}))
-                self.assertEqual(runner.calls, [])
+                self.assertEqual(transport.calls, [])
 
     def test_requested_identity_must_match_response(self):
         for changes in ({"pid": 4243}, {"window_id": 123457}, {"pid": True}, {"window_id": None}):

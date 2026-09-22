@@ -1,8 +1,7 @@
-"""Windows adapter for the installed CUA Driver 0.28.2 CLI.
+"""Windows adapter with one CUA Driver MCP client per user request.
 
-The CLI flattens successful structured content onto stdout, but can also
-print tool errors there with exit code zero. Every response is validated.
 Native records and action results are retained without a parallel wire model.
+The client connects to the existing daemon; it never starts or stops it.
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ import math
 import os
 from pathlib import Path
 import shutil
-import subprocess
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -39,7 +37,7 @@ class DriverError(Exception):
         return details
 
 
-def _failure(tool: str, exit_code: int, diagnostic: str) -> DriverError:
+def _failure(tool: str, exit_code: int | None, diagnostic: str) -> DriverError:
     """Recognize useful error categories without echoing private driver output."""
     text = diagnostic.casefold()
     if "connect to named pipe" in text and "access is denied" in text:
@@ -72,9 +70,10 @@ def _failure(tool: str, exit_code: int, diagnostic: str) -> DriverError:
     elif "daemon" in text and any(marker in text for marker in ("not running", "failed to connect", "connection refused")):
         code, reason = "daemon_unavailable", "The existing CUA daemon could not be reached."
     else:
-        code, reason = "driver_call_failed", "The CLI did not provide a recognized diagnostic."
+        code, reason = "driver_call_failed", "The driver did not provide a recognized diagnostic."
+    exit_detail = f" (exit {exit_code})" if exit_code is not None else ""
     return DriverError(
-        f"CUA Driver {tool} failed (exit {exit_code}). {reason}",
+        f"CUA Driver {tool} failed{exit_detail}. {reason}",
         code=code, tool=tool, exit_code=exit_code,
     )
 
@@ -156,7 +155,7 @@ class CuaDriver:
         max_elements: int = 5000,
         max_depth: int = 25,
         *,
-        runner: Callable[..., Any] | None = None,
+        transport: Any = None,
     ) -> None:
         if executable is not None and (not isinstance(executable, str) or not executable):
             raise ValueError("executable must be a nonempty string")
@@ -168,61 +167,90 @@ class CuaDriver:
         self.timeout = timeout
         self.max_elements = max_elements
         self.max_depth = max_depth
-        self._runner = runner or subprocess.run
+        if transport is None:
+            # Import after DriverError is defined: the transport shares this
+            # existing error contract and does not introduce a parallel model.
+            if __package__:
+                from .cua_mcp import McpTransport
+            else:
+                from cua_mcp import McpTransport
+            transport = McpTransport(self.executable, self.timeout)
+        self._transport = transport
+        self._closed = False
+        self._recovery_required = False
+        self._recovery_snapshot: dict[str, Any] | None = None
+
+    def __enter__(self) -> CuaDriver:
+        if self._closed:
+            raise DriverError("This request's CUA client is closed.", code="driver_closed")
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """End this request's client once; leave the shared daemon running."""
+        if not self._closed:
+            self._closed = True
+            self._recovery_snapshot = None
+            self._transport.close()
 
     def _call(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         if tool not in {"list_windows", "get_window_state", "click", "bring_to_front"}:
             raise DriverError("Only window reads, bring_to_front, and a single click are available.")
-        try:
-            result = self._runner(
-                [self.executable, "call", tool],
-                input=json.dumps(arguments, ensure_ascii=False),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=self.timeout,
-                check=False,
-                shell=False,
-                # CUA's telemetry worker can keep captured pipes open after exit.
-                env={**os.environ, "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0"},
-                **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
-            )
-        except subprocess.TimeoutExpired:
-            raise DriverError(
-                f"CUA Driver {tool} exceeded the client timeout.", code="client_timeout", tool=tool
-            ) from None
-        except FileNotFoundError:
-            raise DriverError("CUA Driver executable was not found; supply its installed path.") from None
-        except OSError:
-            raise DriverError("CUA Driver could not run; check executable and desktop permissions.") from None
-        except UnicodeError:
-            raise DriverError("CUA Driver output could not be decoded as UTF-8.") from None
-        if result.returncode != 0:
-            if tool in {"click", "bring_to_front"}:
-                try:
-                    payload = json.loads(result.stdout, parse_constant=_reject_json_constant)
-                except (TypeError, ValueError):
-                    payload = None
-                if isinstance(payload, dict):
-                    error = _failure(tool, result.returncode, _action_diagnostic(payload) or result.stderr)
-                    error.context["action_result"] = payload
-                    raise error
-            # Do not inspect success-looking JSON/tree output as a diagnostic.
-            diagnostic = result.stderr or (
-                result.stdout if not result.stdout.lstrip().startswith(("{", "[")) else ""
-            )
-            raise _failure(tool, result.returncode, diagnostic)
-        try:
-            payload = json.loads(result.stdout, parse_constant=_reject_json_constant)
-        except (TypeError, ValueError):
-            if not result.stdout.lstrip().startswith(("{", "[")):
-                raise _failure(tool, result.returncode, result.stdout or result.stderr) from None
-            raise DriverError(
-                f"CUA Driver {tool} did not return structured JSON; "
-                "the CLI may have reported a tool error despite exit zero."
-            ) from None
+        if self._closed:
+            raise DriverError("This request's CUA client is closed.", code="driver_closed", tool=tool)
+        for attempt in range(2):
+            try:
+                return self._payload(tool, self._transport.call(tool, arguments))
+            except DriverError as error:
+                reconnect = error.code in {"transport_disconnected", "client_timeout", "daemon_unavailable"}
+                if reconnect or error.code in {"invalid_driver_response", "driver_call_failed"}:
+                    self._recovery_required = True
+                    self._recovery_snapshot = None
+                    self._transport.close()
+                # Reads are safe to repeat once. Never replay a click/activation
+                # after a lost response: it may already have been delivered.
+                if reconnect and attempt == 0 and tool in {"list_windows", "get_window_state"}:
+                    continue
+                raise
+            except (OSError, UnicodeError):
+                self._recovery_required = True
+                self._recovery_snapshot = None
+                self._transport.close()
+                raise DriverError("CUA transport failed; check the client and daemon connection.",
+                                  code="transport_disconnected", tool=tool) from None
+        raise AssertionError("Unreachable CUA retry state")
+
+    @staticmethod
+    def _payload(tool: str, result: Any) -> dict[str, Any]:
+        """Unwrap the native MCP envelope, then retain the existing validators."""
+        if not isinstance(result, dict) or type(result.get("isError", False)) is not bool:
+            raise DriverError("CUA returned an invalid MCP result.", code="invalid_driver_response", tool=tool)
+        content = result.get("content", [])
+        if not isinstance(content, list):
+            raise DriverError("CUA returned invalid MCP content.", code="invalid_driver_response", tool=tool)
+        text = "\n".join(block["text"] for block in content
+                         if isinstance(block, dict) and block.get("type") == "text"
+                         and isinstance(block.get("text"), str))
+        payload = result.get("structuredContent")
+        if "structuredContent" not in result:
+            try:
+                payload = json.loads(text, parse_constant=_reject_json_constant)
+            except (ValueError, TypeError):
+                if result.get("isError"):
+                    raise _failure(tool, None, text) from None
+                raise DriverError("CUA returned no structured JSON result.",
+                                  code="invalid_driver_response", tool=tool) from None
+        if result.get("isError"):
+            diagnostic = _action_diagnostic(payload) if isinstance(payload, dict) else ""
+            error = _failure(tool, None, diagnostic or text)
+            if tool in {"click", "bring_to_front"} and isinstance(payload, dict):
+                error.context["action_result"] = payload
+            raise error
         if not isinstance(payload, dict):
-            raise DriverError(f"CUA Driver {tool} did not return an object.")
+            raise DriverError(f"CUA Driver {tool} did not return an object.",
+                              code="invalid_driver_response", tool=tool)
         if tool in {"click", "bring_to_front"}:
             # Action facts use a different native contract from observations.
             # In particular, an effect of "unverifiable" is a legitimate result.
@@ -232,7 +260,7 @@ class CuaDriver:
                 or ("status" in payload and payload["status"] != "success")
                 or payload.get("effect") == "refused"
             ):
-                error = _failure(tool, 0, _action_diagnostic(payload))
+                error = _failure(tool, None, _action_diagnostic(payload))
                 error.context["action_result"] = payload
                 raise error
             return payload
@@ -243,7 +271,7 @@ class CuaDriver:
                 payload[key] for key in ("code", "status", "refusal", "error")
                 if isinstance(payload.get(key), str)
             )
-            raise _failure(tool, result.returncode, diagnostic)
+            raise _failure(tool, None, diagnostic)
         if "isError" in payload and payload["isError"] is not False:
             raise DriverError(f"CUA Driver {tool} returned a tool error.")
         return payload
@@ -301,6 +329,25 @@ class CuaDriver:
         if not valid:
             raise DriverError("Click requires an observed element_token or element_index with snapshot_id.",
                               code="invalid_click_target", tool="click")
+        if self._recovery_required:
+            snapshot = self._recovery_snapshot
+            fresh = bool(snapshot) and all(
+                snapshot.get(key) == arguments[key] for key in ("pid", "window_id")
+            )
+            elements = (snapshot or {}).get("elements") or []
+            if "element_token" in arguments:
+                fresh = fresh and any(
+                    element.get("element_token") == arguments["element_token"] for element in elements
+                )
+            else:
+                fresh = fresh and snapshot.get("snapshot_id") == arguments["snapshot_id"] and any(
+                    element["element_index"] == arguments["element_index"] for element in elements
+                )
+            if not fresh:
+                raise DriverError(
+                    "Refresh the window state and reselect a control after a CUA connection loss.",
+                    code="stale_element_token", tool="click",
+                )
         payload = self._call("click", arguments)
         # These are the public 0.28.2 ActionResult facts, not OS dispatch names.
         effect, route = payload.get("effect"), payload.get("route")
@@ -348,6 +395,7 @@ class CuaDriver:
         return windows
 
     def get_window_state(self, window: Mapping[str, Any]) -> dict[str, Any]:
+        self._recovery_snapshot = None
         if not isinstance(window, Mapping):
             raise DriverError("Select an observed window record before reading its state.")
         pid, window_id = window.get("pid"), window.get("window_id")
@@ -390,6 +438,8 @@ class CuaDriver:
             returned_count = payload.get("returned_element_count")
             if returned_count is not None and returned_count != len(elements):
                 _invalid("returned_element_count (does not match elements)")
+        if self._recovery_required:
+            self._recovery_snapshot = payload
         return payload
 
     @staticmethod

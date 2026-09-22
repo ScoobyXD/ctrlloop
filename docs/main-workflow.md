@@ -221,6 +221,11 @@ captured only after the wait; concurrent action/snapshot handling is unnecessary
 
 ## Running the loop
 
+One persistent MCP client belongs to each user request and is shared across
+its observation/action loop. The client is opened lazily and closed on completion,
+error or interruption; the existing daemon remains running. There are no health
+polls. Failed reads may reconnect once, while uncertain actions are never replayed.
+
 From the repository root, with the configured TypeSafe credentials and CUA daemon:
 
 ```powershell
