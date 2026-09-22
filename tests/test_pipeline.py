@@ -26,9 +26,22 @@ class RecordingReport:
         self.path = Path("reports") / "test-run.json"
         self.events = []
         self.closed = False
+        self._span_id = 0
 
     def append(self, event, **data):
+        # These legacy assertions cover milestones. Timing and detailed selection
+        # events are exercised with the real sink in the timing test modules.
+        if event.startswith(("timing_", "selection_")):
+            return
         self.events.append(json.loads(json.dumps({"event": event, **data})))
+
+    @contextlib.contextmanager
+    def span(self, operation, **data):
+        self._span_id += 1
+        yield {"span_id": self._span_id}
+
+    def record_interval(self, operation, started_ns, finished_ns, **data):
+        pass
 
     def close(self):
         self.closed = True

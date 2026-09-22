@@ -6,6 +6,7 @@ import unittest
 
 from src.pipeline import run_pipeline, window_candidates
 from test_driver import foreground_result
+from test_pipeline import RecordingReport
 from src.selection import Candidate, ChoiceSelector, PINNED_MODEL
 from src.synthetic import (
     DEFAULT_REGISTRY, START_MENU_KEY,
@@ -68,14 +69,6 @@ class ObservingDriver:
         if self.snapshot is None:
             raise AssertionError("Synthetic windows must not request a driver snapshot")
         return self.snapshot
-
-
-class RecordingReport:
-    def __init__(self):
-        self.events = []
-
-    def append(self, event, **data):
-        self.events.append(json.loads(json.dumps({"event": event, **data})))
 
 
 class SyntheticRegistryTests(unittest.TestCase):

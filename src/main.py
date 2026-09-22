@@ -1,5 +1,12 @@
 """Application entry point: python src/main.py 'the original user request'."""
 
+# Earliest practical Python boundary: excludes interpreter/process launch and
+# importing time itself, but includes all remaining application/SDK imports.
+from time import perf_counter_ns, time_ns
+
+_MODULE_START_NS = perf_counter_ns()
+_MODULE_WALL_NS = time_ns()
+
 import argparse
 import json
 import logging
@@ -24,8 +31,14 @@ else:
     from reporting import RunReport
     from selection import ChoiceSelector, PINNED_MODEL, RequestBudget, SelectionError
 
+_IMPORT_FINISHED_NS = perf_counter_ns()
 
-def main(argv: list[str] | None = None) -> int:
+
+def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> int:
+    entered_ns = perf_counter_ns()
+    origin_ns = _MODULE_START_NS if _include_imports else entered_ns
+    origin_wall_ns = _MODULE_WALL_NS if _include_imports else time_ns()
+    origin_label = "main_module_after_time_import" if _include_imports else "main_call"
     project_dir = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="Select and bring a real window forward, then select a control and optionally click it.")
     parser.add_argument("request", nargs="?", help="Original user request, passed unchanged to every Jev call")
@@ -50,45 +63,76 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("typesafe_sdk").setLevel(logging.WARNING)
     report = None
     try:
-        report = RunReport(project_dir / "reports")
+        report_initialization_ns = perf_counter_ns()
+        report = RunReport(
+            project_dir / "reports", origin_ns=origin_ns,
+            origin_wall_ns=origin_wall_ns, origin_label=origin_label,
+        )
+        report_ready_ns = perf_counter_ns()
+        report.append(
+            "timing_origin", _at_ns=origin_ns, origin=origin_label,
+            clock="perf_counter_ns", wall_clock="UTC anchor projected with monotonic elapsed time",
+            excludes="process/interpreter launch and imports before the origin",
+        )
+        if _include_imports:
+            report.record_interval("startup.imports", _MODULE_START_NS, _IMPORT_FINISHED_NS)
+        report.record_interval("startup.cli", entered_ns, report_initialization_ns)
+        report.record_interval("startup.report_initialization", report_initialization_ns, report_ready_ns)
         print(f"Run report: {report.path}", file=sys.stderr)
-        original_request = (
-            args.request_file.read_bytes().decode("utf-8")
-            if args.request_file is not None else args.request
-        )
+        with report.span("initialization.request_read"):
+            original_request = (
+                args.request_file.read_bytes().decode("utf-8")
+                if args.request_file is not None else args.request
+            )
         report.append("run_started", request=original_request, execute_click=args.click)
-        if not original_request.strip():
-            raise ValueError("The original request must be nonempty.")
-        config = tomllib.loads((project_dir / "pyproject.toml").read_text(encoding="utf-8"))
-        model = config["tool"]["ctrlloop"]["jev-model"]
-        if model != PINNED_MODEL:
-            raise ValueError(f"pyproject.toml must retain the experiment's {PINNED_MODEL} pin.")
-        load_dotenv(args.env_file, override=False, interpolate=False)
-        api_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
-        if not api_key:
-            raise ValueError("TYPESAFE_API_KEY is missing; set it in the environment or --env-file.")
-        budget = RequestBudget(args.max_request_bytes, args.max_question_bytes)
-        driver = CuaDriver(
-            executable=args.driver, max_elements=args.max_elements, max_depth=args.max_depth
-        )
+        with report.span("initialization.configuration"):
+            if not original_request.strip():
+                raise ValueError("The original request must be nonempty.")
+            config = tomllib.loads((project_dir / "pyproject.toml").read_text(encoding="utf-8"))
+            model = config["tool"]["ctrlloop"]["jev-model"]
+            if model != PINNED_MODEL:
+                raise ValueError(f"pyproject.toml must retain the experiment's {PINNED_MODEL} pin.")
+            load_dotenv(args.env_file, override=False, interpolate=False)
+            api_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+            if not api_key:
+                raise ValueError("TYPESAFE_API_KEY is missing; set it in the environment or --env-file.")
+            budget = RequestBudget(args.max_request_bytes, args.max_question_bytes)
+        with report.span("initialization.driver"):
+            driver = CuaDriver(
+                executable=args.driver, max_elements=args.max_elements, max_depth=args.max_depth
+            )
+        http_initialization_ns = perf_counter_ns()
         with httpx2.Client(timeout=30.0, event_hooks={
             "request": [report.on_request], "response": [report.on_response],
         }) as http_client:
+            report.record_interval("initialization.http_client", http_initialization_ns, perf_counter_ns())
+            sdk_initialization_ns = perf_counter_ns()
             with TypeSafeClient(
                 api_key=api_key, base_url="https://api.typesafe.ai", model=model,
                 timeout=30.0, retry=RetryPolicy(max_retries=0), http_client=http_client,
             ) as client:
-                result = run_pipeline(
-                    original_request, driver, ChoiceSelector(client, model=model, budget=budget),
-                    report=report, execute_click=args.click,
-                )
+                report.record_interval("initialization.typesafe_client", sdk_initialization_ns, perf_counter_ns())
+                with report.span("initialization.selector"):
+                    selector = ChoiceSelector(client, model=model, budget=budget)
+                with report.span("pipeline"):
+                    result = run_pipeline(
+                        original_request, driver, selector,
+                        report=report, execute_click=args.click,
+                    )
+                cleanup_started_ns = perf_counter_ns()
+        report.record_interval("client_cleanup", cleanup_started_ns, perf_counter_ns())
+        # Prepare stdout before the final boundary so its cost is in the total.
+        output_started_ns = perf_counter_ns()
+        output_json = json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
+        output_finished_ns = perf_counter_ns()
+        report.record_interval("result_serialization", output_started_ns, output_finished_ns)
         try:
             report.append("run_finished", result=result.to_dict())
         except (OSError, ValueError):
             if result.status != "action_returned":
                 raise
             print("Could not save the completed run report; returning the native action result.", file=sys.stderr)
-        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        print(output_json)
         return 0 if result.status in {"selected", "action_returned"} else 2
     except (DriverError, SelectionError, ValueError, OSError, TypeSafeError, KeyError) as error:
         # Raw SDK/OS messages may contain file content, request bodies, or credentials.
@@ -125,4 +169,4 @@ def _report_failure(report: RunReport | None, event: str, **details) -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(_include_imports=True))

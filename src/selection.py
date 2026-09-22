@@ -1,13 +1,17 @@
 """Deterministic groups-of-ten Choice elimination for windows and controls."""
 
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 import json
 import logging
 import math
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from typesafe_sdk import Choice, TypeSafeError
+
+if TYPE_CHECKING:
+    from src.reporting import RunReport
 
 
 PINNED_MODEL = "jev-1.13.0"
@@ -102,11 +106,16 @@ class ChoiceSelector:
             batches.append(batch)
         return batches
 
-    def _judge(self, state: str, questions: dict[str, Choice]) -> tuple[dict[str, str], dict]:
+    def _judge(
+        self, state: str, questions: dict[str, Choice], *, report: "RunReport | None" = None,
+    ) -> tuple[dict[str, str], dict]:
         try:
-            response = self.client.system_one(
-                state=state, questions=questions, model=self.model
-            )
+            # This interval includes SDK encoding/decoding and any HTTP attempts.
+            # The report's HTTP hooks expose the narrower observed wire interval.
+            with report.span("selection.sdk_call") if report else nullcontext({}) as sdk_timing:
+                response = self.client.system_one(
+                    state=state, questions=questions, model=self.model
+                )
         except TypeSafeError as error:
             # No request bodies, UI content, credentials, or raw HTTP responses in errors.
             status = getattr(error, "status", None)
@@ -115,6 +124,18 @@ class ChoiceSelector:
                 f"TypeSafe request failed: {type(error).__name__} (HTTP {safe_status})."
             ) from None
 
+        with report.span("selection.response_validation") if report else nullcontext({}) as validation_timing:
+            choices, trace = self._validate_response(state, questions, response)
+        if report:
+            trace.update(
+                sdk_span_id=sdk_timing["span_id"],
+                response_validation_span_id=validation_timing["span_id"],
+            )
+        return choices, trace
+
+    def _validate_response(
+        self, state: str, questions: dict[str, Choice], response: Any
+    ) -> tuple[dict[str, str], dict]:
         returned_model = getattr(response, "model", None)
         logger.info("Jev requested_model=%s response_model=%r", self.model, returned_model)
         if returned_model != self.model:
@@ -171,52 +192,87 @@ class ChoiceSelector:
         }
 
     def select(
-        self, original_request: str, candidates: Sequence[Candidate], *, stage: str
+        self, original_request: str, candidates: Sequence[Candidate], *, stage: str,
+        report: "RunReport | None" = None,
     ) -> Selection:
-        if not isinstance(original_request, str) or not original_request.strip():
-            raise ValueError("The original request must be a nonempty string.")
-        current = list(candidates)
-        if any(not isinstance(candidate.key, str) or not candidate.key for candidate in current):
-            raise ValueError("Candidate keys must be nonempty strings.")
-        if len({candidate.key for candidate in current}) != len(current):
-            raise ValueError("Candidate keys must be unique within a selection.")
-        rounds: list[dict[str, Any]] = []
-        while len(current) > 1:
-            groups = [current[start : start + GROUP_SIZE] for start in range(0, len(current), GROUP_SIZE)]
-            questions = {}
-            group_keys = []
-            for group_index, group in enumerate(groups):
-                key = f"{stage}_r{len(rounds) + 1}_g{group_index}"
-                group_keys.append(key)
-                if len(group) > 1:
-                    questions[key] = Choice(
-                        instructions=QUESTION,
-                        criteria={candidate.key: candidate.description for candidate in group},
-                    )
-            # Finish every independent batch in this round before constructing the next.
-            chosen: dict[str, str] = {}
-            batches = []
-            for batch in self._pack(original_request, questions):
-                answers, trace = self._judge(original_request, batch)
-                chosen.update(answers)
-                batches.append(trace)
-            winners = []
-            group_traces = []
-            for key, group in zip(group_keys, groups, strict=True):
-                winner_key = group[0].key if len(group) == 1 else chosen[key]
-                winner = next(candidate for candidate in group if candidate.key == winner_key)
-                winners.append(winner)
-                group_traces.append({
-                    "question_key": key if len(group) > 1 else None,
-                    "options": [candidate.key for candidate in group],
-                    "winner": winner.key,
-                    "forwarded": len(group) == 1,
-                })
-            rounds.append({
-                "candidate_count": len(current),
-                "winner_count": len(winners),
-                "groups": group_traces,
-                "batches": batches,
-            })
-            current = winners
-        return Selection(winner=current[0] if current else None, rounds=rounds)
+        with report.span("selection", stage=stage) if report else nullcontext({}):
+            with report.span("selection.validation") if report else nullcontext({}):
+                if not isinstance(original_request, str) or not original_request.strip():
+                    raise ValueError("The original request must be a nonempty string.")
+                current = list(candidates)
+                if any(not isinstance(candidate.key, str) or not candidate.key for candidate in current):
+                    raise ValueError("Candidate keys must be nonempty strings.")
+                if len({candidate.key for candidate in current}) != len(current):
+                    raise ValueError("Candidate keys must be unique within a selection.")
+            rounds: list[dict[str, Any]] = []
+            while len(current) > 1:
+                round_number = len(rounds) + 1
+                round_id = f"{stage}_r{round_number}"
+                with report.span(
+                    "selection.round", round=round_number, round_id=round_id,
+                    candidate_count=len(current),
+                ) if report else nullcontext({}) as round_timing:
+                    with report.span("selection.grouping") if report else nullcontext({}) as grouping_timing:
+                        groups = [current[start : start + GROUP_SIZE] for start in range(0, len(current), GROUP_SIZE)]
+                        questions = {}
+                        group_keys = []
+                        for group_index, group in enumerate(groups):
+                            key = f"{round_id}_g{group_index}"
+                            group_keys.append(key)
+                            if len(group) > 1:
+                                questions[key] = Choice(
+                                    instructions=QUESTION,
+                                    criteria={candidate.key: candidate.description for candidate in group},
+                                )
+                    with report.span("selection.packing") if report else nullcontext({}) as packing_timing:
+                        packed = self._pack(original_request, questions)
+                        question_batches = {
+                            key: f"{round_id}_b{batch_index}"
+                            for batch_index, batch in enumerate(packed) for key in batch
+                        }
+                    # Finish every independent batch in this round before constructing the next.
+                    chosen: dict[str, str] = {}
+                    batches = []
+                    for batch_index, batch in enumerate(packed):
+                        batch_id = f"{round_id}_b{batch_index}"
+                        with report.span(
+                            "selection.batch", batch_id=batch_id, question_keys=list(batch),
+                        ) if report else nullcontext({}) as batch_timing:
+                            answers, trace = self._judge(original_request, batch, report=report)
+                            chosen.update(answers)
+                            trace["batch_id"] = batch_id
+                            if report:
+                                trace["span_id"] = batch_timing["span_id"]
+                            batches.append(trace)
+                    with report.span("selection.advancement") if report else nullcontext({}) as advancement_timing:
+                        winners = []
+                        group_traces = []
+                        for key, group in zip(group_keys, groups, strict=True):
+                            winner_key = group[0].key if len(group) == 1 else chosen[key]
+                            winner = next(candidate for candidate in group if candidate.key == winner_key)
+                            winners.append(winner)
+                            group_traces.append({
+                                "question_key": key if len(group) > 1 else None,
+                                "options": [candidate.key for candidate in group],
+                                "winner": winner.key,
+                                "forwarded": len(group) == 1,
+                                "batch_id": question_batches.get(key),
+                            })
+                        round_trace = {
+                            "candidate_count": len(current),
+                            "winner_count": len(winners),
+                            "groups": group_traces,
+                            "batches": batches,
+                            "round": round_number,
+                            "round_id": round_id,
+                        }
+                        current = winners
+                    if report:
+                        round_trace.update(
+                            span_id=round_timing["span_id"],
+                            grouping_span_id=grouping_timing["span_id"],
+                            packing_span_id=packing_timing["span_id"],
+                            advancement_span_id=advancement_timing["span_id"],
+                        )
+                    rounds.append(round_trace)
+            return Selection(winner=current[0] if current else None, rounds=rounds)

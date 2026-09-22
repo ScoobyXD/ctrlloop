@@ -1,6 +1,7 @@
 """Select windows and controls, optionally dispatching one native click."""
 
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 import logging
 from typing import Any, Protocol
@@ -112,12 +113,20 @@ def run_pipeline(
     window is brought forward before obtaining the control snapshot, including
     runs without a click. No post-click read, retry or extra Jev stage runs here.
     """
-    windows = driver.list_windows()
+    with (
+        report.span("window_discovery", stage="windows", tool="list_windows")
+        if report is not None else nullcontext({})
+    ):
+        windows = driver.list_windows()
     if report is not None:
         report.append("windows_discovered", windows=windows)
-    window_selection = selector.select(
-        original_request, window_candidates(windows, synthetic=synthetic), stage="windows"
-    )
+    with report.span("candidate_preparation", stage="windows") if report is not None else nullcontext({}):
+        candidates = window_candidates(windows, synthetic=synthetic)
+    with report.span("window_selection", stage="windows") if report is not None else nullcontext({}):
+        window_selection = selector.select(
+            original_request, candidates, stage="windows",
+            **({"report": report} if report is not None else {}),
+        )
     result = PipelineResult(status="no_windows", selections={"windows": window_selection.rounds})
     if window_selection.winner is None:
         result.reason = "Window discovery returned no candidates."
@@ -125,18 +134,27 @@ def run_pipeline(
     result.window = window_selection.winner.record
     if report is not None:
         report.append("window_selected", window=result.window, selections=window_selection.rounds)
-    controls = synthetic.controls_for(window_selection.winner.key)
+    with report.span("synthetic_resolution", stage="controls") if report is not None else nullcontext({}):
+        controls = synthetic.controls_for(window_selection.winner.key)
     if controls is not None:
         result.observation = {
             "source": "synthetic",
             "coverage": "application-defined controls; no live control snapshot was taken",
         }
     else:
-        arguments = {name: result.window.get(name) for name in ("pid", "window_id")}
-        if report is not None:
-            report.append("action_requested", tool="bring_to_front", arguments=arguments)
+        with (
+            report.span("foreground_preparation", tool="bring_to_front")
+            if report is not None else nullcontext({})
+        ):
+            arguments = {name: result.window.get(name) for name in ("pid", "window_id")}
+            if report is not None:
+                report.append("action_requested", tool="bring_to_front", arguments=arguments)
         try:
-            foreground_result = driver.bring_to_front(arguments)
+            with (
+                report.span("foreground_activation", tool="bring_to_front", completion_scope="call_return")
+                if report is not None else nullcontext({})
+            ):
+                foreground_result = driver.bring_to_front(arguments)
         except DriverError as error:
             error.context.update({"stage": "bring_to_front", "selection": result.to_dict()})
             raise
@@ -152,7 +170,11 @@ def run_pipeline(
                                      action_result=foreground_result)
                 raise error from None
         try:
-            snapshot = driver.get_window_state(result.window)
+            with (
+                report.span("control_acquisition", stage="controls", tool="get_window_state")
+                if report is not None else nullcontext({})
+            ):
+                snapshot = driver.get_window_state(result.window)
         except DriverError as error:
             error.context.update({
                 "stage": "get_window_state",
@@ -167,20 +189,21 @@ def run_pipeline(
                 "selections": result.selections,
             })
             raise
-        result.snapshot_id = snapshot.get("snapshot_id")
-        result.observation = {
-            name: snapshot[name]
-            for name in (
-                "elements_complete", "degraded", "degraded_reason", "truncated",
-                "truncation_reason", "element_count", "total_element_count",
-                "returned_element_count", "filtered_element_count",
-            )
-            if name in snapshot
-        }
-        result.observation["coverage"] = "bounded observation; full UI coverage is not established"
-        elements = snapshot.get("elements")
-        if elements is not None:
-            result.observation["observed_control_count"] = len(elements)
+        with report.span("observation_processing", stage="controls") if report is not None else nullcontext({}):
+            result.snapshot_id = snapshot.get("snapshot_id")
+            result.observation = {
+                name: snapshot[name]
+                for name in (
+                    "elements_complete", "degraded", "degraded_reason", "truncated",
+                    "truncation_reason", "element_count", "total_element_count",
+                    "returned_element_count", "filtered_element_count",
+                )
+                if name in snapshot
+            }
+            result.observation["coverage"] = "bounded observation; full UI coverage is not established"
+            elements = snapshot.get("elements")
+            if elements is not None:
+                result.observation["observed_control_count"] = len(elements)
         if report is not None:
             report.append(
                 "window_observed", window=result.window, snapshot_id=result.snapshot_id,
@@ -198,43 +221,59 @@ def run_pipeline(
             result.status = "observation_unavailable"
             result.reason = "The control observation has no snapshot identity."
             return result
-        controls = control_candidates(elements)
-    control_selection = selector.select(original_request, controls, stage="controls")
+        with report.span("candidate_preparation", stage="controls") if report is not None else nullcontext({}):
+            controls = control_candidates(elements)
+    with report.span("control_selection", stage="controls") if report is not None else nullcontext({}):
+        control_selection = selector.select(
+            original_request, controls, stage="controls",
+            **({"report": report} if report is not None else {}),
+        )
     result.selections["controls"] = control_selection.rounds
     if control_selection.winner is None:
         result.status = "no_controls"
         result.reason = "The selected synthetic window defines no controls."
         return result
-    result.control = control_selection.winner.record
-    if report is not None:
-        report.append("control_selected", control=result.control, selections=control_selection.rounds)
-    result.status = "selected"
-    if execute_click:
-        if result.window.get("synthetic") or result.control.get("synthetic"):
-            result.status = "no_action"
-            result.reason = "Synthetic targets have no live CUA click target; Start Menu search and typing are unsupported."
-            if report is not None:
-                report.append("action_skipped", reason=result.reason)
-            return result
-        arguments = {name: result.window.get(name) for name in ("pid", "window_id")}
-        token = result.control.get("element_token")
-        if isinstance(token, str) and token.strip():
-            arguments["element_token"] = token
-        else:
-            arguments.update(element_index=result.control.get("element_index"), snapshot_id=result.snapshot_id)
+    # Include selection reporting and argument handoff in dispatch latency;
+    # only native_action measures the click invocation through its return.
+    with (
+        report.span("action_dispatch", tool="click")
+        if report is not None and execute_click else nullcontext({})
+    ):
+        result.control = control_selection.winner.record
         if report is not None:
-            report.append("action_requested", tool="click", arguments=arguments)
-        try:
-            result.action_result = driver.click(arguments)
-        except DriverError as error:
-            error.context.update(stage="click", selection=result.to_dict())
-            raise
-        result.status = "action_returned"
-        if report is not None:
+            report.append("control_selected", control=result.control, selections=control_selection.rounds)
+        result.status = "selected"
+        if execute_click:
+            with report.span("action_preparation", tool="click") if report is not None else nullcontext({}):
+                if result.window.get("synthetic") or result.control.get("synthetic"):
+                    result.status = "no_action"
+                    result.reason = "Synthetic targets have no live CUA click target; Start Menu search and typing are unsupported."
+                    if report is not None:
+                        report.append("action_skipped", reason=result.reason)
+                    return result
+                arguments = {name: result.window.get(name) for name in ("pid", "window_id")}
+                token = result.control.get("element_token")
+                if isinstance(token, str) and token.strip():
+                    arguments["element_token"] = token
+                else:
+                    arguments.update(element_index=result.control.get("element_index"), snapshot_id=result.snapshot_id)
+                if report is not None:
+                    report.append("action_requested", tool="click", arguments=arguments)
             try:
-                report.append("action_returned", tool="click", action_result=result.action_result)
-            except (OSError, ValueError):
-                # The click has already happened. Return its facts even when
-                # the report sink fails, so callers do not retry blindly.
-                logging.getLogger(__name__).warning("Could not save the action result to the run report; returning it directly.")
+                with (
+                    report.span("native_action", tool="click", completion_scope="call_return")
+                    if report is not None else nullcontext({})
+                ):
+                    result.action_result = driver.click(arguments)
+            except DriverError as error:
+                error.context.update(stage="click", selection=result.to_dict())
+                raise
+            result.status = "action_returned"
+            if report is not None:
+                try:
+                    report.append("action_returned", tool="click", action_result=result.action_result)
+                except (OSError, ValueError):
+                    # The click has already happened. Return its facts even when
+                    # the report sink fails, so callers do not retry blindly.
+                    logging.getLogger(__name__).warning("Could not save the action result to the run report; returning it directly.")
     return result

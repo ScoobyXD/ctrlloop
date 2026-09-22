@@ -179,9 +179,10 @@ A timeout or unreadable response leaves delivery unknown and is never retried.
 
 ## Debug in VS Code
 
-Every CLI run automatically creates a unique `reports/run-*.json` file in this
-project and prints its full path to stderr. The same behavior applies in VS Code;
-no additional launch arguments are needed. The file is an indented JSON array of
+The CLI automatically creates a unique `reports/run-*.json` file in this project
+once reporting initialization succeeds and prints its full path to stderr. The
+same behavior applies in VS Code; no additional launch arguments are needed. The
+file is an indented JSON array of
 events with a UTC timestamp and event name. Nested objects and arrays expand onto
 separate lines. Open or export the file while the run is still in progress. The
 folder is ignored by Git.
@@ -210,6 +211,13 @@ Reports contain these milestones:
   action facts when click execution is enabled. A synthetic selection instead
   records `action_skipped` with its reason. A click failure ends with `run_error`.
 - `run_finished`, `run_error`, or `run_interrupted`: the result or failure reached.
+
+The same event array includes monotonic elapsed timings for startup, discovery,
+candidate preparation, selection rounds/batches, foreground activation, UIA reads,
+and optional action preparation/invocation. See [reading run timings](docs/timing.md)
+for event correlation, bottleneck inspection, and measurement limits. Jev questions
+in one batch share one observed request interval; native action return latency does
+not establish a visible UI change or completion of the original request.
 
 Every new entry is saved immediately: the updated document is written to a
 temporary file, flushed and synced, then atomically replaces the previous report.
