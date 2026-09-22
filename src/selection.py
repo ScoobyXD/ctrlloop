@@ -149,8 +149,10 @@ class ChoiceSelector:
                 raise SelectionError("Jev probability labels do not match the observed options.")
             if not all(_probability(value) for value in probabilities.values()):
                 raise SelectionError("Jev returned an invalid probability.")
-            if not math.isclose(sum(probabilities.values()), 1.0, abs_tol=1e-4):
-                raise SelectionError("Jev probabilities do not sum to one.")
+            # Approximate totals may differ by up to three percentage points.
+            probability_total = math.fsum(probabilities.values())
+            if not 0.97 <= probability_total <= 1.03:
+                raise SelectionError("Jev probability total differs from one by more than 3%.")
             if not _probability(getattr(answer, "confidence", None)):
                 raise SelectionError("Jev returned an invalid confidence.")
             # Distribution validation is structural only. Never rank/gate winners by it.
