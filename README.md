@@ -37,11 +37,12 @@ uv sync --locked
 uv run --locked python src/main.py 'Find the Recycle Bin control on the desktop.'
 ```
 
-The dependencies remain pinned to `typesafe-sdk==0.7.1` and
-`python-dotenv==1.2.3`. The existing `pyproject.toml` pin is `jev-1.13.0`;
+The dependencies remain pinned to `typesafe-sdk==0.7.1`,
+`python-dotenv==1.2.3`, and `httpx2==2.13.0`. The existing `pyproject.toml` pin is `jev-1.13.0`;
 the pipeline requires that exact model and validates every response model.
-Requested and returned model identities are logged to stderr; results are JSON
-on stdout. No credentials, full prompt, or full desktop tree are logged.
+Requested and returned model identities and the run-report path are logged to
+stderr; results are JSON on stdout. Reports include the request and observed
+UI metadata described below. Authentication headers and API keys are not recorded.
 
 CUA Driver 0.28.2 must already be installed with its daemon running on the
 interactive Windows desktop. The adapter finds `cua-driver` on PATH or in its
@@ -62,6 +63,7 @@ The source modules live directly in `src/` and feed into `src/main.py`:
 - `driver.py` discovers windows and reads the selected window's accessibility state.
 - `selection.py` batches Jev Choice questions and advances one winner per group.
 - `pipeline.py` connects window discovery, window selection, the snapshot read, and control selection.
+- `reporting.py` appends durable run events and captures the actual Jev HTTP bodies.
 - `main.py` provides the CLI, loads configuration, and prints the result.
 
 From the repository root, `uv run --locked python -m src.main` also runs the CLI.
@@ -100,6 +102,48 @@ Nonempty degraded observations remain selectable and retain their quality flags.
 was performed or that the chosen control is guaranteed to fulfill it.
 
 ## Debug in VS Code
+
+Every CLI run automatically creates a unique `reports/run-*.json` file in this
+project and prints its full path to stderr. The same behavior applies in VS Code;
+no additional launch arguments are needed. The file is an indented JSON array of
+events with a UTC timestamp and event name. Nested objects and arrays expand onto
+separate lines. Open or export the file while the run is still in progress. The
+folder is ignored by Git.
+
+Reports contain these milestones:
+
+- `run_started`: the original request.
+- `windows_discovered`: the complete observed window list, in discovery order;
+  it does not include the synthetic Start Menu option.
+- `jev_request`: the actual JSON body captured by the HTTP client's request hook
+  after SDK serialization and before network access, plus a request ID, URL, method,
+  and byte count. Its `body` contains the exact JSON fields and values sent to Jev,
+  including every batched question and candidate description. JSON whitespace is
+  normalized by the report writer; this is not a dump of Python object internals.
+- `jev_response`: the response body before SDK/selection validation, associated
+  with the same request ID. `body.answers` retains every chosen label, confidence,
+  and complete probability distribution, alongside model and token usage data.
+  Non-JSON responses use `body_text` instead. A response-body read failure records
+  `jev_response_error` with HTTP status and the exception type.
+- `window_selected`, `window_observed`, and `control_selected`: selected identities,
+  completed selection rounds, and observation quality. Singleton selections appear
+  here even though they require no Jev request. The Start Menu and Search selections
+  are marked `synthetic: true` in `window_selected` and `control_selected`. This
+  route records no `window_observed` event because no live snapshot is taken.
+- `run_finished`, `run_error`, or `run_interrupted`: the result or failure reached.
+
+Every new entry is saved immediately: the updated document is written to a
+temporary file, flushed and synced, then atomically replaces the previous report.
+A timeout, driver failure, or invalid Jev response preserves earlier entries.
+An abrupt process kill may leave no terminal event, but the last saved report
+remains valid JSON. Failure to write a report stops the run before
+further work; failure to append a final error entry does not hide the original
+error. Reports intentionally contain user requests and UI titles/values, but no
+HTTP headers or raw exception messages.
+
+The reporter does not filter candidates, alter questions, change grouping, or
+choose winners. It observes the existing pipeline. The JSON returned on stdout
+keeps its existing shape.
 
 Open this repository folder in VS Code and select **ctrlloop: step through main**
 in Run and Debug. Press **F5**, enter the original request, and the debugger pauses

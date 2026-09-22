@@ -33,12 +33,14 @@ name = "ctrlloop"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "httpx2" },
     { name = "python-dotenv" },
     { name = "typesafe-sdk" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx2", specifier = "==2.13.0" },
     { name = "python-dotenv", specifier = "==1.2.3" },
     { name = "typesafe-sdk", specifier = "==0.7.1" },
 ]

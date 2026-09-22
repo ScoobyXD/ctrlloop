@@ -17,6 +17,27 @@ from src.pipeline import (
 from src.selection import ChoiceSelector, PINNED_MODEL, QUESTION
 
 
+class RecordingReport:
+    """Keep appended milestones inspectable without touching the report directory."""
+
+    def __init__(self):
+        self.path = Path("reports") / "test-run.json"
+        self.events = []
+        self.closed = False
+
+    def append(self, event, **data):
+        self.events.append(json.loads(json.dumps({"event": event, **data})))
+
+    def close(self):
+        self.closed = True
+
+    def on_request(self, request):
+        pass
+
+    def on_response(self, response):
+        pass
+
+
 class ChoosingClient:
     """Choose a preferred option or the last one with unhelpful confidence."""
 
@@ -339,23 +360,99 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(descriptions[0]["indexed_ancestors_nearest_first"], [{"role": "pane"}])
         self.assertEqual(descriptions[1]["indexed_ancestors_nearest_first"], [{"role": "group"}])
 
+    def test_report_keeps_discovery_and_selection_when_window_read_fails(self):
+        windows = [make_window(index) for index in range(11)]
+        windows[-1]["unrecognized_metadata"] = {"preserve": "full discovered record"}
+        driver = ObservingDriver(windows, {})
+        report = RecordingReport()
+        error = DriverError("Window read failed.")
+        with patch.object(driver, "get_window_state", side_effect=error):
+            with self.assertRaises(DriverError):
+                run_pipeline("Find Save", driver, ChoiceSelector(ChoosingClient()), report=report)
+
+        self.assertEqual([entry["event"] for entry in report.events], [
+            "windows_discovered", "window_selected",
+        ])
+        self.assertEqual(report.events[0]["windows"], windows)
+        self.assertEqual(report.events[1]["window"], windows[-1])
+        self.assertEqual(report.events[1]["selections"], error.context["selections"]["windows"])
+
+    def test_report_records_successful_observation_and_final_control(self):
+        windows = [make_window(index) for index in range(2)]
+        elements = [make_element(index) for index in range(2)]
+        snapshot = {"snapshot_id": "observed-snapshot", "elements": elements,
+                    "elements_complete": False, "tree_markdown": "UNNEEDED RAW TREE"}
+        report = RecordingReport()
+        result = run_pipeline(
+            "Find Save", ObservingDriver(windows, snapshot), ChoiceSelector(ChoosingClient()),
+            report=report,
+        )
+
+        self.assertEqual([entry["event"] for entry in report.events], [
+            "windows_discovered", "window_selected", "window_observed", "control_selected",
+        ])
+        observed = report.events[2]
+        self.assertEqual(observed["window"], windows[-1])
+        self.assertEqual(observed["snapshot_id"], result.snapshot_id)
+        self.assertEqual(observed["observation"], result.observation)
+        self.assertEqual(report.events[3]["control"], elements[-1])
+        self.assertEqual(report.events[3]["selections"], result.selections["controls"])
+        self.assertNotIn("UNNEEDED RAW TREE", json.dumps(report.events))
+
+    def test_report_distinguishes_empty_discovery_from_synthetic_search_selection(self):
+        report = RecordingReport()
+        result = run_pipeline(
+            "Find Save", ObservingDriver([], {}), ChoiceSelector(ChoosingClient()), report=report,
+        )
+        self.assertEqual(result.status, "selected")
+        self.assertTrue(result.window["synthetic"])
+        self.assertTrue(result.control["synthetic"])
+        self.assertEqual(result.control["label"], "Search")
+        self.assertIsNone(result.snapshot_id)
+        self.assertEqual(result.observation["source"], "synthetic")
+        self.assertNotIn("observed_control_count", result.observation)
+        self.assertEqual(report.events, [
+            {"event": "windows_discovered", "windows": []},
+            {"event": "window_selected", "window": result.window, "selections": []},
+            {"event": "control_selected", "control": result.control, "selections": []},
+        ])
+
+    def test_report_keeps_unavailable_observation_before_early_return(self):
+        report = RecordingReport()
+        window = make_window()
+        result = run_pipeline(
+            "Find Save", ObservingDriver([window], {"snapshot_id": "unavailable"}),
+            ChoiceSelector(ChoosingClient()), report=report,
+        )
+        self.assertEqual(result.status, "observation_unavailable")
+        self.assertEqual([entry["event"] for entry in report.events], [
+            "windows_discovered", "window_selected", "window_observed",
+        ])
+        self.assertEqual(report.events[-1]["observation"], result.observation)
+
 
 class CliTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.cli = importlib.import_module("src.main")
 
-    def invoke(self, arguments, *, result=None, api_key="test-key", error=None):
+    def invoke(self, arguments, *, result=None, api_key="test-key", error=None, report_init_error=None):
         output = io.StringIO()
+        self.stderr = io.StringIO()
+        self.report = RecordingReport()
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.dict("os.environ", {"TYPESAFE_API_KEY": api_key}, clear=True))
             stack.enter_context(patch.object(self.cli, "load_dotenv"))
             client = stack.enter_context(patch.object(self.cli, "TypeSafeClient"))
+            self.http_client = stack.enter_context(patch.object(self.cli.httpx2, "Client"))
+            self.report_factory = stack.enter_context(patch.object(
+                self.cli, "RunReport", return_value=self.report, side_effect=report_init_error,
+            ))
             driver = stack.enter_context(patch.object(self.cli, "CuaDriver"))
             pipeline = stack.enter_context(patch.object(self.cli, "run_pipeline", side_effect=error,
                                                         return_value=result or PipelineResult("selected")))
             stack.enter_context(contextlib.redirect_stdout(output))
-            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(self.stderr))
             status = self.cli.main(arguments)
         return status, json.loads(output.getvalue()), pipeline, client, driver
 
@@ -372,6 +469,32 @@ class CliTests(unittest.TestCase):
         self.assertEqual(client.call_args.kwargs["api_key"], "test-key")
         self.assertEqual(driver.call_args.kwargs["max_elements"], 5000)
         self.assertEqual(driver.call_args.kwargs["max_depth"], 25)
+        self.assertEqual(self.report.events[0], {"event": "run_started", "request": text})
+
+    def test_unreadable_request_file_still_leaves_a_closed_failure_report(self):
+        with patch.object(Path, "read_bytes", side_effect=PermissionError("sensitive-file-path")):
+            status, output, pipeline, client, driver = self.invoke(["--request-file", "request.txt"])
+        self.assertEqual(status, 1)
+        self.assertEqual(self.report.events, [{"event": "run_error", **output}])
+        self.assertNotIn("sensitive-file-path", json.dumps(self.report.events))
+        self.assertTrue(self.report.closed)
+        pipeline.assert_not_called()
+        client.assert_not_called()
+        driver.assert_not_called()
+
+    def test_report_constructor_failure_stops_before_driver_or_network_with_safe_error(self):
+        status, output, pipeline, client, driver = self.invoke(
+            ["Find Save"], report_init_error=PermissionError("sensitive-report-directory"),
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(output["status"], "error")
+        self.assertIn("PermissionError", output["error"])
+        self.assertNotIn("sensitive-report-directory", json.dumps(output) + self.stderr.getvalue())
+        self.assertEqual(self.report.events, [])
+        pipeline.assert_not_called()
+        client.assert_not_called()
+        driver.assert_not_called()
+        self.http_client.assert_not_called()
 
     def test_missing_key_returns_json_without_instantiating_clients(self):
         status, output, pipeline, client, driver = self.invoke(["Find Save"], api_key="")
@@ -381,6 +504,9 @@ class CliTests(unittest.TestCase):
         pipeline.assert_not_called()
         client.assert_not_called()
         driver.assert_not_called()
+        self.http_client.assert_not_called()
+        self.assertEqual(self.report.events[-1], {"event": "run_error", **output})
+        self.assertTrue(self.report.closed)
 
     def test_changed_model_pin_fails_before_network_or_driver_calls(self):
         with patch.object(self.cli.tomllib, "loads", return_value={"tool": {"ctrlloop": {"jev-model": "latest"}}}):
@@ -402,6 +528,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output["status"], "error")
         self.assertNotIn("secret-token-and-body", output["error"])
         self.assertIn("OSError", output["error"])
+        self.assertNotIn("secret-token-and-body", json.dumps(self.report.events))
 
     def test_driver_failure_prints_safe_diagnostics_and_completed_window_selection(self):
         error = DriverError(
@@ -421,6 +548,80 @@ class CliTests(unittest.TestCase):
             "selections": {"windows": []},
         })
         pipeline.assert_called_once()
+        self.assertEqual(self.report.events, [
+            {"event": "run_started", "request": "Find Save"},
+            {"event": "run_error", **output},
+        ])
+        self.assertTrue(self.report.closed)
+
+    def test_success_attaches_wire_hooks_and_reports_result_without_changing_stdout(self):
+        result = PipelineResult("selected", window=make_window(), control=make_element())
+        status, output, pipeline, client, _ = self.invoke(["Find Save"], result=result)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(output, result.to_dict())
+        self.assertEqual(self.report.events, [
+            {"event": "run_started", "request": "Find Save"},
+            {"event": "run_finished", "result": result.to_dict()},
+        ])
+        self.assertIs(pipeline.call_args.kwargs["report"], self.report)
+        self.assertEqual(self.http_client.call_args.kwargs["event_hooks"], {
+            "request": [self.report.on_request], "response": [self.report.on_response],
+        })
+        self.assertIs(client.call_args.kwargs["http_client"], self.http_client.return_value.__enter__.return_value)
+        self.assertEqual(self.report_factory.call_args.args[0], Path(self.cli.__file__).resolve().parents[1] / "reports")
+        self.assertIn(str(self.report.path), self.stderr.getvalue())
+        self.assertTrue(self.report.closed)
+
+    def test_interrupt_keeps_terminal_event_and_closes_report_before_propagating(self):
+        for error in (KeyboardInterrupt(), SystemExit(3)):
+            with self.subTest(error_type=type(error).__name__):
+                with self.assertRaises(type(error)) as raised:
+                    self.invoke(["Find Save"], error=error)
+                self.assertIs(raised.exception, error)
+                self.assertEqual(self.report.events, [
+                    {"event": "run_started", "request": "Find Save"},
+                    {"event": "run_interrupted", "error_type": type(error).__name__},
+                ])
+                self.assertTrue(self.report.closed)
+
+    def test_unexpected_error_keeps_its_type_and_closes_report_before_propagating(self):
+        error = RuntimeError("sensitive-unexpected-message")
+        with self.assertRaises(RuntimeError) as raised:
+            self.invoke(["Find Save"], error=error)
+        self.assertIs(raised.exception, error)
+        self.assertEqual(self.report.events[-1]["event"], "run_error")
+        self.assertEqual(self.report.events[-1]["error_type"], "RuntimeError")
+        self.assertNotIn("sensitive-unexpected-message", json.dumps(self.report.events))
+        self.assertTrue(self.report.closed)
+
+    def test_report_append_and_close_failures_do_not_replace_driver_error_or_interrupt(self):
+        append_original = RecordingReport.append
+
+        for original_error in (DriverError("Window read failed."), KeyboardInterrupt()):
+            for append_error in (OSError("sensitive-write-error"), ValueError("closed report")):
+                with self.subTest(original=type(original_error).__name__, append=type(append_error).__name__):
+                    def append_until_failure(report, event, **data):
+                        if event in {"run_error", "run_interrupted"}:
+                            raise append_error
+                        append_original(report, event, **data)
+
+                    with patch.object(RecordingReport, "append", autospec=True, side_effect=append_until_failure):
+                        with patch.object(RecordingReport, "close", side_effect=OSError("sensitive-close-error")) as close:
+                            if isinstance(original_error, DriverError):
+                                status, output, _, _, _ = self.invoke(["Find Save"], error=original_error)
+                                self.assertEqual(status, 1)
+                                self.assertEqual(output["error"], "Window read failed.")
+                            else:
+                                with self.assertRaises(KeyboardInterrupt) as raised:
+                                    self.invoke(["Find Save"], error=original_error)
+                                self.assertIs(raised.exception, original_error)
+                    close.assert_called_once()
+                    self.assertEqual(self.report.events, [{"event": "run_started", "request": "Find Save"}])
+                    self.assertIn("Could not append", self.stderr.getvalue())
+                    self.assertIn("Could not close", self.stderr.getvalue())
+                    self.assertNotIn("sensitive-write-error", self.stderr.getvalue())
+                    self.assertNotIn("sensitive-close-error", self.stderr.getvalue())
 
     def test_blank_request_is_rejected_before_clients(self):
         status, output, pipeline, client, driver = self.invoke([" \r\n "])

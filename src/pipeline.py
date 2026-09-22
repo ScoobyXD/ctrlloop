@@ -6,9 +6,11 @@ from typing import Any, Protocol
 
 if __package__:
     from .driver import DriverError
+    from .reporting import RunReport
     from .selection import Candidate, ChoiceSelector
 else:
     from driver import DriverError
+    from reporting import RunReport
     from selection import Candidate, ChoiceSelector
 
 
@@ -139,7 +141,8 @@ def control_candidates(elements: Sequence[dict[str, Any]]) -> list[Candidate]:
 
 
 def run_pipeline(
-    original_request: str, driver: ReadOnlyDriver, selector: ChoiceSelector
+    original_request: str, driver: ReadOnlyDriver, selector: ChoiceSelector,
+    *, report: RunReport | None = None,
 ) -> PipelineResult:
     """Return an observed or synthetic selection, without executing UI actions.
 
@@ -148,17 +151,23 @@ def run_pipeline(
     must resolve it to a live field before typing supplied text.
     """
     windows = driver.list_windows()
+    if report is not None:
+        report.append("windows_discovered", windows=windows)
     window_selection = selector.select(original_request, window_candidates(windows), stage="windows")
     result = PipelineResult(status="no_windows", selections={"windows": window_selection.rounds})
     if window_selection.winner is None:
         result.reason = "Window discovery returned no candidates."
         return result
     result.window = window_selection.winner.record
+    if report is not None:
+        report.append("window_selected", window=result.window, selections=window_selection.rounds)
     if window_selection.winner.key == START_MENU_KEY:
         control_selection = selector.select(
             original_request, [start_menu_search_candidate()], stage="controls"
         )
         result.control = control_selection.winner.record
+        if report is not None:
+            report.append("control_selected", control=result.control, selections=control_selection.rounds)
         result.selections["controls"] = control_selection.rounds
         result.observation = {
             "source": "synthetic",
@@ -194,11 +203,17 @@ def run_pipeline(
     }
     result.observation["coverage"] = "bounded observation; full UI coverage is not established"
     elements = snapshot.get("elements")
+    if elements is not None:
+        result.observation["observed_control_count"] = len(elements)
+    if report is not None:
+        report.append(
+            "window_observed", window=result.window, snapshot_id=result.snapshot_id,
+            observation=result.observation,
+        )
     if elements is None:
         result.status = "observation_unavailable"
         result.reason = "The window read did not provide a structured control observation."
         return result
-    result.observation["observed_control_count"] = len(elements)
     if not elements:
         result.status = "observation_degraded" if snapshot.get("degraded") else "no_controls"
         result.reason = "The window read returned no indexed controls; this does not prove none exist."
@@ -210,5 +225,7 @@ def run_pipeline(
     control_selection = selector.select(original_request, control_candidates(elements), stage="controls")
     result.selections["controls"] = control_selection.rounds
     result.control = control_selection.winner.record
+    if report is not None:
+        report.append("control_selected", control=result.control, selections=control_selection.rounds)
     result.status = "selected"
     return result

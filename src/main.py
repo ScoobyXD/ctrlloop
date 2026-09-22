@@ -8,17 +8,20 @@ from pathlib import Path
 import sys
 import tomllib
 
+import httpx2
 from dotenv import load_dotenv
 from typesafe_sdk import RetryPolicy, TypeSafeClient, TypeSafeError
 
 if __package__:
     from .driver import CuaDriver, DriverError
     from .pipeline import run_pipeline
+    from .reporting import RunReport
     from .selection import ChoiceSelector, PINNED_MODEL, RequestBudget, SelectionError
 else:
     # Direct script execution puts src on the import path.
     from driver import CuaDriver, DriverError
     from pipeline import run_pipeline
+    from reporting import RunReport
     from selection import ChoiceSelector, PINNED_MODEL, RequestBudget, SelectionError
 
 
@@ -44,11 +47,15 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger(ChoiceSelector.__module__).setLevel(logging.INFO)
     # SDK debug logs can contain UI state; this CLI logs only the model identity.
     logging.getLogger("typesafe_sdk").setLevel(logging.WARNING)
+    report = None
     try:
+        report = RunReport(project_dir / "reports")
+        print(f"Run report: {report.path}", file=sys.stderr)
         original_request = (
             args.request_file.read_bytes().decode("utf-8")
             if args.request_file is not None else args.request
         )
+        report.append("run_started", request=original_request)
         if not original_request.strip():
             raise ValueError("The original request must be nonempty.")
         config = tomllib.loads((project_dir / "pyproject.toml").read_text(encoding="utf-8"))
@@ -63,11 +70,18 @@ def main(argv: list[str] | None = None) -> int:
         driver = CuaDriver(
             executable=args.driver, max_elements=args.max_elements, max_depth=args.max_depth
         )
-        with TypeSafeClient(
-            api_key=api_key, base_url="https://api.typesafe.ai", model=model,
-            timeout=30.0, retry=RetryPolicy(max_retries=0),
-        ) as client:
-            result = run_pipeline(original_request, driver, ChoiceSelector(client, model=model, budget=budget))
+        with httpx2.Client(timeout=30.0, event_hooks={
+            "request": [report.on_request], "response": [report.on_response],
+        }) as http_client:
+            with TypeSafeClient(
+                api_key=api_key, base_url="https://api.typesafe.ai", model=model,
+                timeout=30.0, retry=RetryPolicy(max_retries=0), http_client=http_client,
+            ) as client:
+                result = run_pipeline(
+                    original_request, driver, ChoiceSelector(client, model=model, budget=budget),
+                    report=report,
+                )
+        report.append("run_finished", result=result.to_dict())
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0 if result.status == "selected" else 2
     except (DriverError, SelectionError, ValueError, OSError, TypeSafeError, KeyError) as error:
@@ -77,8 +91,31 @@ def main(argv: list[str] | None = None) -> int:
         else:
             message = f"Pipeline failed: {type(error).__name__}. Check local configuration and connectivity."
         details = error.details() if isinstance(error, DriverError) else {}
-        print(json.dumps({"status": "error", "error": message, **details}, ensure_ascii=False))
+        output = {"status": "error", "error": message, **details}
+        _report_failure(report, "run_error", **output)
+        print(json.dumps(output, ensure_ascii=False))
         return 1
+    except (KeyboardInterrupt, SystemExit) as error:
+        _report_failure(report, "run_interrupted", error_type=type(error).__name__)
+        raise
+    except Exception as error:
+        _report_failure(report, "run_error", error_type=type(error).__name__)
+        raise
+    finally:
+        if report is not None:
+            try:
+                report.close()
+            except OSError:
+                print("Could not close the run report cleanly; inspect its last complete entry.", file=sys.stderr)
+
+
+def _report_failure(report: RunReport | None, event: str, **details) -> None:
+    """A failing report sink must not replace the original pipeline failure."""
+    if report is not None:
+        try:
+            report.append(event, **details)
+        except (OSError, ValueError):
+            print("Could not append the final report entry; earlier entries remain on disk.", file=sys.stderr)
 
 
 if __name__ == "__main__":

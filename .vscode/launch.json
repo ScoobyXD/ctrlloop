@@ -9,17 +9,9 @@
       "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "args": ["${input:originalRequest}"],
-      "stopOnEntry": true,
+      "args": ["I want to open my hermes agent"],
+      "stopOnEntry": false,
       "justMyCode": true
-    }
-  ],
-  "inputs": [
-    {
-      "id": "originalRequest",
-      "type": "promptString",
-      "description": "Original request to select a window and control for",
-      "default": "open my hermes agent"
     }
   ]
 }

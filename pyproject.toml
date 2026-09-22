@@ -2,7 +2,7 @@
 name = "ctrlloop"
 version = "0.0.0"
 requires-python = ">=3.11"
-dependencies = ["typesafe-sdk==0.7.1", "python-dotenv==1.2.3"]
+dependencies = ["typesafe-sdk==0.7.1", "python-dotenv==1.2.3", "httpx2==2.13.0"]
 
 [tool.ctrlloop]
 # SETUP.md passes this preference to uv; it does not restrict compatibility.
