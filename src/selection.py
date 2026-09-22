@@ -2,7 +2,9 @@
 
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, field
+import json
 import logging
 import math
 from typing import Any, TYPE_CHECKING
@@ -15,6 +17,14 @@ if TYPE_CHECKING:
 
 PINNED_MODEL = "jev-1.13.0"
 GROUP_SIZE = 10
+SETTLING_MS = {
+    "<50ms": 50,
+    "100ms": 100,
+    "200ms": 200,
+    "300ms": 300,
+    "400ms": 400,
+    ">500ms": 500,
+}
 QUESTION = (
     "Which of these candidates is best suited to help fulfill the user’s original "
     "request, based on the provided candidate information?"
@@ -37,6 +47,7 @@ class Candidate:
 class Selection:
     winner: Candidate | None
     rounds: list[dict[str, Any]] = field(default_factory=list)
+    settling_ms: int | None = None
 
 
 def _probability(value: Any) -> bool:
@@ -59,9 +70,11 @@ class ChoiceSelector:
         self.client = client
         self.model = model
 
-    def _judge(
-        self, state: str, questions: dict[str, Choice], *, report: "RunReport | None" = None,
+    def judge(
+        self, state: str | dict[str, Any], questions: dict[str, Choice], *,
+        report: "RunReport | None" = None,
     ) -> tuple[dict[str, str], dict]:
+        """Submit one complete batch using the pinned client and shared validation."""
         try:
             # SDK time includes request encoding and response decoding. The
             # report's HTTP timing separately measures the client-observed call.
@@ -87,6 +100,7 @@ class ChoiceSelector:
 
         with report.span("selection.response_validation") if report else nullcontext({}) as validation_timing:
             choices, trace = self._validate_response(questions, response)
+            trace["state"] = deepcopy(state)
         if report:
             trace.update(
                 sdk_span_id=sdk_timing["span_id"],
@@ -146,6 +160,23 @@ class ChoiceSelector:
             raise SelectionError("Jev returned invalid token usage.")
         return choices, {
             "question_keys": list(questions),
+            "questions": {
+                key: {
+                    "type": "choice",
+                    "instructions": deepcopy(question.instructions),
+                    "criteria": deepcopy(question.criteria),
+                }
+                for key, question in questions.items()
+            },
+            "answers": {
+                key: {
+                    "type": "choice",
+                    "choice": answer.choice,
+                    "probabilities": dict(answer.probabilities),
+                    "confidence": answer.confidence,
+                }
+                for key, answer in answers.items()
+            },
             "requested_model": self.model,
             "response_model": returned_model,
             **tokens,
@@ -154,6 +185,7 @@ class ChoiceSelector:
     def select(
         self, original_request: str, candidates: Sequence[Candidate], *, stage: str,
         report: "RunReport | None" = None,
+        settling_context: dict[str, Any] | None = None,
     ) -> Selection:
         with report.span("selection", stage=stage) if report else nullcontext({}):
             with report.span("selection.validation") if report else nullcontext({}):
@@ -165,7 +197,9 @@ class ChoiceSelector:
                 if len({candidate.key for candidate in current}) != len(current):
                     raise ValueError("Candidate keys must be unique within a selection.")
             rounds: list[dict[str, Any]] = []
-            while len(current) > 1:
+            settling_ms = None
+            include_settling = stage == "controls" and settling_context is not None
+            while len(current) > 1 or (current and include_settling and settling_ms is None):
                 round_number = len(rounds) + 1
                 round_id = f"{stage}_r{round_number}"
                 with report.span(
@@ -176,20 +210,56 @@ class ChoiceSelector:
                         groups = [current[start : start + GROUP_SIZE] for start in range(0, len(current), GROUP_SIZE)]
                         questions = {}
                         group_keys = []
+                        final_round = include_settling and len(current) <= GROUP_SIZE
+                        app_context = (
+                            json.dumps(settling_context, ensure_ascii=False, separators=(",", ":"))
+                            if final_round else None
+                        )
                         for group_index, group in enumerate(groups):
+                            # A single executable control still needs timing, but
+                            # its identity is already determined without a Choice.
+                            if len(current) == 1:
+                                group_keys.append(None)
+                                continue
                             key = f"{round_id}_g{group_index}"
                             group_keys.append(key)
                             questions[key] = Choice(
-                                instructions=QUESTION,
+                                instructions=(
+                                    f"{QUESTION} Observed app/browser context: {app_context}."
+                                    if final_round else QUESTION
+                                ),
                                 criteria={candidate.key: candidate.description for candidate in group},
                             )
-                    # Every group's question belongs in this round's single call.
-                    chosen, api_call = self._judge(original_request, questions, report=report)
+                        timing_keys = {}
+                        if final_round:
+                            for candidate_index, candidate in enumerate(current):
+                                key = f"{round_id}_settling_{candidate_index}"
+                                timing_keys[candidate.key] = key
+                                description = json.dumps(
+                                    candidate.description, ensure_ascii=False, separators=(",", ":"),
+                                )
+                                questions[key] = Choice(
+                                    instructions=(
+                                        f"Assume CUA executes a click on candidate {candidate.key} "
+                                        f"described by {description}, independently of which candidate "
+                                        f"wins selection. After CUA finishes delivering this candidate "
+                                        f"action in the observed app/browser {app_context} and its call "
+                                        f"returns, how much additional time should this browser/app "
+                                        f"need for the resulting state to become ready for the next step? "
+                                        f"Estimate additional app settling time, excluding CUA execution "
+                                        f"duration. The >500ms answer schedules a first observation at "
+                                        f"500ms; it does not assert that the app has finished."
+                                    ),
+                                    criteria={label: None for label in SETTLING_MS},
+                                )
+                    # All group questions and conditional finalist timings share
+                    # this single request; no timing depends on its selection answer.
+                    chosen, api_call = self.judge(original_request, questions, report=report)
                     with report.span("selection.advancement") if report else nullcontext({}) as advancement_timing:
                         winners = []
                         group_traces = []
                         for key, group in zip(group_keys, groups, strict=True):
-                            winner_key = chosen[key]
+                            winner_key = chosen[key] if key is not None else group[0].key
                             winner = next(candidate for candidate in group if candidate.key == winner_key)
                             winners.append(winner)
                             group_traces.append({
@@ -206,6 +276,16 @@ class ChoiceSelector:
                             "round": round_number,
                             "round_id": round_id,
                         }
+                        if final_round:
+                            round_trace["settling"] = {
+                                candidate.key: {
+                                    "question_key": timing_keys[candidate.key],
+                                    "choice": chosen[timing_keys[candidate.key]],
+                                    "milliseconds": SETTLING_MS[chosen[timing_keys[candidate.key]]],
+                                }
+                                for candidate in current
+                            }
+                            settling_ms = round_trace["settling"][winners[0].key]["milliseconds"]
                         current = winners
                     if report:
                         round_trace.update(
@@ -214,4 +294,6 @@ class ChoiceSelector:
                             advancement_span_id=advancement_timing["span_id"],
                         )
                     rounds.append(round_trace)
-            return Selection(winner=current[0] if current else None, rounds=rounds)
+            return Selection(
+                winner=current[0] if current else None, rounds=rounds, settling_ms=settling_ms,
+            )

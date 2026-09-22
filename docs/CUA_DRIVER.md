@@ -93,27 +93,30 @@ These explicit limits bound the initial walk; they do not promise a complete tre
 
 The CLI's successful result has `elements` and `tree_markdown` **at the top level**. A real CLI tool failure may print plain text and still return exit code zero; inspect the output as described in the versioned reference. Do not treat an empty tree as proof that an app has no controls.
 
-## Select and execute one click
+## Run the control loop
 
 From the ctrlloop repository, with its dependencies and `TYPESAFE_API_KEY` configured:
 
 ```powershell
-uv run --locked python src/main.py --click 'Click the Test button in my test window.'
+uv run --locked python src/main.py 'Click the Test button in my test window.'
 ```
 
-Omit `--click` to select a control without clicking it. Every selected real
-window is always brought forward using native `bring_to_front({pid, window_id})`
+Every run executes the loop. Each selected real window is brought forward using
+native `bring_to_front({pid, window_id})`
 before the control snapshot is captured. A refusal stops execution; the report
 records the activation request and native result as action events. This also
-applies to runs without `--click` and windows that are not minimized.
-With `--click`, the pipeline dispatches the
+applies to windows that are not minimized.
+The pipeline dispatches the
 selected record's `pid`, `window_id`, and `element_token` (or the matching index
-and snapshot pair), returns the native `action_result`, and stops. It does not
-take a post-click snapshot or retry. Synthetic Start Menu/Search selections
+and snapshot pair), records the native `action_result`, waits the selected
+settling interval, and captures fresh state. Jev then judges completion and the
+next step. The loop has no iteration cap and does not retry a failed action.
+Synthetic Start Menu/Search selections
 return `no_action`; opening Start and typing are deferred.
 
-`action_returned`/exit 0 means the driver returned action facts, including an
-`unverifiable` or `suspected_noop` effect. It does not prove the application goal.
+The `action_returned` event records driver facts, including an `unverifiable` or
+`suspected_noop` effect. It does not prove the application goal; the loop observes
+again to judge that. `completed`/exit 0 means Jev judged completion from observed state.
 Native failures retain their diagnostic payload and return `error`/exit 1.
 See [full CLI status and report details](../README.md#run).
 

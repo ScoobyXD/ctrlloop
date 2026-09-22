@@ -2,6 +2,13 @@
 
 Research date: 2026-09-21, America/Los_Angeles.
 
+Historical proposal: the baseline and recommendations below describe the
+implementation inspected on that date. A basic click/observe loop has since been
+implemented; [main workflow](../main-workflow.md) is the current behavior and
+explicitly lists the advanced work still deferred. Every run now loops without
+an iteration cap, superseding this proposal's suggested run limits. This research did not itself
+change runtime code.
+
 Recommendation: extend the existing CUA adapter with its native text tools, then extend the existing pipeline into a bounded action/observation loop. Retain the current window when appropriate, rediscover windows after actions, and rerun window selection when evidence warrants switching. Keep full window reselection available as a comparison policy. Continue pinning `jev-1.13.0` and CUA Driver 0.28.2 while evaluating this change.
 
 This is a research proposal. Tool contracts and implementation were inspected; no typing, messaging, live Jev experiment, or application-control test was performed for this research. Runtime code is unchanged.

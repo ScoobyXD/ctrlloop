@@ -222,7 +222,7 @@ For CLI consumption: retain exit code, stdout, and stderr separately; treat a no
 
 For MCP consumption: handle JSON-RPC errors first; then check `result.isError`, structured refusals, the expected success shape, and observation-quality fields. This preserves error structure better than parsing CLI text. The saved MCP examples show the actual envelopes; schemas alone do not specify the outer JSON-RPC framing.
 
-## 7. Single-click contract
+## 7. Click execution contract
 
 ctrlloop brings every selected real window forward with native
 `bring_to_front({pid, window_id})` before taking the control snapshot. Activation
@@ -230,8 +230,8 @@ must confirm the exact target; refusals stop the run and preserve native facts.
 The result contract is defined by the versioned
 [Windows implementation](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs#L9191-L9218).
 
-The `--click` option adds one `cua-driver call click` after the existing
-selection. The input is `{pid, window_id, element_token}` copied from the selected
+Each control selection is followed by one `cua-driver call click`. The input is
+`{pid, window_id, element_token}` copied from the selected
 native records. If no token is present, it uses `{pid, window_id, element_index,
 snapshot_id}` from that same observation. Bare indices and guessed identifiers
 are not valid targets. Windows 0.28.2 has no `action: "press"` argument; omitting
@@ -265,12 +265,14 @@ hint is not an automatic retry. A plain-text failure may still have CLI exit 0.
 The adapter handles actions separately from read-result validation and preserves
 parsed native failures in `DriverError.context["action_result"]`.
 
-The pipeline returns `action_returned` with the native `action_result` on a
+The pipeline records `action_returned` with the native `action_result` on a
 non-refused result, including `unverifiable` and `suspected_noop`. This reports
 driver facts, not completion of the original request. Native errors return CLI
 status `error` with `stage: "click"` and the completed selection. A synthetic
-target returns `no_action`. There is no post-action read, loop, extra Jev planner,
-typing, coordinate fallback, or foreground escalation.
+target returns `no_action`. The loop reuses this native action contract and waits after CUA returns,
+then observes again and asks Jev about progress. See the authoritative
+[main workflow](../../main-workflow.md). The loop does not add typing, coordinate
+fallback, or automatic foreground escalation for a refused click.
 
 The [native cache](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/cua-driver-core/src/element_cache.rs)
 is scoped to the daemon/runtime, with snapshots indexed by PID and snapshot ID.

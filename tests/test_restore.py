@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from src.driver import CuaDriver, DriverError
-from src.pipeline import run_pipeline
+from pipeline_fixtures import select_once
 from src.selection import ChoiceSelector
 from test_driver import FakeRunner, window, state, element, foreground_result
 from test_pipeline import ChoosingClient, RecordingReport
@@ -27,8 +27,8 @@ class RestoreTests(unittest.TestCase):
             state(elements=[element(element_token="after-restore")]), ACTION_RESULT,
         )
         report = RecordingReport()
-        result = run_pipeline("open slack", CuaDriver(executable="fake", runner=runner),
-                              ChoiceSelector(ChoosingClient()), execute_click=True, report=report)
+        result = select_once("open slack", CuaDriver(executable="fake", runner=runner),
+                              ChoiceSelector(ChoosingClient()), deliver_click=True, report=report)
         self.assertEqual([call[0][-1] for call in runner.calls],
                          ["list_windows", "bring_to_front", "get_window_state", "click"])
         self.assertEqual(json.loads(runner.calls[1][1]["input"]),
@@ -39,24 +39,24 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(returned[0]["tool"], "bring_to_front")
         self.assertEqual(returned[0]["action_result"], RESTORED)
 
-    def test_selection_only_still_brings_minimized_window_forward(self):
+    def test_observation_stage_brings_minimized_window_forward(self):
         runner = FakeRunner({"windows": [window(minimized=True)]}, RESTORED, state())
-        run_pipeline("open slack", CuaDriver(executable="fake", runner=runner),
+        select_once("open slack", CuaDriver(executable="fake", runner=runner),
                      ChoiceSelector(ChoosingClient()))
         self.assertEqual([c[0][-1] for c in runner.calls], ["list_windows", "bring_to_front", "get_window_state"])
 
-    def test_every_window_state_is_brought_forward_with_or_without_click(self):
-        for execute_click in (False, True):
+    def test_every_window_state_is_brought_forward_before_later_stages(self):
+        for deliver_click in (False, True):
             for metadata in ({}, {"minimized": False}, {"minimized": None}, {"minimized": True}):
-                with self.subTest(execute_click=execute_click, metadata=metadata):
+                with self.subTest(deliver_click=deliver_click, metadata=metadata):
                     selected = window(**metadata)
                     runner = FakeRunner({"windows": [selected]}, foreground_result(selected),
                                         state(elements=[element(element_token="fresh")]), ACTION_RESULT)
-                    run_pipeline("open slack", CuaDriver(executable="fake", runner=runner),
-                                 ChoiceSelector(ChoosingClient()), execute_click=execute_click)
+                    select_once("open slack", CuaDriver(executable="fake", runner=runner),
+                                 ChoiceSelector(ChoosingClient()), deliver_click=deliver_click)
                     self.assertEqual([c[0][-1] for c in runner.calls],
                                      ["list_windows", "bring_to_front", "get_window_state"]
-                                     + (["click"] if execute_click else []))
+                                     + (["click"] if deliver_click else []))
 
     def test_only_final_window_winner_is_activated_before_control_questions(self):
         windows = [window(window_id=123456 + i) for i in range(12)]
@@ -79,7 +79,7 @@ class RestoreTests(unittest.TestCase):
 
         driver._runner = native_call
         with patch.object(client, "system_one", side_effect=question_call):
-            run_pipeline("open slack", driver, ChoiceSelector(client))
+            select_once("open slack", driver, ChoiceSelector(client))
 
         self.assertEqual(timeline, ["list_windows", "windows", "windows", "bring_to_front",
                                     "get_window_state", "controls"])
@@ -94,7 +94,7 @@ class RestoreTests(unittest.TestCase):
         ):
             runner = FakeRunner({"windows": [window()]}, response)
             with self.assertRaises(DriverError):
-                run_pipeline("open slack", CuaDriver(executable="fake", runner=runner),
+                select_once("open slack", CuaDriver(executable="fake", runner=runner),
                              ChoiceSelector(ChoosingClient()))
             self.assertEqual([c[0][-1] for c in runner.calls], ["list_windows", "bring_to_front"])
 
@@ -106,8 +106,8 @@ class RestoreTests(unittest.TestCase):
                                 subprocess.CompletedProcess([], exit_code, json.dumps(refusal), ""))
             client = ChoosingClient()
             with self.assertRaises(DriverError) as raised:
-                run_pipeline("open slack", CuaDriver(executable="fake", runner=runner),
-                             ChoiceSelector(client), execute_click=True)
+                select_once("open slack", CuaDriver(executable="fake", runner=runner),
+                             ChoiceSelector(client), deliver_click=True)
             self.assertEqual(raised.exception.code, "foreground_unavailable")
             self.assertEqual(raised.exception.context["stage"], "bring_to_front")
             self.assertEqual(raised.exception.context["action_result"], refusal)

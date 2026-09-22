@@ -1,4 +1,4 @@
-"""Offline checks of the observation pipeline and thin CLI boundaries."""
+"""Shared observation/selection stage checks and thin always-loop CLI boundaries."""
 
 import contextlib
 import importlib
@@ -13,8 +13,9 @@ from src.driver import DriverError
 from test_driver import foreground_result
 from src.pipeline import (
     PipelineResult, control_candidates,
-    run_pipeline, window_candidates,
+    window_candidates,
 )
+from pipeline_fixtures import select_once
 from src.selection import ChoiceSelector, PINNED_MODEL, QUESTION
 from src.synthetic import START_MENU_KEY, START_MENU_SEARCH_KEY
 
@@ -118,7 +119,7 @@ class PipelineTests(unittest.TestCase):
     def run_observation(self, snapshot, windows=None, request="Find save"):
         client = ChoosingClient()
         driver = ObservingDriver([make_window()] if windows is None else windows, snapshot)
-        return run_pipeline(request, driver, ChoiceSelector(client)), driver, client
+        return select_once(request, driver, ChoiceSelector(client)), driver, client
 
     def test_both_stages_preserve_observed_identity_and_use_one_snapshot(self):
         windows = [make_window(index) for index in range(11)]
@@ -177,7 +178,7 @@ class PipelineTests(unittest.TestCase):
         client = ChoosingClient(preferred_key=START_MENU_KEY)
         selector = ChoiceSelector(client)
         with patch.object(selector, "select", wraps=selector.select) as select:
-            result = run_pipeline(request, driver, selector)
+            result = select_once(request, driver, selector)
 
         self.assertEqual(result.status, "selected")
         self.assertEqual(driver.calls, [("list_windows",)])
@@ -234,7 +235,7 @@ class PipelineTests(unittest.TestCase):
         error = DriverError("Discovery was denied.", code="access_denied", tool="list_windows")
         with patch.object(driver, "list_windows", side_effect=error) as discover:
             with self.assertRaises(DriverError) as raised:
-                run_pipeline("Open Start", driver, ChoiceSelector(client))
+                select_once("Open Start", driver, ChoiceSelector(client))
         self.assertIs(raised.exception, error)
         discover.assert_called_once_with()
         self.assertEqual(driver.calls, [])
@@ -260,7 +261,7 @@ class PipelineTests(unittest.TestCase):
 
         with patch.object(driver, "get_window_state", side_effect=failed_read):
             with self.assertRaises(DriverError) as raised:
-                run_pipeline("Find save", driver, ChoiceSelector(client))
+                select_once("Find save", driver, ChoiceSelector(client))
 
         self.assertIs(raised.exception, error)
         self.assertEqual(error.context["stage"], "get_window_state")
@@ -285,7 +286,7 @@ class PipelineTests(unittest.TestCase):
         error = DriverError("Window read failed.")
         with patch.object(driver, "get_window_state", side_effect=error) as read:
             with self.assertRaises(DriverError):
-                run_pipeline("Find save", driver, ChoiceSelector(ChoosingClient()))
+                select_once("Find save", driver, ChoiceSelector(ChoosingClient()))
         read.assert_called_once_with(window)
         self.assertEqual(error.context["window"], window)
         self.assertEqual(len(error.context["selections"]["windows"]), 1)
@@ -393,7 +394,7 @@ class PipelineTests(unittest.TestCase):
         error = DriverError("Window read failed.")
         with patch.object(driver, "get_window_state", side_effect=error):
             with self.assertRaises(DriverError):
-                run_pipeline("Find Save", driver, ChoiceSelector(ChoosingClient()), report=report)
+                select_once("Find Save", driver, ChoiceSelector(ChoosingClient()), report=report)
 
         self.assertEqual([entry["event"] for entry in report.events], [
             "windows_discovered", "window_selected", "action_requested", "action_returned",
@@ -408,7 +409,7 @@ class PipelineTests(unittest.TestCase):
         snapshot = {"snapshot_id": "observed-snapshot", "elements": elements,
                     "elements_complete": False, "tree_markdown": "UNNEEDED RAW TREE"}
         report = RecordingReport()
-        result = run_pipeline(
+        result = select_once(
             "Find Save", ObservingDriver(windows, snapshot), ChoiceSelector(ChoosingClient()),
             report=report,
         )
@@ -426,7 +427,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_report_distinguishes_empty_discovery_from_synthetic_search_selection(self):
         report = RecordingReport()
-        result = run_pipeline(
+        result = select_once(
             "Find Save", ObservingDriver([], {}), ChoiceSelector(ChoosingClient()), report=report,
         )
         self.assertEqual(result.status, "selected")
@@ -445,7 +446,7 @@ class PipelineTests(unittest.TestCase):
     def test_report_keeps_unavailable_observation_before_early_return(self):
         report = RecordingReport()
         window = make_window()
-        result = run_pipeline(
+        result = select_once(
             "Find Save", ObservingDriver([window], {"snapshot_id": "unavailable"}),
             ChoiceSelector(ChoosingClient()), report=report,
         )
@@ -475,7 +476,7 @@ class CliTests(unittest.TestCase):
             ))
             driver = stack.enter_context(patch.object(self.cli, "CuaDriver"))
             pipeline = stack.enter_context(patch.object(self.cli, "run_pipeline", side_effect=error,
-                                                        return_value=result or PipelineResult("selected")))
+                                                        return_value=result or PipelineResult("completed")))
             stack.enter_context(contextlib.redirect_stdout(output))
             stack.enter_context(contextlib.redirect_stderr(self.stderr))
             status = self.cli.main(arguments)
@@ -488,16 +489,16 @@ class CliTests(unittest.TestCase):
             status, output, pipeline, client, driver = self.invoke(["--request-file", str(path)])
         read_bytes.assert_called_once_with(path)
         self.assertEqual(status, 0)
-        self.assertEqual(output["status"], "selected")
+        self.assertEqual(output["status"], "completed")
         self.assertEqual(pipeline.call_args.args[0], text)
         self.assertEqual(client.call_args.kwargs["model"], PINNED_MODEL)
         self.assertEqual(client.call_args.kwargs["api_key"], "test-key")
         self.assertEqual(driver.call_args.kwargs["max_elements"], 5000)
         self.assertEqual(driver.call_args.kwargs["max_depth"], 25)
         self.assertEqual(self.report.events[0], {
-            "event": "run_started", "request": text, "execute_click": False,
+            "event": "run_started", "request": text,
         })
-        self.assertFalse(pipeline.call_args.kwargs["execute_click"])
+        self.assertEqual(set(pipeline.call_args.kwargs), {"report"})
 
     def test_unreadable_request_file_still_leaves_a_closed_failure_report(self):
         with patch.object(Path, "read_bytes", side_effect=PermissionError("sensitive-file-path")):
@@ -550,42 +551,42 @@ class CliTests(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertEqual(output["status"], "no_windows")
 
-    def test_click_flag_forwards_once_and_returns_native_action_facts(self):
+    def test_completed_loop_forwards_once_and_returns_native_action_facts(self):
         native_result = {
             "effect": "unverifiable", "route": "accessibility", "delivery": {"mode": "background"},
         }
         result = PipelineResult(
-            "action_returned", window=make_window(), control=make_element(),
+            "completed", window=make_window(), control=make_element(),
             snapshot_id="snapshot-secret", action_result=native_result,
         )
 
-        status, output, pipeline, _, driver = self.invoke(["--click", "Click Save"], result=result)
+        status, output, pipeline, _, driver = self.invoke(["Click Save"], result=result)
 
         self.assertEqual(status, 0)
         self.assertEqual(output, {**result.to_dict(), "timing": self.report.timing})
         pipeline.assert_called_once()
         self.assertEqual(pipeline.call_args.args[0], "Click Save")
         self.assertIs(pipeline.call_args.args[1], driver.return_value)
-        self.assertTrue(pipeline.call_args.kwargs["execute_click"])
+        self.assertEqual(set(pipeline.call_args.kwargs), {"report"})
         self.assertEqual(self.report.events, [
-            {"event": "run_started", "request": "Click Save", "execute_click": True},
+            {"event": "run_started", "request": "Click Save"},
             {"event": "run_finished", "result": result.to_dict()},
         ])
         self.assertTrue(self.report.closed)
 
-    def test_click_with_unsupported_target_returns_no_action_and_exit_two(self):
+    def test_unsupported_loop_target_returns_no_action_and_exit_two(self):
         result = PipelineResult(
             "no_action", window={"synthetic": True, "title": "Start Menu"},
             control={"synthetic": True, "label": "Search"},
             reason="Synthetic targets have no live CUA click target.",
         )
 
-        status, output, pipeline, _, _ = self.invoke(["--click", "Open Start"], result=result)
+        status, output, pipeline, _, _ = self.invoke(["Open Start"], result=result)
 
         self.assertEqual(status, 2)
         self.assertEqual(output, {**result.to_dict(), "timing": self.report.timing})
         self.assertIsNone(output["action_result"])
-        self.assertTrue(pipeline.call_args.kwargs["execute_click"])
+        self.assertEqual(set(pipeline.call_args.kwargs), {"report"})
         self.assertEqual(self.report.events[-1], {"event": "run_finished", "result": result.to_dict()})
         self.assertTrue(self.report.closed)
 
@@ -605,7 +606,7 @@ class CliTests(unittest.TestCase):
         )
         error.context.update(stage="click", action_result=native_result, selection=selected.to_dict())
 
-        status, output, pipeline, _, _ = self.invoke(["--click", "Click Save"], error=error)
+        status, output, pipeline, _, _ = self.invoke(["Click Save"], error=error)
 
         self.assertEqual(status, 1)
         self.assertEqual(output, {
@@ -614,16 +615,16 @@ class CliTests(unittest.TestCase):
             "timing": self.report.timing,
         })
         pipeline.assert_called_once()
-        self.assertTrue(pipeline.call_args.kwargs["execute_click"])
+        self.assertEqual(set(pipeline.call_args.kwargs), {"report"})
         self.assertEqual(self.report.events, [
-            {"event": "run_started", "request": "Click Save", "execute_click": True},
+            {"event": "run_started", "request": "Click Save"},
             {"event": "run_error", **self.without_timing(output)},
         ])
         self.assertTrue(self.report.closed)
 
-    def test_completed_click_keeps_stdout_and_exit_zero_when_final_report_write_fails(self):
+    def test_completed_loop_keeps_stdout_and_exit_zero_when_final_report_write_fails(self):
         result = PipelineResult(
-            "action_returned", window=make_window(), control=make_element(),
+            "completed", window=make_window(), control=make_element(),
             action_result={
                 "effect": "unverifiable", "route": "accessibility", "delivery": {"mode": "background"},
             },
@@ -635,13 +636,13 @@ class CliTests(unittest.TestCase):
                     raise report_error
 
                 with patch.object(RecordingReport, "close", autospec=True, side_effect=fail_close) as close:
-                    status, output, pipeline, _, _ = self.invoke(["--click", "Click Save"], result=result)
+                    status, output, pipeline, _, _ = self.invoke(["Click Save"], result=result)
 
                 self.assertEqual(status, 0)
                 self.assertEqual(output, result.to_dict())
                 pipeline.assert_called_once()
                 self.assertEqual(self.report.events, [
-                    {"event": "run_started", "request": "Click Save", "execute_click": True},
+                    {"event": "run_started", "request": "Click Save"},
                     {"event": "run_finished", "result": result.to_dict()},
                 ])
                 close.assert_called_once()
@@ -677,19 +678,19 @@ class CliTests(unittest.TestCase):
         })
         pipeline.assert_called_once()
         self.assertEqual(self.report.events, [
-            {"event": "run_started", "request": "Find Save", "execute_click": False},
+            {"event": "run_started", "request": "Find Save"},
             {"event": "run_error", **self.without_timing(output)},
         ])
         self.assertTrue(self.report.closed)
 
     def test_success_attaches_wire_hooks_and_returns_report_timing_with_operational_result(self):
-        result = PipelineResult("selected", window=make_window(), control=make_element())
+        result = PipelineResult("completed", window=make_window(), control=make_element())
         status, output, pipeline, client, _ = self.invoke(["Find Save"], result=result)
 
         self.assertEqual(status, 0)
         self.assertEqual(output, {**result.to_dict(), "timing": self.report.timing})
         self.assertEqual(self.report.events, [
-            {"event": "run_started", "request": "Find Save", "execute_click": False},
+            {"event": "run_started", "request": "Find Save"},
             {"event": "run_finished", "result": result.to_dict()},
         ])
         self.assertIs(pipeline.call_args.kwargs["report"], self.report)
@@ -709,7 +710,7 @@ class CliTests(unittest.TestCase):
                     self.invoke(["Find Save"], error=error)
                 self.assertIs(raised.exception, error)
                 self.assertEqual(self.report.events, [
-                    {"event": "run_started", "request": "Find Save", "execute_click": False},
+                    {"event": "run_started", "request": "Find Save"},
                     {"event": "run_interrupted", "error_type": type(error).__name__},
                 ])
                 self.assertTrue(self.report.closed)
@@ -747,7 +748,7 @@ class CliTests(unittest.TestCase):
                                 self.assertIs(raised.exception, original_error)
                     close.assert_called_once()
                     self.assertEqual(self.report.events, [
-                        {"event": "run_started", "request": "Find Save", "execute_click": False},
+                        {"event": "run_started", "request": "Find Save"},
                     ])
                     self.assertIn("Could not buffer", self.stderr.getvalue())
                     self.assertIn("Could not write", self.stderr.getvalue())

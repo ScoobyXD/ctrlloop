@@ -3,8 +3,10 @@
 The [main workflow](main-workflow.md) defines the selection and timing contract.
 A candidate is one window or control; a group contains up to ten candidates; a
 group question chooses one winner from that group. **Every selection round sends
-all its group questions in exactly one Jev API call.** The next round uses those
-winners.
+all its group questions in exactly one Jev API call.** The final
+control round's request also includes a conditional settling-time question for
+every finalist. The next round uses the previous round's winners. An iteration
+is one observation pass of the loop, not a selection round.
 
 The CLI collects events, timestamps, and actual Jev payloads in memory. At the end
 it generates and writes the existing `reports/run-*.json` event array once. Use
@@ -43,7 +45,7 @@ and `timing_finished` events describe operations:
 | `started_elapsed_ms`, `finished_elapsed_ms` | Work boundaries relative to the origin. |
 | `started_at`, `finished_at` | Corresponding anchored UTC work boundaries. |
 | `status` | `ok`, `error`, or `interrupted`; failures retain `error_type`. |
-| `stage`, `round`, `round_id`, `question_keys` | Selection and HTTP correlation where applicable. |
+| `iteration`, `stage`, `round`, `round_id`, `question_keys` | Loop, selection, and HTTP correlation where applicable. |
 
 Use `duration_ms` or the explicit work boundaries, rather than subtracting event
 creation timestamps. A start event can be recorded before its measured work
@@ -61,7 +63,7 @@ Filter measured operations in PowerShell:
 ```powershell
 $events = Get-Content -Raw -LiteralPath 'reports/run-REPLACE-WITH-YOUR-FILE.json' | ConvertFrom-Json
 $events | Where-Object event -eq 'timing_finished' |
-    Select-Object operation, stage, round, duration_ms, span_id, parent_span_id |
+    Select-Object operation, iteration, stage, round, duration_ms, span_id, parent_span_id |
     Format-Table -AutoSize
 ```
 
@@ -84,18 +86,41 @@ recorded startup work. `initialization.request_read`,
 | `action_dispatch` | Selected-control recording through action preparation and return. |
 | `action_preparation` | Checking synthetic targets, building click arguments, and recording `action_requested`. |
 | `native_action` | `driver.click()` through return/error. |
+| `loop.iteration` | The current pass, including its observation, judgments, selection, action, or wait as applicable. |
+| `loop.judgment` | Preparing, requesting, and validating the three loop questions, or the unchanged-state wait/error and conditional timing pair. |
+| `settling_wait` | The requested additional app/browser wait, starting after CUA returns for an action, or after the wait-longer judgment. |
 
 Within selection, inspect `selection.validation`, `selection.round`,
 `selection.grouping`, `selection.sdk_call`, `selection.response_validation`, and
 `selection.advancement`. A round starts before forming its groups and ends after
-its winners are ready. A selection starting with one candidate needs no round or
-Jev call. A trailing one-candidate group within a larger round still belongs to
-that round's single request.
+its winners are ready. A selection starting with one candidate needs no selection
+question; an executable singleton still gets its timing question
+through the same selector. A trailing one-candidate group within a larger round
+still belongs to that round's single request.
 
-Foreground activation precedes the real control snapshot even without `--click`.
+Foreground activation precedes the newly selected real window's control snapshot.
 Synthetic controls require no live UIA read or foreground activation. A skipped
 synthetic action can have preparation records but has no `native_action`.
 Absent stages mean the work did not occur.
+
+Loop events retain the `iteration`, observed state, all judgment questions,
+answers and full probabilities in `loop_judgment.api_call`, and the chosen route
+in the `loop_route` event. The result's `iterations` array keeps each pass's
+route, judgment traces, and `settling_ms` when used. Later passes retain
+their own window/control selection traces. Use `(iteration, round_id)` when
+correlating repeated names such as `controls_r1`; `round_id` alone can identify
+different rounds in different passes. The existing span and HTTP request IDs
+remain unique within the run.
+
+`settling_wait` records `requested_ms` and its measured `duration_ms`, with `kind`
+set to `after_action` or `additional_wait`;
+the scheduler may return later than the request. It starts only after the CUA
+action result returns, so its duration excludes `native_action`. The timing
+Choice estimates additional app/browser readiness time. The exact options
+`<50ms`, `100ms`, `200ms`, `300ms`, `400ms`, and `>500ms` map in code to 50, 100,
+200, 300, 400, and 500 ms. The last option is a 500 ms first observation, not a
+readiness guarantee. Additional wait passes sleep and observe without repeating
+the prior click.
 
 On a successful pipeline return, `client_cleanup` measures closing the SDK and
 HTTP clients. The total operational duration ends after the operational result
@@ -105,12 +130,27 @@ happen afterward.
 ## Jev API call duration
 
 A question key such as `controls_r1_g0` identifies the stage, round, and group.
-Rounds are numbered from one and groups from zero. `round_id` and `question_keys`
+Rounds are numbered from one and groups from zero. `iteration`, `round_id`, and `question_keys`
 link a round's group questions to its single API call. Each round trace contains
 one `api_call` record with model identities, token usage, and SDK/validation span
 IDs. Its groups retain their options and winners. HTTP events share `request_id`
-and round context, linking `jev_request` with `jev_response`,
+and iteration/round context, linking `jev_request` with `jev_response`,
 `jev_response_error`, or `jev_request_unfinished`.
+
+The timing summary's `jev_api_call_count` counts actual prepared requests seen
+by the HTTP hook. It is zero when no request occurs; Python callers must register
+the report hooks to obtain this count. It can also be checked by counting
+`jev_request` events, including
+the later-pass three-question batches and wait/error batches. Counting only
+selection rounds would miss those judgment calls. The per-finalist timing
+questions share the final control selection's call and duration. Inspect each
+request/response pair to see its complete question and probability distributions;
+do not count individual questions as requests.
+
+The loop's `last_action.requested_wait_ms_so_far` is code-computed cumulative
+scheduled settling time supplied to later judgments. It includes additional
+waits and excludes CUA duration. Use measured `settling_wait` spans for actual
+elapsed wait time rather than treating this requested-time total as a clock.
 
 The primary API duration has these boundaries:
 
@@ -208,8 +248,8 @@ reporting can run. An abrupt process termination can lose the report; there is
 no per-event durable copy. A missing finish record does not mean zero duration.
 
 Native action duration ends when the adapter returns. Its result does not prove
-that the screen changed or the user's task completed; there is no post-action
-observation. These changes add no timing-estimate questions, polling, sleeps, delays,
-or repeated action loop. Offline fixtures verify boundaries and correlation;
+that the screen changed or the user's task completed. The loop waits, observes
+fresh state, and asks the later-pass judgments described
+in the [main workflow](main-workflow.md). Offline fixtures verify boundaries and correlation;
 their durations are not production Jev benchmarks. The model remains
 `jev-1.13.0` and the driver remains CUA Driver `0.28.2`.

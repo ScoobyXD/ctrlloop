@@ -1,4 +1,4 @@
-"""One-click contract checks through the real adapter with an offline CLI runner."""
+"""Native dispatch stage checks through the real adapter and an offline CLI runner."""
 
 from copy import deepcopy
 import json
@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from src.driver import CuaDriver, DriverError
-from src.pipeline import run_pipeline
+from pipeline_fixtures import select_once
 from src.selection import ChoiceSelector, PINNED_MODEL
 from src.synthetic import START_MENU_KEY
 from test_driver import FakeRunner, element, state, window, foreground_result
@@ -41,7 +41,7 @@ class ClickPipelineTests(unittest.TestCase):
         )
         request = "  Click Save.\r\nKeep this wording. "
 
-        result = run_pipeline(request, driver, ChoiceSelector(client), execute_click=True)
+        result = select_once(request, driver, ChoiceSelector(client), deliver_click=True)
 
         self.assertEqual(result.status, "action_returned")
         self.assertEqual(result.action_result, native_result)
@@ -69,7 +69,7 @@ class ClickPipelineTests(unittest.TestCase):
             snapshot_id="snapshot:chosen", elements=[element(element_index=901, element_token=None)],
         ))
 
-        result = run_pipeline("Click Save", driver, ChoiceSelector(client), execute_click=True)
+        result = select_once("Click Save", driver, ChoiceSelector(client), deliver_click=True)
 
         self.assertEqual(result.status, "action_returned")
         self.assertEqual(json.loads(runner.calls[-1][1]["input"]), {
@@ -79,10 +79,10 @@ class ClickPipelineTests(unittest.TestCase):
         self.assertEqual(len(runner.calls), 4)
         self.assertEqual(len(client.calls), 1)  # One control needs no Jev question.
 
-    def test_selection_only_remains_the_default(self):
+    def test_selection_stage_can_be_inspected_before_dispatch(self):
         driver, runner, client = self.set_up_run()
 
-        result = run_pipeline("Find Save", driver, ChoiceSelector(client))
+        result = select_once("Find Save", driver, ChoiceSelector(client))
 
         self.assertEqual(result.status, "selected")
         self.assertIsNone(result.action_result)
@@ -93,7 +93,7 @@ class ClickPipelineTests(unittest.TestCase):
             with self.subTest(real_windows=bool(windows)):
                 driver, runner, client = self.set_up_run(windows=windows, preferred_key=START_MENU_KEY)
 
-                result = run_pipeline("Open Start", driver, ChoiceSelector(client), execute_click=True)
+                result = select_once("Open Start", driver, ChoiceSelector(client), deliver_click=True)
 
                 self.assertEqual(result.status, "no_action")
                 self.assertTrue(result.reason)
@@ -114,7 +114,7 @@ class ClickPipelineTests(unittest.TestCase):
             with self.subTest(status=status, snapshot=snapshot):
                 driver, runner, client = self.set_up_run(snapshot=snapshot)
 
-                result = run_pipeline("Click Save", driver, ChoiceSelector(client), execute_click=True)
+                result = select_once("Click Save", driver, ChoiceSelector(client), deliver_click=True)
 
                 self.assertEqual(result.status, status)
                 self.assertIsNone(result.action_result)
@@ -130,7 +130,7 @@ class ClickPipelineTests(unittest.TestCase):
                 driver, runner, client = self.set_up_run(action_result=native_result)
 
                 with self.assertRaises(DriverError) as raised:
-                    run_pipeline("Click Save", driver, ChoiceSelector(client), execute_click=True)
+                    select_once("Click Save", driver, ChoiceSelector(client), deliver_click=True)
 
                 self.assertEqual(raised.exception.code, code)
                 self.assertEqual(raised.exception.context["action_result"], native_result)
@@ -154,7 +154,7 @@ class ClickPipelineTests(unittest.TestCase):
 
                 with patch.object(report, "append", side_effect=append_until_request):
                     with self.assertRaises(type(report_error)) as raised:
-                        run_pipeline("Click Save", driver, ChoiceSelector(client), execute_click=True, report=report)
+                        select_once("Click Save", driver, ChoiceSelector(client), deliver_click=True, report=report)
 
                 self.assertIs(raised.exception, report_error)
                 self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows", "bring_to_front", "get_window_state"])
