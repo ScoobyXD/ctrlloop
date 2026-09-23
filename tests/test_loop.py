@@ -39,7 +39,7 @@ def evidence_calls(client):
 
 
 class ScriptedClient:
-    """Choose fixture candidates or none and freeze state at each request."""
+    """Choose fixture candidates (or inject invalid none) and freeze request state."""
 
     def __init__(self, clock, timeline, *, windows=("window_0",), timing="100ms",
                  confirmation="yes", none_stages=(), evidence_choices=(), wrong_evidence_model=False):
@@ -75,7 +75,7 @@ class ScriptedClient:
                 value = "none"
             else:
                 value = next(option for option in options if option.startswith("control_"))
-            if value not in options:
+            if value not in options and value != "none":
                 raise AssertionError(f"Scripted option {value!r} missing for {key}")
             answers[key] = SimpleNamespace(
                 type="choice", choice=value, confidence=1,
@@ -238,28 +238,36 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(trace["state"], call["state"])
             self.assertEqual(set(trace["questions"]), set(call["questions"]))
 
-    def test_all_evidence_groups_none_stops_without_confirmation_retry_or_second_action(self):
+    def test_each_evidence_group_advances_to_confirmation_without_second_action(self):
         after = snapshot(2, "No evidence")
         after["elements"] = [make_element(index) for index in range(21)]
         result, driver, client, _ = self.run_loop(
-            observations=[snapshot(1, "Save"), after], none_stages={"evidence"},
+            observations=[snapshot(1, "Save"), after], confirmation="no",
         )
-        self.assertEqual(result.status, "no_evidence")
+        self.assertEqual(result.status, "action_unverified")
         self.assertEqual(result.last_control["status"], "(unverified)")
         evidence = evidence_calls(client)
-        self.assertEqual(len(evidence), 1)
+        self.assertEqual(len(evidence), 2)
         self.assertEqual(len(evidence[0]["questions"]), 3)
         self.assertFalse(any(set(question.criteria) == {"yes", "no"}
                              for question in evidence[0]["questions"].values()))
+        self.assertEqual([round_["candidate_count"] for round_ in result.selections["evidence"]], [21, 3])
+        self.assertTrue(any(set(question.criteria) == {"yes", "no"}
+                            for question in evidence[-1]["questions"].values()))
+        self.assertTrue(all("none" not in question.criteria
+                            for call in evidence for question in call["questions"].values()))
         self.assertEqual(len(self.tool_calls(driver, "click")), 1)
         self.assertEqual(len(self.tool_calls(driver, "get_window_state")), 2)
         self.assertEqual([item[2] for item in self.timeline if item[0] == "sleep"], [0.1])
 
-    def test_final_evidence_none_ignores_a_positive_conditional_confirmation(self):
-        result, driver, client, _ = self.run_loop(none_stages={"evidence"}, confirmation="yes")
-        self.assertEqual(result.status, "no_evidence")
-        self.assertEqual(result.last_control["status"], "(unverified)")
+    def test_invalid_none_evidence_cannot_verify_or_repeat_action(self):
+        driver = ScriptedDriver(self.clock, self.timeline,
+                                observations=[snapshot(1, "Save"), snapshot(2, "Saved")])
+        client = ScriptedClient(self.clock, self.timeline, none_stages={"evidence"}, confirmation="yes")
+        with self.assertRaisesRegex(SelectionError, "unknown option label"):
+            run_pipeline("Save document", driver, ChoiceSelector(client), sleep=self.sleep)
         self.assertEqual(len(evidence_calls(client)), 1)
+        self.assertEqual(evidence_calls(client)[0]["state"]["last_control"]["status"], "(unverified)")
         self.assertEqual(len(self.tool_calls(driver, "click")), 1)
 
     def test_rejected_confirmation_does_not_mark_verified_or_repeat_action(self):
@@ -270,9 +278,11 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(len(evidence_calls(client)), 1)
         self.assertEqual([item[2] for item in self.timeline if item[0] == "sleep"], [0.1])
 
-    def test_control_none_prevents_click_wait_and_verification(self):
-        result, driver, client, _ = self.run_loop(none_stages={"controls"})
-        self.assertEqual(result.status, "no_control_selected")
+    def test_invalid_none_control_prevents_click_wait_and_verification(self):
+        driver = ScriptedDriver(self.clock, self.timeline, observations=[snapshot(1, "Save")])
+        client = ScriptedClient(self.clock, self.timeline, none_stages={"controls"})
+        with self.assertRaisesRegex(SelectionError, "unknown option label"):
+            run_pipeline("Save document", driver, ChoiceSelector(client), sleep=self.sleep)
         self.assertEqual(self.tool_calls(driver, "click"), [])
         self.assertEqual(evidence_calls(client), [])
         self.assertFalse(any(item[0] == "sleep" for item in self.timeline))

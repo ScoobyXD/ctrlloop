@@ -74,13 +74,10 @@ class SelectionTests(unittest.TestCase):
             for question in call["questions"].values():
                 self.assertIsInstance(question, Choice)
                 self.assertEqual(question.instructions, EXPECTED_QUESTION)
-                real_options = {key: value for key, value in question.criteria.items() if key != NONE_KEY}
-                self.assertLessEqual(len(real_options), 10)
-                self.assertGreaterEqual(len(real_options), 1)
+                self.assertNotIn(NONE_KEY, question.criteria)
+                self.assertLessEqual(len(question.criteria), 10)
+                self.assertGreaterEqual(len(question.criteria), 1)
                 for key, description in question.criteria.items():
-                    if key == NONE_KEY:
-                        self.assertIn("None of these candidates", description)
-                        continue
                     self.assertEqual(description, descriptions[key])
                     self.assertNotIn("private_context", description)
 
@@ -186,7 +183,7 @@ class SelectionTests(unittest.TestCase):
         client = FakeClient()
         result = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
         self.assertEqual([len(call["questions"]) for call in client.calls], [40, 4, 1])
-        self.assertEqual([len(q.criteria) for q in client.calls[0]["questions"].values()], [11] * 39 + [3])
+        self.assertEqual([len(q.criteria) for q in client.calls[0]["questions"].values()], [10] * 39 + [2])
         self.assertEqual(
             [list(call["questions"]) for call in client.calls],
             [round_trace["api_call"]["question_keys"] for round_trace in result.rounds],
@@ -208,7 +205,7 @@ class SelectionTests(unittest.TestCase):
         result = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
         self.assertEqual([len(call["questions"]) for call in client.calls], [2, 1])
         singleton = client.calls[0]["questions"]["controls_r1_g1"]
-        self.assertEqual(list(singleton.criteria), [observed[-1].key, NONE_KEY])
+        self.assertEqual(list(singleton.criteria), [observed[-1].key])
         self.assertEqual(singleton.criteria[observed[-1].key], observed[-1].description)
         self.assertEqual(result.rounds[0]["groups"][1]["question_key"], "controls_r1_g1")
 
@@ -222,7 +219,7 @@ class SelectionTests(unittest.TestCase):
         client = FakeClient(mutate=flat_distribution)
         result = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
         self.assertIs(result.winner, observed[-1])
-        self.assertEqual(result.rounds[1]["groups"][0]["options"], [c.key for c in observed[9::10]] + [NONE_KEY])
+        self.assertEqual(result.rounds[1]["groups"][0]["options"], [c.key for c in observed[9::10]])
 
     def test_group_order_is_observation_order_not_sorted_key_order(self):
         observed = list(reversed(candidates(24)))
@@ -294,30 +291,26 @@ class SelectionTests(unittest.TestCase):
         window = ChoiceSelector(FakeClient()).select(ORIGINAL, [collision], stage="windows")
         self.assertIs(window.winner, collision)
 
-    def test_single_control_is_judged_against_none_even_without_settling(self):
-        for choose_none in (False, True):
-            with self.subTest(choose_none=choose_none):
-                observed = candidates(1)
-                client = FakeClient(choose=lambda labels: NONE_KEY if choose_none else labels[0])
-                selection = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
-                self.assertEqual(len(client.calls), 1)
-                self.assertEqual(list(client.calls[0]["questions"]["controls_r1_g0"].criteria), [observed[0].key, NONE_KEY])
-                self.assertIs(selection.winner, None if choose_none else observed[0])
-                self.assertIsNone(selection.settling_ms)
-                self.assertIsNone(selection.verification)
+    def test_single_control_still_has_a_question_without_none_or_settling(self):
+        observed = candidates(1)
+        client = FakeClient()
+        selection = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(list(client.calls[0]["questions"]["controls_r1_g0"].criteria), [observed[0].key])
+        self.assertIs(selection.winner, observed[0])
+        self.assertIsNone(selection.settling_ms)
+        self.assertIsNone(selection.verification)
 
-    def test_all_none_stops_elimination_without_an_extra_call(self):
+    def test_unsupplied_none_answer_is_rejected_without_an_extra_call(self):
         for stage in ("controls", "evidence"):
-            with self.subTest(stage=stage):
-                client = FakeClient(choose=lambda labels: NONE_KEY)
-                selection = ChoiceSelector(client).select(ORIGINAL, candidates(101), stage=stage)
-                self.assertIsNone(selection.winner)
-                self.assertEqual(len(client.calls), 1)
-                self.assertEqual(len(client.calls[0]["questions"]), 11)
-                self.assertEqual(selection.rounds[0]["candidate_count"], 101)
-                self.assertEqual(selection.rounds[0]["winner_count"], 0)
-                self.assertTrue(all(group["winner"] == NONE_KEY for group in selection.rounds[0]["groups"]))
-                self.assertEqual(selection.verification, False if stage == "evidence" else None)
+            for count in (1, 101):
+                with self.subTest(stage=stage, count=count):
+                    client = FakeClient(choose=lambda labels: NONE_KEY)
+                    with self.assertRaisesRegex(SelectionError, "unknown option label"):
+                        ChoiceSelector(client).select(ORIGINAL, candidates(count), stage=stage)
+                    self.assertEqual(len(client.calls), 1)
+                    self.assertTrue(all(NONE_KEY not in question.criteria
+                                        for question in client.calls[0]["questions"].values()))
 
     def assert_bad_response(self, mutate):
         client = FakeClient(mutate=mutate)

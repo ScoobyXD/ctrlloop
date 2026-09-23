@@ -213,8 +213,8 @@ class LoopStateTests(unittest.TestCase):
         self.assertEqual(result.status, "action_verified")
         evidence = evidence_calls(client)
         self.assertEqual([round_["candidate_count"] for round_ in result.selections["evidence"]], [343, 35, 4])
-        first_groups = [question for question in evidence[0]["questions"].values()
-                        if "none" in question.criteria]
+        first_groups = [question for key, question in evidence[0]["questions"].items()
+                        if not key.endswith("_confirmation")]
         candidates = {key: description for question in first_groups
                       for key, description in question.criteria.items() if key != "none"}
         self.assertEqual(len(candidates), 343)

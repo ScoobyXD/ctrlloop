@@ -33,7 +33,9 @@ QUESTION = (
 EVIDENCE_QUESTION = (
     "Which of these freshly observed candidates provides the clearest evidence that "
     "the action recorded in `last_action`, targeting the unverified `last_control`, "
-    "achieved its intended result? Choose none if no candidate provides such evidence. "
+    "achieved its intended result? "
+    # Temporarily disabled with the synthetic none criteria below.
+    # "Choose none if no candidate provides such evidence. "
     "A past selection or action-delivery result alone is not proof."
 )
 EVIDENCE_CONFIRMATION_QUESTION = (
@@ -213,14 +215,14 @@ class ChoiceSelector:
                     raise ValueError("Candidate keys must be nonempty strings.")
                 if len({candidate.key for candidate in current}) != len(current):
                     raise ValueError("Candidate keys must be unique within a selection.")
-                include_none = stage in {"controls", "evidence"}
-                if include_none and any(candidate.key == NONE_KEY for candidate in current):
+                control_or_evidence = stage in {"controls", "evidence"}
+                if control_or_evidence and any(candidate.key == NONE_KEY for candidate in current):
                     raise ValueError("The none option key is reserved for control and evidence selection.")
             rounds: list[dict[str, Any]] = []
             settling_ms = None
             verification = False if stage == "evidence" else None
             include_settling = stage == "controls" and settling_context is not None
-            while current and (len(current) > 1 or include_none):
+            while current and (len(current) > 1 or control_or_evidence):
                 round_number = len(rounds) + 1
                 round_id = f"{stage}_r{round_number}"
                 with report.span(
@@ -240,12 +242,13 @@ class ChoiceSelector:
                             key = f"{round_id}_g{group_index}"
                             group_keys.append(key)
                             criteria = {candidate.key: candidate.description for candidate in group}
-                            if include_none:
-                                criteria[NONE_KEY] = (
-                                    "None of these candidates provides evidence that the attempted action succeeded."
-                                    if stage == "evidence" else
-                                    "None of these candidates is suitable for the next action toward the user's request."
-                                )
+                            # Temporary experiment: each group must choose a supplied candidate.
+                            # if control_or_evidence:
+                            #     criteria[NONE_KEY] = (
+                            #         "None of these candidates provides evidence that the attempted action succeeded."
+                            #         if stage == "evidence" else
+                            #         "None of these candidates is suitable for the next action toward the user's request."
+                            #     )
                             question = EVIDENCE_QUESTION if stage == "evidence" else QUESTION
                             questions[key] = Choice(
                                 instructions=(
@@ -302,7 +305,7 @@ class ChoiceSelector:
                         group_traces = []
                         for key, group in zip(group_keys, groups, strict=True):
                             winner_key = chosen[key]
-                            if not include_none or winner_key != NONE_KEY:
+                            if not control_or_evidence or winner_key != NONE_KEY:
                                 winners.append(next(candidate for candidate in group if candidate.key == winner_key))
                             group_traces.append({
                                 "question_key": key,

@@ -9,7 +9,7 @@ from src.pipeline import window_candidates
 from pipeline_fixtures import select_once
 from test_driver import foreground_result
 from test_pipeline import RecordingReport
-from src.selection import Candidate, ChoiceSelector, NONE_KEY, PINNED_MODEL
+from src.selection import Candidate, ChoiceSelector, PINNED_MODEL
 from src.synthetic import (
     DEFAULT_REGISTRY, START_MENU_KEY,
     SyntheticRegistry, SyntheticWindow,
@@ -199,7 +199,7 @@ class SyntheticPipelineTests(unittest.TestCase):
         self.assertEqual(list(client.calls[0]["questions"]["windows_r1_g0"].criteria),
                          [START_MENU_KEY, "launcher", "window_0"])
         self.assertEqual(list(client.calls[1]["questions"]["controls_r1_g0"].criteria),
-                         ["browse", "search", NONE_KEY])
+                         ["browse", "search"])
         for call in client.calls:
             self.assertEqual(call["state"]["original_request"], request)
             self.assertEqual(call["model"], PINNED_MODEL)
@@ -242,7 +242,7 @@ class SyntheticPipelineTests(unittest.TestCase):
         self.assertEqual(driver.calls, [("list_windows",), ("bring_to_front", {"pid": 1, "window_id": 2}), ("get_window_state", start)])
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(list(client.calls[0]["questions"]["controls_r1_g0"].criteria),
-                         ["control_0", NONE_KEY])
+                         ["control_0"])
 
     def test_empty_registry_and_no_real_windows_returns_no_windows(self):
         driver = ObservingDriver()

@@ -232,17 +232,16 @@ class LoopSelectionTests(unittest.TestCase):
             )
         self.assertEqual(len(client.calls), 1)
 
-    def test_none_final_control_has_no_winning_timing(self):
+    def test_unsupplied_none_control_is_rejected_even_with_valid_timings(self):
         client = FakeClient(group_choices={"controls_r1_g0": NONE_KEY})
-        result = ChoiceSelector(client).select(
-            REQUEST, candidates(2), stage="controls", settling_context=CONTEXT,
-        )
-        self.assertIsNone(result.winner)
-        self.assertIsNone(result.settling_ms)
+        with self.assertRaisesRegex(SelectionError, "unknown option label"):
+            ChoiceSelector(client).select(
+                REQUEST, candidates(2), stage="controls", settling_context=CONTEXT,
+            )
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(len(client.calls[0]["questions"]), 3)
-        self.assertEqual(set(result.rounds[0]["settling"]), {"control_0", "control_1"})
-        self.assertNotIn(NONE_KEY, result.rounds[0]["settling"])
+        self.assertTrue(all(NONE_KEY not in question.criteria
+                            for question in client.calls[0]["questions"].values()))
 
     def test_evidence_rounds_share_context_and_only_final_round_confirms(self):
         state = self.evidence_state()
@@ -266,8 +265,9 @@ class LoopSelectionTests(unittest.TestCase):
                 self.assertEqual(question.instructions, EVIDENCE_QUESTION)
                 self.assertIn("last_control", question.instructions)
                 self.assertIn("last_action", question.instructions)
-                self.assertEqual(list(question.criteria)[-1], NONE_KEY)
-                self.assertLessEqual(len(question.criteria), 11)
+                self.assertNotIn("Choose none", question.instructions)
+                self.assertNotIn(NONE_KEY, question.criteria)
+                self.assertLessEqual(len(question.criteria), 10)
         final_call = client.calls[-1]
         confirmation = final_call["questions"]["evidence_r3_confirmation"]
         self.assertEqual(confirmation.instructions["question"], EVIDENCE_CONFIRMATION_QUESTION)
@@ -302,32 +302,31 @@ class LoopSelectionTests(unittest.TestCase):
                 self.assertIsNone(result.settling_ms)
                 self.assertEqual(len(client.calls), 1)
                 self.assertEqual(list(client.calls[0]["questions"]), ["evidence_r1_g0", "evidence_r1_confirmation"])
-                self.assertEqual(result.rounds[0]["groups"][0]["options"], ["control_0", NONE_KEY])
+                self.assertEqual(result.rounds[0]["groups"][0]["options"], ["control_0"])
 
-    def test_sparse_evidence_advancement_still_confirms_surviving_singleton(self):
+    def test_each_evidence_group_advances_a_real_candidate_to_confirmation(self):
         client = FakeClient(group_choices={
-            "evidence_r1_g0": NONE_KEY, "evidence_r1_g1": "control_10",
+            "evidence_r1_g0": "control_9", "evidence_r1_g1": "control_10",
         })
         observed = candidates(11)
         result = ChoiceSelector(client).select(self.evidence_state(), observed, stage="evidence")
-        self.assertEqual([round_["candidate_count"] for round_ in result.rounds], [11, 1])
-        self.assertEqual([round_["winner_count"] for round_ in result.rounds], [1, 1])
+        self.assertEqual([round_["candidate_count"] for round_ in result.rounds], [11, 2])
+        self.assertEqual([round_["winner_count"] for round_ in result.rounds], [2, 1])
         self.assertEqual([len(call["questions"]) for call in client.calls], [2, 2])
         self.assertIs(result.winner, observed[10])
         self.assertTrue(result.verification)
         final_questions = client.calls[-1]["questions"]
-        self.assertEqual(list(final_questions["evidence_r2_g0"].criteria), ["control_10", NONE_KEY])
+        self.assertEqual(list(final_questions["evidence_r2_g0"].criteria), ["control_9", "control_10"])
         self.assertEqual(final_questions["evidence_r2_confirmation"].instructions["evidence_candidates"], {
-            "control_10": observed[10].description,
+            "control_9": observed[9].description, "control_10": observed[10].description,
         })
 
-    def test_none_evidence_cannot_be_overridden_by_yes_confirmation(self):
+    def test_unsupplied_none_evidence_is_rejected_despite_yes_confirmation(self):
         client = FakeClient(group_choices={"evidence_r1_g0": NONE_KEY}, confirmation="yes")
-        result = ChoiceSelector(client).select(self.evidence_state(), candidates(3), stage="evidence")
-        self.assertIsNone(result.winner)
-        self.assertFalse(result.verification)
-        self.assertEqual(result.rounds[0]["verification"]["choice"], "yes")
-        self.assertFalse(result.rounds[0]["verification"]["verified"])
+        with self.assertRaisesRegex(SelectionError, "unknown option label"):
+            ChoiceSelector(client).select(self.evidence_state(), candidates(3), stage="evidence")
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(list(client.calls[0]["questions"]), ["evidence_r1_g0", "evidence_r1_confirmation"])
 
     def test_empty_evidence_is_unverified_without_inference(self):
         client = FakeClient()

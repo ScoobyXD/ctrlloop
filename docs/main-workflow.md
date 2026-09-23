@@ -1,5 +1,12 @@
 # Main workflow
 
+> **Temporary experiment:** The synthetic `none` options and the evidence prompt's
+> "Choose none" sentence are commented out in `src/selection.py`. Every nonempty
+> group now advances one supplied candidate, with at most ten options per group.
+> Singleton control/evidence rounds still run, including settling questions and
+> the final yes/no verification. References to `none` below describe the baseline
+> behavior to restore after the experiment.
+
 This is the authoritative explanation of the basic Jev-driven control loop in
 `src/pipeline.py`, its selector, reporter, and CLI. [Reading run timings](timing.md)
 maps the workflow to report fields. Every run selects a control, delivers its CUA

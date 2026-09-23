@@ -163,7 +163,7 @@ class PipelineTests(unittest.TestCase):
         # Multiple independent questions are combined before advancing a round.
         self.assertTrue(any(len(call["questions"]) > 1 for call in client.calls))
 
-    def test_no_real_windows_judges_virtual_search_against_none_without_window_read(self):
+    def test_no_real_windows_judges_virtual_search_without_none_or_window_read(self):
         result, driver, client = self.run_observation({}, windows=[])
         self.assertEqual(result.status, "selected")
         self.assertEqual(result.window["title"], "Start Menu")
@@ -172,7 +172,7 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(result.control["synthetic"])
         self.assertEqual(result.selections["windows"], [])
         self.assertEqual(result.selections["controls"][0]["groups"][0]["options"],
-                         [START_MENU_SEARCH_KEY, NONE_KEY])
+                         [START_MENU_SEARCH_KEY])
         self.assertEqual(driver.calls, [("list_windows",)])
         self.assertEqual(len(client.calls), 1)
 
@@ -335,15 +335,15 @@ class PipelineTests(unittest.TestCase):
         result, _, client = self.run_observation({"snapshot_id": "s", "elements": [minimal, nullable]})
         self.assertIs(result.control, nullable)
         descriptions = next(iter(client.calls[-1]["questions"].values())).criteria
-        self.assertIn(NONE_KEY, descriptions)
-        self.assertEqual({key: value for key, value in descriptions.items() if key != NONE_KEY},
+        self.assertNotIn(NONE_KEY, descriptions)
+        self.assertEqual(descriptions,
                          {"control_0": {"role": "text"}, "control_1": {"role": "button"}})
 
-    def test_single_observed_control_is_judged_against_none_and_result_is_json_serializable(self):
+    def test_single_observed_control_is_judged_without_none_and_result_is_json_serializable(self):
         result, _, client = self.run_observation({"snapshot_id": "s", "elements": [make_element()]})
         self.assertEqual(result.status, "selected")
         self.assertEqual(len(client.calls), 2)
-        self.assertEqual(result.selections["controls"][0]["groups"][0]["options"], ["control_0", NONE_KEY])
+        self.assertEqual(result.selections["controls"][0]["groups"][0]["options"], ["control_0"])
         self.assertEqual(result.selections["windows"][0]["candidate_count"], 2)
         self.assertTrue(all(key.startswith("windows_") for key in client.calls[0]["questions"]))
         self.assertEqual(json.loads(json.dumps(result.to_dict()))["snapshot_id"], "s")

@@ -17,8 +17,9 @@ Activation failures stop the run; native results are retained in the report.
 Selection retains identities in Python. Click execution uses the control's
 existing snapshot-bound target and CUA's default background delivery. The loop
 captures fresh controls after the action and uses the same group-selection
-machinery to narrow evidence. Every control/evidence group includes `none` so Jev
-can reject unsuitable candidates. It does not add automatic click escalation,
+machinery to narrow evidence. For the current experiment, synthetic `none` options
+are commented out; every group selects a supplied candidate. The final yes/no
+verification still runs. It does not add automatic click escalation,
 coordinate fallback, typing, additional waits, or action retries.
 
 The Start Menu route is available even when the real menu is closed. An observed
@@ -30,7 +31,7 @@ driver errors remain errors.
 Both Start Menu and Search records have `synthetic: true`. Search has role `Edit`,
 `input_type: "text"`, and semantic target `windows_start_menu_search`. It has no
 invented PID, window handle, element index/token, geometry, or snapshot identity.
-Search is judged against `none`, as with any other single control candidate.
+Search still receives a selection round, as with any other single control candidate.
 
 A synthetic selection returns `no_action`: it has no live click
 target. Opening Start, resolving its search field, and typing are deferred.

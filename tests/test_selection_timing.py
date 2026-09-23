@@ -73,7 +73,7 @@ class SelectionTimingTests(unittest.TestCase):
                     {key: value for key, value in question.criteria.items() if key != NONE_KEY},
                     {key: descriptions[key] for key in question.criteria if key != NONE_KEY},
                 )
-                self.assertIn("None of these candidates", question.criteria[NONE_KEY])
+                self.assertNotIn(NONE_KEY, question.criteria)
         self.assertEqual([len(call["questions"]) for call in timed.calls], [5, 1])
         starts, finishes = self.assert_paired(events)
         self.assertTrue(all(e["status"] == "ok" for e in finishes.values()))
@@ -132,7 +132,7 @@ class SelectionTimingTests(unittest.TestCase):
             events = self.events(report)
         self.assertEqual(len(wire_calls), 2)
         self.assertEqual(len(wire_calls[0]["questions"]), 3)
-        self.assertEqual(list(wire_calls[0]["questions"]["controls_r1_g2"]["criteria"]), ["candidate_0020", NONE_KEY])
+        self.assertEqual(list(wire_calls[0]["questions"]["controls_r1_g2"]["criteria"]), ["candidate_0020"])
         self.assertEqual(list(wire_calls[1]["questions"]), ["controls_r2_g0"])
         starts, _ = self.assert_paired(events)
         requests = [e for e in events if e["event"] == "jev_request"]
@@ -149,9 +149,9 @@ class SelectionTimingTests(unittest.TestCase):
             self.assertEqual(starts[api_call["sdk_span_id"]]["round_id"], request["round_id"])
             for answer in response["body"]["answers"].values():
                 self.assertIn("probabilities", answer)
-                self.assertIn(NONE_KEY, answer["probabilities"])
+                self.assertNotIn(NONE_KEY, answer["probabilities"])
 
-    def test_evidence_http_final_batch_preserves_state_none_confirmation_and_trace(self):
+    def test_evidence_http_final_batch_preserves_state_confirmation_and_real_only_trace(self):
         wire_calls = []
         state = {
             "original_request": ORIGINAL, "iteration": 2,
@@ -200,7 +200,7 @@ class SelectionTimingTests(unittest.TestCase):
             for key, question in call["questions"].items():
                 self.assertNotIn("settling", key)
                 if not key.endswith("_confirmation"):
-                    self.assertIn(NONE_KEY, question["criteria"])
+                    self.assertNotIn(NONE_KEY, question["criteria"])
         confirmation = wire_calls[-1]["questions"]["evidence_r2_confirmation"]
         self.assertEqual(confirmation["instructions"]["question"], EVIDENCE_CONFIRMATION_QUESTION)
         self.assertEqual(confirmation["instructions"]["evidence_candidates"], {
@@ -220,7 +220,7 @@ class SelectionTimingTests(unittest.TestCase):
             self.assertEqual(starts[api_call["sdk_span_id"]]["stage"], "evidence")
         final_trace = result.rounds[-1]["api_call"]
         self.assertEqual(final_trace["answers"]["evidence_r2_confirmation"]["probabilities"], {"yes": 1.0, "no": 0.0})
-        self.assertIn(NONE_KEY, final_trace["answers"]["evidence_r2_g0"]["probabilities"])
+        self.assertNotIn(NONE_KEY, final_trace["answers"]["evidence_r2_g0"]["probabilities"])
         state["last_control"]["status"] = "verified"
         self.assertEqual(final_trace["state"]["last_control"]["status"], "unverified")
         self.assertEqual(requests[-1]["body"]["state"]["last_control"]["status"], "unverified")
@@ -323,7 +323,7 @@ class SelectionTimingTests(unittest.TestCase):
                     {e["operation"] for e in starts.values()}, {"selection", "selection.validation"},
                 )
 
-    def test_singleton_control_has_one_timed_inference_against_none(self):
+    def test_singleton_control_still_has_one_timed_inference_without_none(self):
         client = FakeClient()
         with RunReport(self.path) as report:
             result = ChoiceSelector(client).select(
@@ -332,7 +332,7 @@ class SelectionTimingTests(unittest.TestCase):
             starts, finishes = self.assert_paired(self.events(report))
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(len(result.rounds), 1)
-        self.assertEqual(result.rounds[0]["groups"][0]["options"], ["candidate_0000", NONE_KEY])
+        self.assertEqual(result.rounds[0]["groups"][0]["options"], ["candidate_0000"])
         sdk = [event for event in starts.values() if event["operation"] == "selection.sdk_call"]
         self.assertEqual(len(sdk), 1)
         self.assertEqual(sdk[0]["question_keys"], ["controls_r1_g0"])

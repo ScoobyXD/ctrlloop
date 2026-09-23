@@ -72,7 +72,7 @@ class ClickPipelineTests(unittest.TestCase):
             "element_index": 901, "snapshot_id": "snapshot:chosen",
         })
         self.assertEqual(len(transport.calls), 4)
-        self.assertEqual(len(client.calls), 2)  # A singleton control still competes with none.
+        self.assertEqual(len(client.calls), 2)  # Singleton controls still receive a selection question.
 
     def test_selection_stage_can_be_inspected_before_dispatch(self):
         driver, transport, client = self.set_up_run()
