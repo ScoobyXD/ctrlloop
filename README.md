@@ -8,7 +8,8 @@ The pipeline dispatches that native CUA action, waits for the app to settle,
 and starts the next selection from fresh observations.
 Choosing Windows Search instead sends desktop **Win+S**, then directly types the
 query resolved before activation. An explicit `--text` supplies the exact Search
-query; otherwise Jev selects words from the original request in one batched call.
+query; otherwise Jev selects words from the original request in one text stage,
+using one call when it fits the byte budget or parallel calls when needed.
 The Win+S-to-typing handoff has no intervening observation,
 confirmation, sleep, control selection, or Jev call. The next iteration observes
 the real search results.
@@ -95,7 +96,8 @@ This example is not enabled by default. Window keys must be nonempty and unique;
 `window_` is reserved for discovered windows. Control keys must be nonempty and
 unique within their window. Duplicate or reserved keys fail at registry creation.
 A custom synthetic control still needs a Jev selection; multiple controls
-use the same selection rounds, with up to 400 control candidates per API call. A definition with no controls returns
+use the same selection rounds, with whole questions packed into parallel calls
+when the complete body exceeds 90,000 bytes. A definition with no controls returns
 `no_controls` unless it has a direct route, as Windows Search does. Custom
 synthetic controls without native targets return `no_action`. Passing
 `SyntheticRegistry(())` disables synthetic options and their replacement rules.
@@ -179,7 +181,7 @@ The source modules live directly in `src/` and feed into `src/main.py`:
 - `driver.py` discovers and activates windows, reads accessibility state, and dispatches native clicks, hotkeys, and text entry.
 - `cua_mcp.py` owns the request's MCP connection, framing, timeouts and client cleanup.
 - [`jev_questions.py`](src/jev_questions.py) holds the authored selection, action, timer, and word-inclusion questions; edit the wording here.
-- `selection.py` batches group questions into Jev calls capped at 400 control candidates, then advances the round's selected candidates together.
+- `selection.py` packs whole questions into HTTP bodies of at most 90,000 bytes, sends a round's calls in parallel, then advances its selected candidates together.
 - `synthetic.py` defines synthetic windows, their controls, and duplicate-matching rules.
 - `pipeline.py` repeats window selection and real control click/text actions or direct Windows Search actions within the iteration limit.
 - `reporting.py` buffers events and actual Jev HTTP bodies, then saves the report and separate input/output files on a worker at the end.
@@ -297,7 +299,7 @@ Reports contain these milestones:
 - `jev_request`: the actual JSON body captured by the HTTP client's request hook
   after SDK serialization and before network access, plus a request ID, URL, method,
   and byte count. Its `body` contains the exact JSON fields and values sent to Jev,
-  including every group question and candidate description for the round. JSON
+  including every group question and candidate description in that batch. JSON
   whitespace is
   normalized by the report writer; this is not a dump of Python object internals.
 - `jev_response`: the response body before SDK/selection validation, associated
@@ -331,7 +333,8 @@ Search's `type_text`. Native return and any settling follow that boundary. The `
 duration differs from this dispatch-bounded loop duration.
 See [reading run timings](docs/timing.md)
 for event correlation, bottleneck inspection, and measurement limits. Group
-questions in each batch share one observed API call duration; native action return
+questions in each batch share one observed API call duration. Parallel durations
+overlap, so their sum is not the round's elapsed time; native action return
 latency does not establish a visible UI change or completion of the original request.
 
 The reporter retains each event in memory without serializing or copying the
@@ -382,19 +385,23 @@ order. Regroup survivors in tens for the next round.
 
 Only a singleton window bypasses selection. A singleton control still receives
 the selection question, with action and timers when executable. For 1,000 control candidates,
-the round counts are `1000 -> 100 -> 10 -> 1`: three calls, then one, then one,
-for five control calls in total. Group size ten is fixed.
+the round counts are `1000 -> 100 -> 10 -> 1`. Prepared body sizes determine
+the number of API calls per round. Group size ten is fixed.
 
 Authored questions `QUESTION`, `ACTION`, `TIMER`, and `TEXT_WORD` live in
 [`src/jev_questions.py`](src/jev_questions.py). `QUESTION` is reused for all window
-and control narrowing rounds and final selections. The final control call also
+and control narrowing rounds and final selections. The final control round also
 includes an `ACTION` click-versus-`type_text` Choice
 for every finalist and a separate hypothetical `TIMER` for each action per
-finalist. Consume only the winning control's action and matching timer.
+finalist. Include all those questions before packing the round into one or more
+calls. Consume only the winning control's action and matching timer after every
+batch succeeds.
 
 The original request is split once into whitespace-delimited words with original
-character offsets. When text is needed, one further API call asks one Noul per
-word, including all words together and using the selected destination as context.
+character offsets. When text is needed, one text stage asks one Noul per word,
+including all words and using the selected destination as context. The same
+90,000-byte budget applies: use one API call when it fits, otherwise parallel
+batches of whole Noul questions. All answers must validate before text is assembled.
 Words whose inclusion probability exceeds 0.5 are included. The chosen positions
 must form one nonempty continuous phrase; code copies its exact original substring,
 preserving punctuation and internal whitespace. Empty or scattered selections
@@ -429,24 +436,26 @@ the full observed records remain local and the original prompt is never shortene
 Selection does not send PID, HWND, snapshot token, screenshot, or a redundant full
 tree as state.
 
-**Control selection sends at most 400 candidates per API call, in groups of 10.**
-Larger rounds send consecutive batches in observed order: the first 400 controls,
-then the next 400, then any remainder. Window rounds use one call. The next round
-starts after all batch responses are processed, because it needs every group's
-winner. For 392 control candidates, the rounds are
-`392 -> 40 -> 4 -> 1`: 40 group questions in one call, then four in one call,
-then one in one call, for three control calls in total.
+**Every window/control round and text stage first prepares its complete HTTP body through the SDK.**
+If it is at most **90,000 bytes**, send one call. Otherwise, preserve question
+order and pack the largest contiguous batches of whole questions that fit,
+counting shared state and the envelope in each body. Each batch repeats the
+same frozen state for the round. A thread pool sends the batches concurrently
+through the shared SDK client. Collect validated answers by their existing
+question IDs, then advance winners in original group order after all batches
+succeed. Text selection uses the same packer and dispatch path, collecting every
+word's Noul answer before applying inclusion decisions. No candidates or words
+are dropped, and multiple calls remain one round or text stage.
 
-For 631 controls, round 1 sends 400 candidates in 40 groups, then 231 in 24 groups.
-The 64 group winners combine for round 2; the rounds are `631 -> 64 -> 7 -> 1`,
-using two calls, then one, then one: four control calls in total. No candidate
-is dropped to meet the cap.
+For 392 controls, the rounds are `392 -> 40 -> 4 -> 1`; for 631 controls, they
+are `631 -> 64 -> 7 -> 1`. Body sizes determine the API call count in each round.
 
-Only the last of those control calls adds the action Choice and two hypothetical
+Only the final control round adds the action Choice and two hypothetical
 `TIMER` questions per finalist. The
 exact choices are `<50ms`, `100ms`, `200ms`, `300ms`, `400ms`, and `>500ms`, mapped
-in code to 50, 100, 200, 300, 400, and 500 ms. All timers share the final
-selection API call; only the winning candidate/action's interval is consumed. After CUA
+in code to 50, 100, 200, 300, 400, and 500 ms. Include action and timer questions
+before sizing the final round; they may occupy different parallel calls. Only
+the winning candidate/action's interval is consumed. After CUA
 returns, the loop waits that interval before the next iteration's fresh window
 and control observations. The final permitted action has no following wait.
 Windows Search skips control selection and timers entirely and starts the next
@@ -454,11 +463,15 @@ iteration after typing returns, without a settling wait.
 See the
 [main workflow](docs/main-workflow.md) for details.
 
-There is no byte-based request splitting or request-budget CLI configuration.
-Actual service limits still apply; the 400-candidate cap is not a token guarantee.
-An oversized batch fails explicitly without automatic smaller retries or removing
-candidates. Actual input/output token usage is retained for every call in the
-round's `api_calls` list. See
+The fixed **90,000-byte** budget has no CLI configuration. It counts the complete
+SDK-prepared HTTP body, equivalent to `len(request.content)` before transport;
+indented report-file sizes differ. Local sizing sends no API requests. Service
+token limits still apply. Automatic rejection retries, description compaction,
+and splitting an individual question are outside this implementation. If shared
+state plus one atomic group/action/timer/Noul question cannot fit, the entire
+round or text stage fails before any of its calls are dispatched.
+Actual input/output token usage and prepared body bytes are retained for every
+call in the round's `api_calls` list. See
 [main workflow](docs/main-workflow.md) for the workflow and timing contract.
 
 Returned model identity, question keys, answer type, option labels, probability

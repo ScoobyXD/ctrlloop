@@ -17,16 +17,49 @@ The workflow keeps its authored question definitions in
 - `ACTION` selects `click` or `type_text` for each final control candidate.
 - `TIMER` estimates the additional settling interval for a possible action.
   Separate hypothetical click and text timers accompany each finalist in the
-  final control-selection request.
+  final control-selection round, before request sizing and packing.
 - `TEXT_WORD`, a Noul, asks whether each source word belongs in the text for the
-  current destination. All words are asked together in one additional API call
-  only when text needs to be resolved.
+  current destination. All words are evaluated in one text stage only when text
+  needs to be resolved. Its whole questions use the same request budget and
+  parallel batching as window/control selection.
 
 Question definitions are reused as needed. A round with 40 groups still
-contains 40 instances of the selection question, all sent in one API call.
+contains 40 instances of the selection question, sent in one API call if the
+complete body fits the 90,000-byte budget, otherwise in parallel batches.
 There is no evidence-selection stage, action-confirmation question, or automatic
 completion judgment. Reaching the iteration limit does not assert that the
 user's request has been fulfilled.
+
+## Jev request budget
+
+**The application budget is 90,000 bytes per Jev API call, inclusive.** This is
+decimal **90 KB**, not 90 KiB. A prepared body of 90,000 bytes fits; 90,001 bytes
+exceeds the budget. `REQUEST_BUDGET_BYTES` in `src/selection.py` fixes this value;
+there is no request-budget CLI setting.
+
+Prepare the complete HTTP body locally through the pinned SDK's existing
+request builder, then count its encoded bytes. This is the same body measured
+as `len(request.content)` before transport. Count shared state, the model and
+JSON envelope, question IDs, instructions, candidate criteria, every final
+control action/timer, and every word Noul in the text stage. Each call repeats
+its state and envelope, so count those bytes
+again for each call. HTTP headers and transport framing are outside the budget.
+Indented report-file sizes differ from the outgoing HTTP body sizes. Local sizing
+sends no API calls and creates no HTTP request events.
+
+Window/control selection and text selection reuse the same packing and parallel
+dispatch helpers. Complete all local packing before dispatching any batch. If
+the shared state plus one whole question exceeds the budget, fail the round or
+text stage before any of its API calls are sent. A question is atomic: do not
+split a Choice group's candidates, remove words, or trim the original request.
+
+The budget comes from a study of 780 successful calls in 38 saved runs:
+7,707,537 reported input tokens across 14,902,182 prepared HTTP body bytes, or
+approximately 1.93346 bytes per input token. Applying that observed ratio to a
+64,000-token reference gives approximately 123,741 bytes; reducing that by 25%
+gives approximately 92,806 bytes, rounded down to **90,000 bytes**. This is an
+application byte budget, not an exact tokenizer or a guarantee of passing Jev's
+token limits. The model remains pinned to `jev-1.13.0`.
 
 ## Vocabulary
 
@@ -36,7 +69,7 @@ user's request has been fulfilled.
 | Group | Up to 10 candidates considered together. |
 | Group question | One instance of `QUESTION` selecting a candidate from a group. |
 | Round | Evaluate all groups, then advance each group's selected candidate after every batch succeeds. |
-| API call | One request with a batch of group questions (up to 400 control candidates), plus final action/timer questions when applicable, or the complete batch of word Nouls. |
+| API call | One request with a batch of whole questions and a complete body of at most 90,000 bytes; questions can be group selections, final action/timers, or source-word Nouls. |
 | Stage | Window discovery/selection, activation, control acquisition/selection, text selection, or action dispatch. |
 | Iteration | One decision cycle with fresh window discovery, selection, observation, and action when available. All calls in the cycle share its iteration number. |
 | Loop boundary for a timeline | Starts at current-state acquisition and ends when the last CUA command is sent: the selected control's click/text action or Windows Search text entry. Native return and any settling appear afterward, before the next loop starts. |
@@ -73,7 +106,7 @@ source spans throughout the run; do not regenerate or rewrite the request.
    final control round, include an action Choice and a hypothetical timer for
    each of `click` and `type_text` per finalist. Consume the winning candidate's
    action and its matching timer.
-6. For `type_text`, resolve the phrase in one batched Noul call while preserving
+6. For `type_text`, resolve the phrase in one Noul text stage while preserving
    previous action/control history. An empty or noncontiguous selection returns
    `no_action`. Immediately before native dispatch, record the selected control,
    action, and source window as the latest attempted action. Execute the selected
@@ -93,7 +126,7 @@ candidates. It uses the existing activation stage for
 `type_text({scope: "desktop", text: <resolved text>})`. Both commands belong
 to the same iteration. This route makes zero control-selection rounds and zero
 timer requests, and adds no settling wait after typing. Without an explicit
-Search override, its one word-selection call occurs before Win+S. The next normal
+Search override, its word-selection stage completes before Win+S. The next normal
 iteration reads fresh state and can select real search results. Real Start and
 Search windows remain observed window candidates; the synthetic route does not
 replace them. After a result click closes Search, the next discovery offers the
@@ -114,8 +147,9 @@ Every window and control request carries the same run context:
 | `last_control` | Previous dispatched control as `{window, control, action}`, or `null` before control dispatch. Retain it during text resolution; update immediately before dispatch. |
 | `last_action` | Previous tool and filtered native delivery/result facts, available after an action attempt. Text entry also retains the exact entered text. |
 
-One mutable dictionary is reused within the run. Each request serializes a
-complete snapshot; this is not a server-side patch protocol. Round traces and
+One mutable dictionary is reused within the run. Each round freezes the current
+state for sizing and parallel dispatch. Each request serializes that complete
+snapshot; this is not a server-side patch protocol. Round traces and
 report events retain historical snapshots so later updates cannot change earlier
 requests. Refreshing the current window must not rewrite the source window
 retained with the previous control.
@@ -133,10 +167,12 @@ the word questions to the existing state.
 1. Divide candidates into groups of up to 10, preserving observed order.
 2. Give every group one `QUESTION` with only its candidates as criteria. There is
    no synthetic `none` response option.
-3. For controls, send consecutive batches of at most **400 candidates** (40 groups)
-   per Jev API call. Keep all window groups in one call. Final control action and
-   timer questions share the final round's single batch.
-4. Retain each selected option, confidence, and probability distribution.
+3. Include final control action/timer questions and prepare the complete HTTP request through
+   the SDK. If it fits within **90,000 bytes**, send one call. Otherwise pack its
+   ordered questions into the largest contiguous batches that fit, keeping every
+   group question whole and counting shared state and the envelope in each body.
+4. Send the batches in parallel. Validate and retain each selected option,
+   confidence, and probability distribution by its existing question ID.
 5. After every batch succeeds, combine one winner per group in group order;
    regroup until one winner remains.
 
@@ -145,27 +181,28 @@ selection question and, for a real window, its action Choice and both timers.
 Every round uses the same
 `QUESTION` wording; observed window context is already in shared state.
 
-| Control round | Candidates entering | Groups / selection questions | API calls | Winners leaving |
-| --- | ---: | ---: | ---: | ---: |
-| 1 | 392 | 40 | 1 | 40 |
-| 2 | 40 | 4 | 1 | 4 |
-| 3 | 4 | 1 | 1 | 1 |
+| Control round | Candidates entering | Groups / selection questions | Winners leaving |
+| --- | ---: | ---: | ---: |
+| 1 | 392 | 40 | 40 |
+| 2 | 40 | 4 | 4 |
+| 3 | 4 | 1 | 1 |
 
-This uses three control calls in total. The final call adds four action Choices
-and eight hypothetical timers, for 13 questions in that request. If text wins,
-one additional call selects the words. Window selection with 17 candidates adds two calls: 17 become
+This uses three control rounds. The final round adds four action Choices and
+eight hypothetical timers, making 13 questions to measure before packing.
+Each round uses one call if its complete body fits, or parallel calls if it needs
+multiple batches. If text wins, the text stage also uses one or more calls under
+the same budget. Window selection with 17 candidates adds two rounds: 17 become
 two winners, then one. The next iteration begins new window/control rounds.
 
-For 631 controls, round 1 sends the first 400 candidates in 40 groups and the
-remaining 231 in 24 groups, using two sequential API calls. All 64 winners enter
-round 2 together, then seven enter the final round: four control calls in total.
-For 647 controls, the first round sends 400 and 247 candidates in 40 and 25 groups.
-The rounds are `647 -> 65 -> 7 -> 1`, also using four control calls in total.
-For 1,000 controls, the first round sends 400, 400, and 200 candidates. The rounds
-are `1000 -> 100 -> 10 -> 1`, using three calls, then one, then one: five control
-calls in total. Larger rounds require further batches, each capped at 400 candidates.
+For 631 controls, the rounds are `631 -> 64 -> 7 -> 1`; for 647, they are
+`647 -> 65 -> 7 -> 1`; for 1,000, they are `1000 -> 100 -> 10 -> 1`.
+The prepared byte sizes determine API call boundaries, not a fixed candidate
+count. Multiple calls within a round remain one round.
 
-Questions within one call are independent. Later rounds depend on all earlier
+The shared SDK client dispatches batches through a thread pool. All batches are
+submitted before waiting; the pool bounds the number in flight. Answers may
+arrive in any order, but question IDs preserve their original group membership.
+Questions within a round are independent. Later rounds depend on all earlier
 group winners and start only after every batch response is validated. If any
 batch fails, selection stops before advancing or acting on partial results.
 Candidates are not silently removed.
@@ -176,9 +213,10 @@ Each finalist receives an action Choice between `click` and `type_text`, using
 its capabilities and the user's intended next step. Each also receives two
 instances of `TIMER`: one assuming a click, one assuming text entry. Structured
 context identifies the candidate, observed description, hypothetical action, and
-app/window. These questions cannot rely on each other's answers in the same
-batch. Retain all responses but consume only the winning candidate's action and
-the corresponding timer. This follows the existing
+app/window. Include them all before byte sizing; they may be packed into
+different parallel calls. Questions cannot rely on other answers from this
+round. Retain all responses but consume only the winning candidate's action and
+the corresponding timer after every batch validates. This follows the existing
 [speculative fan-out pattern](https://docs.typesafe.ai/patterns/fan-out).
 
 | Choice option | Scheduled wait (milliseconds) |
@@ -199,9 +237,14 @@ iteration. No wait follows the last permitted action.
 
 Text resolution reuses the original request's ordered word spans. One Noul per
 word asks whether it belongs in the text for the selected control or Windows
-Search destination, with the original request and current action context. Send
-all those questions in **one API call**, not one call per word. No text call is
-needed after a click choice or for an explicit Windows Search `--text` override.
+Search destination, with the original request and current action context.
+Evaluate **all source words in one text stage**, using the same complete-body
+byte sizing, whole-question packing, and parallel dispatch helpers as selection.
+A small request uses one API call. If it exceeds 90,000 bytes, pack its Nouls into
+parallel calls, each counting the full shared state and envelope. No word is
+omitted, and words are not converted into ten-word Choice groups. Collect and
+validate every batch before deciding inclusion or dispatching text. No text call
+is needed after a click choice or for an explicit Windows Search `--text` override.
 
 A word is included when its Noul probability exceeds 0.5. Accept only a nonempty
 contiguous sequence of included positions; scattered words or no words leave the
@@ -209,8 +252,9 @@ action unresolved. Code copies the exact substring from the first selected
 word's start to the last selected word's end. This preserves internal whitespace,
 punctuation, URLs, and repeated-word identity through offsets. It does not remove
 quotes or punctuation, assemble multiple separated phrases, infer a URL from a
-site name, or generate text absent from the request. A provider-size failure
-remains an error; it does not silently split or truncate the word batch.
+site name, or generate text absent from the request. Local byte packing happens
+before requests are sent; a later provider rejection remains an error, without
+automatic smaller retries or truncation.
 
 For an observed control, the existing adapter sends native `type_text` with the
 same snapshot-bound target used for clicking. CUA Driver 0.28.2's Windows
@@ -229,7 +273,8 @@ Windows Search keeps its existing desktop action and observation behavior.
 The selected native tool is retained as `Selection.action`. Final control traces
 store `actions[candidate]` with its question key and chosen tool, and
 `settling[candidate][action]` with its question key, Choice answer, and
-milliseconds. The text stage uses the same `Selection` and `api_calls` records;
+milliseconds. The text stage uses the same `Selection` and `api_calls` records,
+including packing, batch, and prepared `body_bytes` information;
 its trace adds `selected_indices`, `selected_offsets`, `source_span`, `text`, and
 an unresolved `reason` when applicable. Word-selection rounds are separate from
 window/control rounds and do not use groups-of-ten elimination.
@@ -278,7 +323,7 @@ delivery, not screen readiness or completion.
 | Description size | App/title/control text capped at 240 characters; up to two indexed ancestors with 120-character labels. Original request and source records remain intact. |
 | Jev timeout/retries | 30-second HTTP timeout configuration, zero automatic retries; not a total run deadline. |
 | CUA timeout/retries | 60-second deadline per transport attempt including lazy startup; reads may reconnect/retry once, actions are not replayed. |
-| Batching | Up to 10 candidates per group; at most 400 control candidates per call; window rounds use one call; action/timers only in final control call; all word Nouls together in one text call. |
+| Batching | Up to 10 window/control candidates per group; all stages pack whole questions into complete HTTP bodies of at most 90,000 bytes and dispatch parallel batches; action/timers included before sizing the final control round; one Noul per source word. |
 | Settling | One 50–500 ms scheduled wait after a control click or confirmed targeted text action when another iteration follows; none on the Windows Search route. |
 | Iterations | Positive bound, default 10; no automatic completion judgment. |
 | Model | Exact pin `jev-1.13.0`, validated on every response. |
@@ -290,10 +335,12 @@ Controls require structured indexed observations and snapshot identities. Action
 use an observed element token or an element index with its snapshot ID. Old
 targets are cleared before new observation; stale failures are not replayed.
 
-There is no local token cap, byte-packing heuristic, or total runtime cap.
+There is no local token cap or total runtime cap.
 Provider limits apply to shared state plus questions; see
 [TypeSafe model documentation](https://docs.typesafe.ai/models). Observation and
-text bounds and the 400-candidate cap do not guarantee a batch fits those limits.
+text bounds and the 90,000-byte cap do not guarantee a batch fits those limits.
+Automatic token-limit retries, description compaction, and splitting an
+oversized individual question are outside this implementation.
 
 ## Timing and reporting
 
@@ -308,6 +355,9 @@ and service work; it excludes request construction and response decoding. It is
 client-observed duration, not isolated inference time. All questions in a batch
 share that call's duration. Each round retains an `api_calls` list, including
 single-call rounds, with separate answers, usage, and timing references per call.
+Each call also records its prepared `body_bytes`. `selection.packing` measures
+local SDK preparation and sizing. Parallel call durations overlap, so their sum
+is not the round's elapsed time.
 
 Each cycle retains iteration, selections, native results, rounds, and route.
 Windows Search records both `hotkey` and `type_text` action events and timings
