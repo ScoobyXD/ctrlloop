@@ -72,6 +72,17 @@ class SyntheticRegistry:
 WINDOWS_SEARCH_KEY = "windows_search"
 
 
+def is_visible_windows_search(window: Mapping[str, Any]) -> bool:
+    """Recognize the live Search destination without replacing its native record."""
+    return (
+        not window.get("synthetic")
+        and str(window.get("app_name", "")).casefold() == "searchhost.exe"
+        and str(window.get("title", "")).casefold() == "search"
+        and window.get("is_on_screen") is True
+        and window.get("minimized") is not True
+    )
+
+
 WINDOWS_SEARCH = SyntheticWindow(
     window=Candidate(
         WINDOWS_SEARCH_KEY,

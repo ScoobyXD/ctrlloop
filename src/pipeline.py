@@ -10,12 +10,12 @@ if __package__:
     from .driver import DriverError
     from .reporting import RunReport
     from .selection import Candidate, ChoiceSelector
-    from .synthetic import DEFAULT_REGISTRY, WINDOWS_SEARCH_KEY, SyntheticRegistry
+    from .synthetic import DEFAULT_REGISTRY, WINDOWS_SEARCH_KEY, SyntheticRegistry, is_visible_windows_search
 else:
     from driver import DriverError
     from reporting import RunReport
     from selection import Candidate, ChoiceSelector
-    from synthetic import DEFAULT_REGISTRY, WINDOWS_SEARCH_KEY, SyntheticRegistry
+    from synthetic import DEFAULT_REGISTRY, WINDOWS_SEARCH_KEY, SyntheticRegistry, is_visible_windows_search
 
 
 DEFAULT_MAX_ITERATIONS = 10
@@ -60,10 +60,18 @@ def _text(value: Any, limit: int = 240) -> str | None:
 def window_candidates(
     windows: Sequence[dict[str, Any]], *, synthetic: SyntheticRegistry = DEFAULT_REGISTRY,
 ) -> list[Candidate]:
-    candidates = synthetic.windows()
-    for index, window in enumerate(windows):
-        if synthetic.replaces(window):
-            continue
+    # Search is transient: offer the opener only when fresh discovery has no
+    # visible destination. Keep the real window and its native identifiers.
+    observed = [
+        (index, window) for index, window in enumerate(windows)
+        if not synthetic.replaces(window)
+    ]
+    search_visible = any(is_visible_windows_search(window) for _, window in observed)
+    candidates = [
+        candidate for candidate in synthetic.windows()
+        if not _is_windows_search(candidate.record) or not search_visible
+    ]
+    for index, window in observed:
         description = {}
         for name in ("app_name", "title"):
             if value := _text(window.get(name)):
@@ -189,6 +197,16 @@ def _search_windows(state, result, driver, report, text):
     if text is None:
         result.status = "no_action"
         result.reason = "Windows Search requires exact text; supply --text or run_pipeline(text=...)."
+        if report is not None:
+            report.append("action_skipped", reason=result.reason)
+        return
+    last_action = state.get("last_action", {})
+    if last_action.get("tool") == "type_text" and last_action.get("text") == text:
+        result.status = "observation_unavailable"
+        result.reason = (
+            "Windows Search was not observed after the previous identical query. "
+            "The launch and text were not replayed; inspect the current state before trying again."
+        )
         if report is not None:
             report.append("action_skipped", reason=result.reason)
         return

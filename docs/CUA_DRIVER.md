@@ -158,8 +158,11 @@ If the synthetic Windows Search window wins, its activation stage instead sends
 intervening observation, confirmation, sleep, control search, or Jev call. Both
 commands use the same MCP client and iteration; the next iteration observes the
 real search results without a settling wait. Real Start/Search windows remain
-available to normal window and control selection. The adapter retains each
-native result, and uncertain input is never replayed.
+available to normal window and control selection. A freshly observed visible
+Search destination suppresses the synthetic opener until it closes. If Search
+is not observed and the opener wins again immediately after the identical query,
+the pipeline returns `observation_unavailable` without another hotkey or typing
+call. The adapter retains each native result, and uncertain input is never replayed.
 
 Supply the exact query with `--text` or `run_pipeline(..., text=...)`; the app
 does not extract it from the request. Valid strings are preserved verbatim,

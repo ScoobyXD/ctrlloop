@@ -44,7 +44,9 @@ an action is a stopped cycle, not a completed click.
 
 1. Keep the user's exact original request in state and set this iteration number.
 2. Discover windows and build their candidate descriptions. Refresh the previous
-   current window if still observed; otherwise clear it.
+   current window if still observed; otherwise clear it. A visible, non-minimized
+   `SearchHost.exe` window titled `Search` suppresses its synthetic opener, keeping
+   the real window available for selection. Recompute this on every discovery.
 3. Select the next window with `QUESTION`. This happens again every iteration,
    allowing the next action to move to another window.
 4. For Windows Search, send desktop Win+S, then immediately send desktop
@@ -52,6 +54,8 @@ an action is a stopped cycle, not a completed click.
    (or return `iteration_limit` at the configured bound). No control read,
    control selection, timer, observation, confirmation, or sleep intervenes.
    Without supplied text, return `no_action` before either native command.
+   If the previous action was typing the identical Search query and Search was
+   not observed, return `observation_unavailable` without replaying either command.
    For a real window, bring it forward and read its accessibility tree.
    Preserve the observation identities needed to execute the selected control.
 5. Build control candidates once and narrow them with `QUESTION`. Include one
@@ -74,7 +78,11 @@ to the same iteration. This route makes zero control-selection rounds and zero
 timer requests, and adds no settling wait after typing. The next normal
 iteration reads fresh state and can select real search results. Real Start and
 Search windows remain observed window candidates; the synthetic route does not
-replace them.
+replace them. After a result click closes Search, the next discovery offers the
+opener again. The existing `last_action` protects against consecutive identical
+launch/type actions when the destination cannot be observed; a control click
+replaces that state, and a new run starts with no previous action. This is an
+observation failure stop, not a permanent ban on searching again.
 
 ## Shared Jev state
 

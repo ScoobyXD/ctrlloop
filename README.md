@@ -24,10 +24,14 @@ every group selects a supplied candidate. It does not add automatic click escala
 coordinate fallback, additional waits, or action retries. Text entry is currently
 limited to the direct Windows Search route.
 
-Windows Search is available even when Search is closed. Real Start and Search
-windows retain their observed order and identity, so subsequent iterations can
-select their real controls. Successful empty window discovery still leaves
-Windows Search available; driver errors remain errors.
+The synthetic Windows Search opener is available when fresh discovery has no
+visible `SearchHost.exe` window titled `Search`. While that destination is open,
+only its real window is offered, preserving its observed order and native identity
+for control selection. Closing Search makes the opener available again.
+If the opener is selected immediately after the same query was typed and Search
+was not observed, the run stops with `observation_unavailable` instead of sending
+Win+S and typing again. An intervening control click or a new run permits a later
+search; there is no permanent one-shot flag. Driver errors remain errors.
 
 The Windows Search window record has `synthetic: true` and no invented PID,
 window handle, control, geometry, or snapshot identity. It has no control
@@ -354,7 +358,8 @@ VS Code's graphical breakpoints. See the [VS Code Python debugger guide](https:/
 
 ## Selection contract
 
-Windows Search is prepended to the first-stage options. Real windows preserve
+When no visible Search destination is observed, its synthetic opener is prepended
+to the first-stage options. Real windows preserve
 the driver's observed order, as do controls from real snapshots. Each group
 contains at most ten candidates and receives one Jev Choice question using
 `QUESTION`. Each group selects one supplied candidate, which advances in group
