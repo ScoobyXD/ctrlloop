@@ -1,8 +1,6 @@
-"""Native dispatch stage checks through the real adapter and an offline CLI runner."""
+"""Native dispatch stage checks through the real adapter and an offline MCP transport."""
 
 from copy import deepcopy
-import json
-import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -10,7 +8,7 @@ from src.driver import CuaDriver, DriverError
 from pipeline_fixtures import select_once
 from src.selection import ChoiceSelector, PINNED_MODEL
 from src.synthetic import START_MENU_KEY
-from test_driver import FakeRunner, element, state, window, foreground_result
+from test_driver import FakeTransport, element, state, window, foreground_result, tool_result
 from test_pipeline import ChoosingClient, RecordingReport
 
 
@@ -21,22 +19,22 @@ ACTION_RESULT = {
 
 class ClickPipelineTests(unittest.TestCase):
     def set_up_run(self, *, snapshot=None, windows=None, action_result=None, preferred_key=None):
-        runner = FakeRunner(
+        transport = FakeTransport(
             {"windows": [window()] if windows is None else windows},
             foreground_result((windows or [window()])[-1]),
             state(elements=[element(element_token="observed-token")]) if snapshot is None else snapshot,
             ACTION_RESULT if action_result is None else action_result,
         )
-        driver = CuaDriver(executable="fake-cua", runner=runner)
+        driver = CuaDriver(executable="fake-cua", transport=transport)
         client = ChoosingClient(preferred_key=preferred_key)
-        return driver, runner, client
+        return driver, transport, client
 
     def test_selected_records_dispatch_one_token_click_after_the_only_snapshot(self):
         selected_window = window(pid=4243, window_id=123457, title="Second editor")
         selected_control = element(element_index=901, element_token="observed-token:901", label="Save")
         snapshot = state(pid=4243, window_id=123457, elements=[element(), selected_control])
         native_result = {**ACTION_RESULT, "native_detail": {"retained": True}}
-        driver, runner, client = self.set_up_run(
+        driver, transport, client = self.set_up_run(
             windows=[window(), selected_window], snapshot=snapshot, action_result=native_result,
         )
         request = "  Click Save.\r\nKeep this wording. "
@@ -48,13 +46,10 @@ class ClickPipelineTests(unittest.TestCase):
         self.assertEqual(result.window, selected_window)
         self.assertEqual(result.control, selected_control)
         self.assertEqual(result.snapshot_id, snapshot["snapshot_id"])
-        self.assertEqual([call[0] for call in runner.calls], [
-            ["fake-cua", "call", "list_windows"],
-            ["fake-cua", "call", "bring_to_front"],
-            ["fake-cua", "call", "get_window_state"],
-            ["fake-cua", "call", "click"],
+        self.assertEqual([call[0] for call in transport.calls], [
+            "list_windows", "bring_to_front", "get_window_state", "click",
         ])
-        self.assertEqual(json.loads(runner.calls[-1][1]["input"]), {
+        self.assertEqual(transport.calls[-1][1], {
             "pid": 4243, "window_id": 123457, "element_token": "observed-token:901",
         })
         self.assertEqual(len(client.calls), 2)
@@ -65,33 +60,33 @@ class ClickPipelineTests(unittest.TestCase):
         self.assertEqual(result.to_dict()["action_result"], native_result)
 
     def test_index_fallback_keeps_the_exact_snapshot_and_sparse_element_index(self):
-        driver, runner, client = self.set_up_run(snapshot=state(
+        driver, transport, client = self.set_up_run(snapshot=state(
             snapshot_id="snapshot:chosen", elements=[element(element_index=901, element_token=None)],
         ))
 
         result = select_once("Click Save", driver, ChoiceSelector(client), deliver_click=True)
 
         self.assertEqual(result.status, "action_returned")
-        self.assertEqual(json.loads(runner.calls[-1][1]["input"]), {
+        self.assertEqual(transport.calls[-1][1], {
             "pid": 4242, "window_id": 123456,
             "element_index": 901, "snapshot_id": "snapshot:chosen",
         })
-        self.assertEqual(len(runner.calls), 4)
+        self.assertEqual(len(transport.calls), 4)
         self.assertEqual(len(client.calls), 2)  # A singleton control still competes with none.
 
     def test_selection_stage_can_be_inspected_before_dispatch(self):
-        driver, runner, client = self.set_up_run()
+        driver, transport, client = self.set_up_run()
 
         result = select_once("Find Save", driver, ChoiceSelector(client))
 
         self.assertEqual(result.status, "selected")
         self.assertIsNone(result.action_result)
-        self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows", "bring_to_front", "get_window_state"])
+        self.assertEqual([call[0] for call in transport.calls], ["list_windows", "bring_to_front", "get_window_state"])
 
     def test_synthetic_start_search_stops_without_a_snapshot_or_native_action(self):
         for windows in ([], [window()]):
             with self.subTest(real_windows=bool(windows)):
-                driver, runner, client = self.set_up_run(windows=windows, preferred_key=START_MENU_KEY)
+                driver, transport, client = self.set_up_run(windows=windows, preferred_key=START_MENU_KEY)
 
                 result = select_once("Open Start", driver, ChoiceSelector(client), deliver_click=True)
 
@@ -100,7 +95,7 @@ class ClickPipelineTests(unittest.TestCase):
                 self.assertIsNone(result.action_result)
                 self.assertTrue(result.window["synthetic"])
                 self.assertTrue(result.control["synthetic"])
-                self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows"])
+                self.assertEqual([call[0] for call in transport.calls], ["list_windows"])
                 self.assertEqual(len(client.calls), 2 if windows else 1)
 
     def test_unusable_observations_keep_their_status_and_never_click(self):
@@ -112,13 +107,13 @@ class ClickPipelineTests(unittest.TestCase):
         )
         for snapshot, status in cases:
             with self.subTest(status=status, snapshot=snapshot):
-                driver, runner, client = self.set_up_run(snapshot=snapshot)
+                driver, transport, client = self.set_up_run(snapshot=snapshot)
 
                 result = select_once("Click Save", driver, ChoiceSelector(client), deliver_click=True)
 
                 self.assertEqual(result.status, status)
                 self.assertIsNone(result.action_result)
-                self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows", "bring_to_front", "get_window_state"])
+                self.assertEqual([call[0] for call in transport.calls], ["list_windows", "bring_to_front", "get_window_state"])
 
     def test_native_refusals_preserve_the_result_without_retry_or_reselection(self):
         for code in ("stale_element_token", "background_unavailable"):
@@ -127,15 +122,15 @@ class ClickPipelineTests(unittest.TestCase):
                 "refusal": {"code": code, "message": "Native target refusal."},
             }
             with self.subTest(code=code):
-                driver, runner, client = self.set_up_run(action_result=native_result)
+                driver, transport, client = self.set_up_run(action_result=native_result)
 
                 with self.assertRaises(DriverError) as raised:
                     select_once("Click Save", driver, ChoiceSelector(client), deliver_click=True)
 
                 self.assertEqual(raised.exception.code, code)
                 self.assertEqual(raised.exception.context["action_result"], native_result)
-                self.assertEqual(raised.exception.exit_code, 0)
-                self.assertEqual([call[0][-1] for call in runner.calls], [
+                self.assertIsNone(raised.exception.exit_code)
+                self.assertEqual([call[0] for call in transport.calls], [
                     "list_windows", "bring_to_front", "get_window_state", "click",
                 ])
                 self.assertEqual(len(client.calls), 2)
@@ -143,7 +138,7 @@ class ClickPipelineTests(unittest.TestCase):
     def test_failed_pre_action_report_stops_before_dispatch(self):
         for report_error in (OSError("report write failed"), ValueError("report closed")):
             with self.subTest(error=type(report_error).__name__):
-                driver, runner, client = self.set_up_run()
+                driver, transport, client = self.set_up_run()
                 report = RecordingReport()
                 append_original = report.append
 
@@ -157,7 +152,7 @@ class ClickPipelineTests(unittest.TestCase):
                         select_once("Click Save", driver, ChoiceSelector(client), deliver_click=True, report=report)
 
                 self.assertIs(raised.exception, report_error)
-                self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows", "bring_to_front", "get_window_state"])
+                self.assertEqual([call[0] for call in transport.calls], ["list_windows", "bring_to_front", "get_window_state"])
                 self.assertEqual(report.events[-1]["event"], "control_selected")
 
 
@@ -165,18 +160,18 @@ class ClickDriverTests(unittest.TestCase):
     def test_native_action_results_are_not_rejected_by_read_only_status_rules(self):
         for payload in (ACTION_RESULT, {**ACTION_RESULT, "status": "success"}):
             with self.subTest(payload=payload):
-                runner = FakeRunner(payload)
-                driver = CuaDriver(executable="fake-cua", runner=runner)
+                transport = FakeTransport(payload)
+                driver = CuaDriver(executable="fake-cua", transport=transport)
                 target = {"pid": 4242, "window_id": 123456, "element_token": "observed-token"}
                 before = deepcopy(target)
 
                 self.assertEqual(driver.click(target), payload)
 
                 self.assertEqual(target, before)
-                self.assertEqual(json.loads(runner.calls[0][1]["input"]), target)
-                self.assertEqual(runner.calls[0][0], ["fake-cua", "call", "click"])
+                self.assertEqual(transport.calls[0][1], target)
+                self.assertEqual(transport.calls[0][0], "click")
 
-    def test_invalid_or_unsupported_targets_fail_before_subprocess(self):
+    def test_invalid_or_unsupported_targets_fail_before_transport(self):
         token_target = {"pid": 4242, "window_id": 123456, "element_token": "observed-token"}
         index_target = {"pid": 4242, "window_id": 123456, "element_index": 0, "snapshot_id": "observed"}
         invalid_targets = [
@@ -198,54 +193,54 @@ class ClickDriverTests(unittest.TestCase):
 
         for target in invalid_targets:
             with self.subTest(target=target):
-                runner = FakeRunner()
-                driver = CuaDriver(executable="fake-cua", runner=runner)
+                transport = FakeTransport()
+                driver = CuaDriver(executable="fake-cua", transport=transport)
                 with self.assertRaises(DriverError):
                     driver.click(target)
-                self.assertEqual(runner.calls, [])
+                self.assertEqual(transport.calls, [])
 
-    def test_zero_exit_plain_text_native_error_is_not_success(self):
-        runner = FakeRunner(subprocess.CompletedProcess([], 0, "stale_element_token: snapshot superseded", ""))
-        driver = CuaDriver(executable="fake-cua", runner=runner)
+    def test_plain_text_native_error_is_not_success(self):
+        transport = FakeTransport(tool_result(text="stale_element_token: snapshot superseded", is_error=True))
+        driver = CuaDriver(executable="fake-cua", transport=transport)
 
         with self.assertRaises(DriverError) as raised:
             driver.click({"pid": 4242, "window_id": 123456, "element_token": "observed-token"})
 
         self.assertEqual(raised.exception.code, "stale_element_token")
-        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(len(transport.calls), 1)
 
     def test_malformed_action_facts_raise_driver_error_and_preserve_payload(self):
         for field in ("effect", "route"):
             for malformed in ([], {}):
                 payload = {**ACTION_RESULT, field: malformed}
                 with self.subTest(field=field, malformed=malformed):
-                    runner = FakeRunner(payload)
-                    driver = CuaDriver(executable="fake-cua", runner=runner)
+                    transport = FakeTransport(payload)
+                    driver = CuaDriver(executable="fake-cua", transport=transport)
 
                     with self.assertRaises(DriverError) as raised:
                         driver.click({"pid": 4242, "window_id": 123456, "element_token": "observed-token"})
 
                     self.assertEqual(raised.exception.code, "invalid_action_result")
                     self.assertEqual(raised.exception.context["action_result"], payload)
-                    self.assertEqual(len(runner.calls), 1)
+                    self.assertEqual(len(transport.calls), 1)
 
-    def test_nonzero_exit_preserves_native_payload_without_treating_it_as_success(self):
+    def test_mcp_error_preserves_native_payload_without_treating_it_as_success(self):
         refusal = {
             "status": "refused", "refusal": {"code": "stale_element_token", "message": "Snapshot superseded."},
         }
         for payload, expected_code in ((refusal, "stale_element_token"), (ACTION_RESULT, "driver_call_failed")):
             with self.subTest(payload=payload):
-                runner = FakeRunner(subprocess.CompletedProcess([], 1, json.dumps(payload), "private-stderr"))
-                driver = CuaDriver(executable="fake-cua", runner=runner)
+                transport = FakeTransport(tool_result(payload, text="private-diagnostic", is_error=True))
+                driver = CuaDriver(executable="fake-cua", transport=transport)
 
                 with self.assertRaises(DriverError) as raised:
                     driver.click({"pid": 4242, "window_id": 123456, "element_token": "observed-token"})
 
                 self.assertEqual(raised.exception.code, expected_code)
-                self.assertEqual(raised.exception.exit_code, 1)
+                self.assertIsNone(raised.exception.exit_code)
                 self.assertEqual(raised.exception.context["action_result"], payload)
-                self.assertNotIn("private-stderr", str(raised.exception))
-                self.assertEqual(len(runner.calls), 1)
+                self.assertNotIn("private-diagnostic", str(raised.exception))
+                self.assertEqual(len(transport.calls), 1)
 
 
 if __name__ == "__main__":

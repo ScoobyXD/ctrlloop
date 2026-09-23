@@ -115,11 +115,22 @@ UI metadata described below. Authentication headers and API keys are not recorde
 CUA Driver 0.28.2 must already be installed with its daemon running on the
 interactive Windows desktop. The adapter finds `cua-driver` on PATH or in its
 default Windows install directory; `--driver <path>` overrides the executable.
-It does not start a daemon. See [driver setup](docs/CUA_DRIVER.md).
-Every CUA child process receives `CUA_DRIVER_RS_TELEMETRY_ENABLED=0`, so the
-adapter keeps CUA CLI telemetry off even if the saved setting or parent
-environment enables it. This avoids the Windows telemetry worker delaying
-captured output after a command finishes.
+Each user request owns one persistent MCP client connected explicitly to the
+existing daemon. The client starts lazily on the first CUA call, is reused across
+every loop iteration, and closes on completion, error, or interruption. A later
+request gets its own client even if its wording is identical. It does not start
+or stop the daemon. See [driver setup](docs/CUA_DRIVER.md).
+The CUA MCP client process receives `CUA_DRIVER_RS_TELEMETRY_ENABLED=0`, so the
+adapter keeps telemetry off even if the saved setting or parent environment
+enables it. This avoids the Windows telemetry worker delaying client shutdown.
+
+There are no background health checks. EOF, transport errors and bounded request
+timeouts detect a lost connection. Each transport attempt has a 60-second default
+deadline, including any lazy startup/handshake. Reads reconnect and retry once for
+connection loss, timeout, or an unavailable daemon, with a new deadline; native
+tool refusals are not generally retried. A lost action response stops the run
+without replaying the action, because delivery may already have occurred. After
+a connection loss, only controls from a fresh snapshot may be clicked.
 
 For a multiline request, `--request-file request.txt` reads UTF-8 bytes without
 trimming or normalizing line endings. Use `--env-file <path>` to read an existing
@@ -133,6 +144,7 @@ uv run --locked python -m unittest discover -s tests -v
 The source modules live directly in `src/` and feed into `src/main.py`:
 
 - `driver.py` discovers and activates windows, reads accessibility state, and dispatches native clicks.
+- `cua_mcp.py` owns the request's MCP connection, framing, timeouts and client cleanup.
 - `selection.py` sends all group questions in one Jev call per round and advances selected candidates; `none` advances no candidate.
 - `synthetic.py` defines synthetic windows, their controls, and duplicate-matching rules.
 - `pipeline.py` runs window selection, activation, control selection/clicks, and verification from fresh evidence.
@@ -148,8 +160,8 @@ from src.driver import CuaDriver
 from src.pipeline import run_pipeline
 from src.selection import ChoiceSelector, PINNED_MODEL
 
-with TypeSafeClient(model=PINNED_MODEL, retry=RetryPolicy(max_retries=0)) as client:
-    result = run_pipeline(original_request, CuaDriver(), ChoiceSelector(client))
+with CuaDriver() as driver, TypeSafeClient(model=PINNED_MODEL, retry=RetryPolicy(max_retries=0)) as client:
+    result = run_pipeline(original_request, driver, ChoiceSelector(client))
     print(result.to_dict())
 ```
 
@@ -265,9 +277,9 @@ imports; **F10** steps over a line and **F11** steps into a function. Use the
 Variables panel or Debug Console to inspect values.
 
 For a window-read failure, break on `driver.get_window_state(result.window)` in
-`src/pipeline.py` and inspect `result.window`. Inside `src/driver.py`, `result`
-holds the CLI's exit code and separate stdout/stderr after the subprocess returns.
-Inspect those locally when the safe diagnostic code is insufficient.
+`src/pipeline.py` and inspect `result.window`. Inside `src/driver.py`, `_payload`
+receives the native MCP result envelope, including structured content and tool
+error information. Inspect it locally when the safe diagnostic code is insufficient.
 
 `python -m pdb src/main.py ...` starts the separate terminal debugger: `(Pdb)` is
 a prompt waiting for debugger commands, not application output. It does not use
@@ -353,8 +365,8 @@ The explicit `none` option is a group-level rejection, not an observed candidate
 
 Observation calls use `list_windows({})` and `get_window_state` with
 the selected record's exact `pid`/`window_id`, accessibility enabled and screenshots
-disabled. The adapter separates stdout/stderr and validates JSON and success
-shape, because some driver failures print plain text with exit code zero.
+disabled. The adapter validates the MCP result envelope and native structured
+payload, preserving tool errors before accepting an observation.
 The selected action is `click` using the selected
 window's `pid`/`window_id` and the original `element_token`, or the matching
 `element_index`/`snapshot_id` pair when no token is present. The loop then waits

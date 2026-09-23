@@ -482,6 +482,7 @@ class CliTests(unittest.TestCase):
                 self.cli, "RunReport", return_value=self.report, side_effect=report_init_error,
             ))
             driver = stack.enter_context(patch.object(self.cli, "CuaDriver"))
+            self.driver_factory = driver
             pipeline = stack.enter_context(patch.object(self.cli, "run_pipeline", side_effect=error,
                                                         return_value=result or PipelineResult("action_verified")))
             stack.enter_context(contextlib.redirect_stdout(output))

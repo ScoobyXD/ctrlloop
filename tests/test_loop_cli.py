@@ -7,12 +7,36 @@ from unittest.mock import patch
 
 from src import main as cli
 from src.pipeline import PipelineResult
+from src.driver import DriverError
 import test_pipeline
 
 
 class LoopCliTests(unittest.TestCase):
     cli = cli
     invoke = test_pipeline.CliTests.invoke
+
+    def test_one_client_per_request_and_cleanup_before_report_completion(self):
+        clients = []
+        for _ in range(2):
+            status, _, pipeline, _, factory = self.invoke(["Save document"])
+            self.assertEqual(status, 0)
+            factory.assert_called_once()
+            self.assertIs(pipeline.call_args.args[1], factory.return_value)
+            factory.return_value.close.assert_called_once_with()
+            clients.append(factory.return_value)
+        # Identical wording on a new request must not reuse the earlier client.
+        self.assertIsNot(clients[0], clients[1])
+
+    def test_request_failure_or_interrupt_closes_client(self):
+        for error in (DriverError("Connection failed."), ValueError("Invalid response."), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                if isinstance(error, KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.invoke(["Save document"], error=error)
+                else:
+                    status, _, _, _, _ = self.invoke(["Save document"], error=error)
+                    self.assertEqual(status, 1)
+                self.driver_factory.return_value.close.assert_called_once_with()
 
     def test_request_runs_loop_by_default_without_execution_modes(self):
         result = PipelineResult("action_verified", iterations=[{"iteration": 2, "route": "verified"}])

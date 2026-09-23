@@ -99,26 +99,30 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
             driver = CuaDriver(
                 executable=args.driver, max_elements=args.max_elements, max_depth=args.max_depth
             )
-        http_initialization_ns = perf_counter_ns()
-        with httpx2.Client(timeout=30.0, event_hooks={
-            "request": [report.on_request], "response": [report.on_response],
-        }) as http_client:
-            report.record_interval("initialization.http_client", http_initialization_ns, perf_counter_ns())
-            sdk_initialization_ns = perf_counter_ns()
-            with TypeSafeClient(
-                api_key=api_key, base_url="https://api.typesafe.ai", model=model,
-                timeout=30.0, retry=RetryPolicy(max_retries=0), http_client=http_client,
-            ) as client:
-                report.record_interval("initialization.typesafe_client", sdk_initialization_ns, perf_counter_ns())
-                with report.span("initialization.selector"):
-                    selector = ChoiceSelector(client, model=model)
-                with report.span("pipeline"):
-                    result = run_pipeline(
-                        original_request, driver, selector,
-                        report=report,
-                    )
-                cleanup_started_ns = perf_counter_ns()
-        report.record_interval("client_cleanup", cleanup_started_ns, perf_counter_ns())
+        try:
+            http_initialization_ns = perf_counter_ns()
+            with httpx2.Client(timeout=30.0, event_hooks={
+                "request": [report.on_request], "response": [report.on_response],
+            }) as http_client:
+                report.record_interval("initialization.http_client", http_initialization_ns, perf_counter_ns())
+                sdk_initialization_ns = perf_counter_ns()
+                with TypeSafeClient(
+                    api_key=api_key, base_url="https://api.typesafe.ai", model=model,
+                    timeout=30.0, retry=RetryPolicy(max_retries=0), http_client=http_client,
+                ) as client:
+                    report.record_interval("initialization.typesafe_client", sdk_initialization_ns, perf_counter_ns())
+                    with report.span("initialization.selector"):
+                        selector = ChoiceSelector(client, model=model)
+                    with report.span("pipeline"):
+                        result = run_pipeline(
+                            original_request, driver, selector,
+                            report=report,
+                        )
+                    cleanup_started_ns = perf_counter_ns()
+            report.record_interval("client_cleanup", cleanup_started_ns, perf_counter_ns())
+        finally:
+            with report.span("driver_cleanup"):
+                driver.close()
         # Finish preparing the operational result before generating the report.
         output_started_ns = perf_counter_ns()
         output = result.to_dict()

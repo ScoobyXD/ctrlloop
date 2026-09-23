@@ -69,6 +69,9 @@ class TimedDriver:
         self._call("click", arguments)
         return self.native_result
 
+    def close(self):
+        self.closed = True
+
 
 class PipelineTimingTests(unittest.TestCase):
     def setUp(self):
@@ -216,6 +219,7 @@ class PipelineTimingTests(unittest.TestCase):
 
             def delayed_write(text):
                 self.assertEqual(cleanup, ["sdk", "http"])
+                self.assertTrue(driver.closed)
                 self.assertEqual(driver.calls[-1][0], "click")
                 self.assertEqual(stdout.getvalue(), "")
                 write_document(text)

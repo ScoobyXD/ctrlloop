@@ -119,6 +119,19 @@ The CLI's successful result has `elements` and `tree_markdown` **at the top leve
 
 ## Run the control loop
 
+Each original user request now uses one persistent MCP client, connected with
+`cua-driver mcp --socket \\.\pipe\cua-driver` to the existing daemon. All CUA
+operations and loop iterations share that client. It closes on normal completion,
+error or interruption; the daemon stays running. A new request receives a new
+client. Python callers should scope `CuaDriver()` with a context manager.
+
+No periodic health polling is used. EOF and request failures/timeouts trigger
+connection disposal. Reads reconnect and retry once. A lost click or activation
+response stops without replaying the action. A fresh snapshot is required before
+using controls after connection loss. MCP's native structured result/error
+envelopes replace parsing one-shot CLI stdout in the application adapter; the
+one-shot commands above remain useful for manual inspection.
+
 From the ctrlloop repository, with its dependencies and `TYPESAFE_API_KEY` configured:
 
 ```powershell

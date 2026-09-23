@@ -230,7 +230,9 @@ must confirm the exact target; refusals stop the run and preserve native facts.
 The result contract is defined by the versioned
 [Windows implementation](https://github.com/trycua/cua/blob/cua-driver-rs-v0.28.2/libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs#L9191-L9218).
 
-Each control selection is followed by one `cua-driver call click`. The input is
+Each control selection is followed by one native `click` call. The application
+now shares one persistent MCP client across the user request; standalone CLI
+examples below describe the same driver contract. The input is
 `{pid, window_id, element_token}` copied from the selected
 native records. If no token is present, it uses `{pid, window_id, element_index,
 snapshot_id}` from that same observation. Bare indices and guessed identifiers

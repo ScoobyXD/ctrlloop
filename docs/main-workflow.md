@@ -249,6 +249,14 @@ captured only after the wait; concurrent action/snapshot handling is unnecessary
 
 ## Running the loop
 
+One persistent MCP client belongs to each user request and is shared across
+its observation/action loop. The client is opened lazily and closed on completion,
+error or interruption; the existing daemon remains running. There are no health
+polls. Reads may reconnect and retry once after connection loss, a timeout, or an
+unavailable daemon; uncertain clicks and foreground activations are never
+replayed. Python callers own this lifetime with `with CuaDriver() as driver` or
+an explicit `driver.close()`; the CLI closes the driver in its cleanup path.
+
 From the repository root, with the configured TypeSafe credentials and CUA daemon:
 
 ```powershell
@@ -283,7 +291,7 @@ gaps. They are separate from Jev's provider limits.
 | Candidate description shortening | App/title and control label/value/value-description text is shortened to **240 characters**. Include at most **two explicitly indexed ancestors**, with labels shortened to **120 characters**. Original request and source records remain intact. | `_text`, `window_candidates`, and `control_candidates` in `src/pipeline.py`; no CLI setting. |
 | Jev HTTP timeout and retries | **30-second timeout configuration**, with **zero automatic retries**. This is HTTP timeout configuration, not a total run deadline. | Client construction in `src/main.py`; no CLI setting. |
 | HTTP connection lifetime | One HTTP client is reused throughout a CLI run, then closed. Separate CLI runs start a new client. The installed HTTP library defaults to **five seconds of idle connection retention**, so the same client can need a new connection after a longer idle period. | Client lifetime in `src/main.py`; inherited `httpx2` connection-pool defaults; no CLI setting. |
-| CUA child timeout | **60 seconds per CLI child call**, by default. | `CuaDriver(timeout=...)`; no CLI setting. |
+| CUA request timeout and read retry | **60-second deadline per transport attempt**, including lazy MCP startup/handshake when needed. Window discovery and state reads reconnect and retry once after connection loss, timeout, or an unavailable daemon. The retry gets a fresh deadline, so a complete read can exceed 60 seconds. Clicks and foreground activations are never replayed automatically. | `CuaDriver(timeout=...)` and its persistent `McpTransport`; no CLI setting. |
 | Selection grouping and batching | Up to **ten candidates per group**; control/evidence questions also include `none` for at most eleven options. Exactly **one API call per selection round** contains all group questions plus any final-round timing/confirmation questions. | `GROUP_SIZE` and selection flow in `src/selection.py`; required by the workflow. |
 | Settling-time choices | Only **50, 100, 200, 300, 400, or 500 ms** can be scheduled after the click. `<50ms` maps to 50 and `>500ms` maps to 500. This increment does not add another wait after verification fails. | `SETTLING_MS` in `src/selection.py`; no CLI setting. |
 | Model pin | Require **`jev-1.13.0`**, including the model identity returned by the service. | `PINNED_MODEL` and selector validation; CLI verifies the project configuration matches. This is an explicit project requirement. |
@@ -295,7 +303,7 @@ them. These checks are safeguards, not confidence thresholds:
 
 | Validation | Current behavior |
 | --- | --- |
-| Observation and target identity | Control selection needs structured indexed controls and a snapshot identity. Clear old targets before reading again. Native clicks require the observed window identity and either an element token or an element index with its snapshot ID. Stale-target failures are surfaced without retry. |
+| Observation and target identity | Control selection needs structured indexed controls and a snapshot identity. Clear old targets before reading again. Native clicks require the observed window identity and either an element token or an element index with its snapshot ID. After connection loss, a fresh snapshot must establish the click target. Stale-target failures are surfaced without retry. |
 | Jev answer structure | Require exactly the requested question keys, Choice answers, known option labels, and matching probability labels. Probabilities and confidence must be finite numbers from 0 to 1; each question's probability total must be **0.97–1.03 inclusive**. Token usage must contain nonnegative integer counts. Invalid responses stop the run. |
 | Confidence/probability gating | **None.** Structurally valid answers are accepted without a minimum confidence or winning-probability threshold; the application uses Jev's returned choice. |
 
@@ -376,6 +384,7 @@ by the number of questions and present that as per-question latency.
 | Action preparation | Before mapping the selected control to native arguments | Arguments are ready for dispatch |
 | Native action | Immediately before invoking the action adapter | Adapter returns the action result |
 | Settling wait | After the native action returns | The selected sleep returns, before fresh observation |
+| Driver cleanup | Before closing this request's persistent MCP client | Client cleanup finishes; the shared daemon remains running |
 | Total operational run | Earliest recorded application boundary | Operational result and normal client cleanup are complete, before report generation |
 | Report generation and writing | After the operational run, before constructing the final JSON | The single final report write completes |
 

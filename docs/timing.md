@@ -134,6 +134,15 @@ HTTP clients. The total operational duration ends after the operational result
 and normal cleanup, before generating the report. Stdout serialization and output
 happen afterward.
 
+The CUA client is persistent for one user request. Its lazy MCP startup and
+handshake are included in the first CUA call's span. A read may reconnect and
+retry once after connection loss, timeout, or an unavailable daemon; both attempts
+remain inside that call's outer span. Each attempt has its own default 60-second
+deadline, so an outer read span can exceed 60 seconds. Clicks and foreground
+activations are not retried. `driver_cleanup` measures closing this request's MCP client after
+normal work, failure, or interruption, before the terminal report event. The
+shared daemon remains running. No periodic health polling is performed.
+
 ## Jev API call duration
 
 A question key such as `controls_r1_g0` identifies the stage, round, and group.
