@@ -1,8 +1,9 @@
 # Main workflow
 
 This is the authoritative description of the Jev-driven control loop in
-`src/pipeline.py`, its selector, reporter, and CLI. Each iteration discovers
-windows and selects a window. A real window goes through control reading,
+`src/pipeline.py`, its selector, reporter, and CLI. Discover and select a window
+until the first real window is chosen, then retain its native identity for the
+run. Each iteration reads fresh controls in that window, followed by
 selection, a click or targeted text entry, and settling. The synthetic Windows
 Search destination resolves its query first, then sends Win+S and immediately
 types it. The next decision
@@ -48,10 +49,14 @@ Indented report-file sizes differ from the outgoing HTTP body sizes. Local sizin
 sends no API calls and creates no HTTP request events.
 
 Window/control selection and text selection reuse the same packing and parallel
-dispatch helpers. Complete all local packing before dispatching any batch. If
-the shared state plus one whole question exceeds the budget, fail that round
-before any of its API calls are sent. A question is atomic: do not
-split a Choice group's candidates, remove words, or trim the original request.
+dispatch helpers. Form selection groups of at most 50 candidates, reducing a
+group to the largest contiguous prefix whose complete single-question body fits.
+Complete all grouping and packing before dispatching any batch. If shared state
+plus even one candidate's selection question, or a whole action/timer/Noul
+question, exceeds the budget, fail that round before any API calls are sent.
+Once formed, a question is atomic during packing: do not split its group, remove
+words, or trim the original request. If all groups in a multi-candidate round
+would be singletons, fail before dispatch because the round cannot reduce them.
 
 The budget comes from a study of 780 successful calls in 38 saved runs:
 7,707,537 reported input tokens across 14,902,182 prepared HTTP body bytes, or
@@ -66,12 +71,12 @@ token limits. The model remains pinned to `jev-1.13.0`.
 | Term | Meaning |
 | --- | --- |
 | Candidate | One observed or synthetic window/control option, or one source word in the text round. |
-| Group | Up to 10 candidates considered together. |
+| Group | Up to 50 candidates considered together, reduced when needed to fit the complete single-question request within the byte budget. |
 | Group question | One `QUESTION` selecting a window/control candidate from a group. |
 | Round | Evaluate all questions, then advance selected candidates after every batch succeeds. The single text round evaluates all source-word Nouls. |
 | API call | One request with a batch of whole questions and a complete body of at most 90,000 bytes; questions can be group selections, final action/timers, or source-word Nouls. |
 | Stage | Window discovery/selection, activation, control acquisition/selection, text selection, or action dispatch. |
-| Iteration | One decision cycle with fresh window discovery, selection, observation, and action when available. All calls in the cycle share its iteration number. |
+| Iteration | One decision cycle with fresh control observation, selection, and action when available. Window discovery/selection occurs only until a real window is retained. All calls in the cycle share its iteration number. |
 | Loop boundary for a timeline | Starts at current-state acquisition and ends when the last CUA command is sent: the selected control's click/text action or Windows Search text entry. Native return and any settling appear afterward, before the next loop starts. |
 
 The report's `loop.iteration` span encloses the complete decision cycle, including
@@ -86,12 +91,14 @@ words once, preserving their character offsets and order. Reuse these local
 source spans throughout the run; do not regenerate or rewrite the request.
 
 1. Keep the user's exact original request in state and set this iteration number.
-2. Discover windows and build their candidate descriptions. Refresh the previous
-   current window if still observed; otherwise clear it. A visible, non-minimized
+2. If no real window has been selected, discover windows and build their candidate
+   descriptions. A visible, non-minimized
    `SearchHost.exe` window titled `Search` suppresses its synthetic opener, keeping
    the real window available for selection. Recompute this on every discovery.
-3. Select the next window with `QUESTION`. This happens again every iteration,
-   allowing the next action to move to another window.
+3. On a discovery iteration, select a window with `QUESTION`. Retain the first
+   real window's `pid`/`window_id` for the remainder of the run. Subsequent
+   iterations skip discovery and window selection. A synthetic destination is
+   not retained, so selecting Windows Search permits discovery again next time.
 4. For Windows Search, use the exact explicit `--text` when supplied; otherwise
    assemble all words meeting the inclusion threshold. No selected words
    returns `no_action` before activation. Send desktop Win+S, then immediately send
@@ -100,8 +107,11 @@ source spans throughout the run; do not regenerate or rewrite the request.
    control selection, timer, observation, confirmation, or sleep intervenes.
    If the previous action was typing the identical Search query and Search was
    not observed, return `observation_unavailable` without replaying either command.
-   For a real window, bring it forward and read its accessibility tree.
-   Preserve the observation identities needed to execute the selected control.
+   For a real window, bring it forward and read its accessibility tree on every
+   iteration, refreshing its app/title context. Preserve the observation
+   identities needed to execute the selected control. If the retained window
+   becomes unavailable, propagate the existing driver error; do not automatically
+   select a replacement window.
 5. Build control candidates once and narrow them with `QUESTION`. Only in the
    final control round, include an action Choice and a hypothetical timer for
    each of `click` and `type_text` per finalist. Consume the winning candidate's
@@ -120,8 +130,8 @@ source spans throughout the run; do not regenerate or rewrite the request.
    returns, then begin the next iteration.
 
 Empty, unavailable, or failed observations/actions and unresolved text can stop earlier.
-Old executable targets are not reused for a new iteration. There are no separate
-routing, verification, retry-action, or extra-wait questions.
+Old control targets are not reused for a new iteration; the window identity is.
+There are no separate routing, verification, retry-action, or extra-wait questions.
 
 The synthetic Windows Search route has one window candidate and no control
 candidates. It uses the existing activation stage for
@@ -132,8 +142,9 @@ timer requests, and adds no settling wait after typing. Without an explicit
 Search override, its complete text-selection stage finishes before Win+S. The next normal
 iteration reads fresh state and can select real search results. Real Start and
 Search windows remain observed window candidates; the synthetic route does not
-replace them. After a result click closes Search, the next discovery offers the
-opener again. The existing `last_action` protects against consecutive identical
+replace them. A real Search window, once selected, is retained; if a result click
+closes it, the next activation/read can fail instead of switching to the opened
+application. The existing `last_action` protects against consecutive identical
 launch/type actions when the destination cannot be observed; a control click
 replaces that state, and a new run starts with no previous action. This is an
 observation failure stop, not a permanent ban on searching again.
@@ -146,7 +157,7 @@ Every window and control request carries the same run context:
 | --- | --- |
 | `original_request` | The user's exact original text, without rewriting, trimming, or shortening. |
 | `iteration` | Current decision cycle, starting at 1; it does not count completed clicks. |
-| `current_window` | Observed app/title metadata, refreshed from discovery and changed when a new window is selected; `null` before selection or when the old window is absent. |
+| `current_window` | Observed app/title metadata; `null` before selection, then refreshed from each snapshot of the retained real window. Its native identity remains fixed for the run. |
 | `last_control` | Previous dispatched control as `{window, control, action}`, or `null` before control dispatch. Retain it during text resolution; update immediately before dispatch. |
 | `last_action` | Previous tool and complete native response in `result`, including effect, route, delivery, and any evidence/escalation metadata, available after an action attempt. Text entry also retains the exact entered text. |
 
@@ -169,11 +180,15 @@ word questions to the existing state.
 
 Window and control selection follow these steps:
 
-1. Divide candidates into groups of up to 10, preserving observed order.
+1. Divide candidates into groups of up to 50, preserving observed order. Size
+   each complete single-group request through the SDK, including shared state.
+   If a proposed group exceeds 90,000 bytes, use its largest fitting contiguous
+   candidate prefix. Keep all remaining candidates for later groups.
 2. Give every group one `QUESTION` with only its candidates as criteria. There is
    no synthetic `none` response option.
-3. Include final control action/timer questions and prepare the complete HTTP request through
-   the SDK. If it fits within **90,000 bytes**, send one call. Otherwise pack its
+3. A round with one actual group is final; for controls, add its action/timer
+   questions. In every round, prepare the complete HTTP request through the SDK.
+   If it fits within **90,000 bytes**, send one call. Otherwise pack its
    ordered questions into the largest contiguous batches that fit, keeping every
    group question whole and counting shared state and the envelope in each body.
 4. Send the batches in parallel. Validate and retain each selected option,
@@ -188,21 +203,23 @@ Every round uses the same
 
 | Control round | Candidates entering | Groups / selection questions | Winners leaving |
 | --- | ---: | ---: | ---: |
-| 1 | 392 | 40 | 40 |
-| 2 | 40 | 4 | 4 |
-| 3 | 4 | 1 | 1 |
+| 1 | 300 | 6 (50 candidates each) | 6 |
+| 2 | 6 | 1 (6 candidates) | 1 |
 
-This uses three control rounds. The final round adds four action Choices and
-eight hypothetical timers, making 13 questions to measure before packing.
+When these groups fit, this uses two control rounds. The final round adds six
+action Choices and twelve hypothetical timers, making 19 questions to measure
+before packing.
 Each round uses one call if its complete body fits, or parallel calls if it needs
 multiple batches. If text wins, its stage adds one word round packed under the
-same budget. Window selection with 17 candidates adds two rounds: 17 become
-two winners, then one. The next iteration begins new window/control rounds.
+same budget. Window selection with 17 fitting candidates takes one round.
+Once a real window is retained, later iterations have zero window rounds and
+start fresh control rounds from their new snapshots.
 
-For 631 controls, the rounds are `631 -> 64 -> 7 -> 1`; for 647, they are
-`647 -> 65 -> 7 -> 1`; for 1,000, they are `1000 -> 100 -> 10 -> 1`.
-The prepared byte sizes determine API call boundaries, not a fixed candidate
-count. Multiple calls within a round remain one round.
+For 963 fitting controls, the rounds are `963 -> 20 -> 1` (19 groups of 50 and
+one of 13 in round 1); for 1,000, they are `1000 -> 20 -> 1`.
+The byte budget can require smaller groups and extra rounds. It also determines
+API call boundaries after all round questions are formed. Multiple calls within
+a round remain one round, including parallel action/timer calls in the final round.
 
 The shared SDK client dispatches batches through a thread pool. All batches are
 submitted before waiting; the pool bounds the number in flight. Answers may
@@ -247,7 +264,7 @@ action context. Evaluate **all source words in that one round**, using the same
 complete-body byte sizing, whole-question packing, and parallel dispatch helpers
 as selection. A fitting round uses one API call; a larger round uses parallel
 calls, each counting the full shared state and envelope. No word is omitted or
-converted into a ten-word Choice group. Collect and validate every batch before
+converted into a multi-word Choice group. Collect and validate every batch before
 deciding inclusion or dispatching text. No text call is needed after a click
 choice or for an explicit Windows Search `--text` override.
 
@@ -355,7 +372,8 @@ delivery, not screen readiness or completion.
 | Description size | App/title/control text capped at 240 characters; up to two indexed ancestors with 120-character labels. Original request and source records remain intact. |
 | Jev timeout/retries | 30-second HTTP timeout configuration, zero automatic retries; not a total run deadline. |
 | CUA timeout/retries | 60-second deadline per transport attempt including lazy startup; reads may reconnect/retry once, actions are not replayed. |
-| Batching | Up to 10 window/control candidates per group. All rounds pack whole questions into HTTP bodies of at most 90,000 bytes and dispatch parallel batches; action/timers included before sizing the final control round; one Noul per source word in `text_r1`. |
+| Batching | Up to 50 window/control candidates per group, reduced when the complete single-group body would exceed 90,000 bytes. All rounds pack whole questions into bodies within that budget and dispatch parallel batches; action/timers included before sizing the final control round; one Noul per source word in `text_r1`. |
+| Window reuse | Retain the first selected real window for the run, with fresh control snapshots each iteration. Synthetic Windows Search permits another discovery/selection. No automatic replacement of a closed real window. |
 | Text assembly | All words meeting `>= 0.70` are typed in source order. Adjacent selected words retain their source whitespace; omitted-word gaps become one space. |
 | Text delivery | Explicit native mode overrides the observed browser foreground default for targeted typing; unknown/non-browser targets retain the native default. No automatic mode retry. |
 | Settling | One 50–500 ms scheduled wait after a control click or confirmed/unverifiable targeted text action when another iteration follows; none on the Windows Search route. |
@@ -373,8 +391,9 @@ There is no local token cap or total runtime cap.
 Provider limits apply to shared state plus questions; see
 [TypeSafe model documentation](https://docs.typesafe.ai/models). Observation and
 text bounds and the 90,000-byte cap do not guarantee a batch fits those limits.
-Automatic token-limit retries, description compaction, and splitting an
-oversized individual question are outside this implementation.
+Automatic token-limit retries, description compaction, and splitting a
+formed individual question are outside this implementation. Selection grouping
+can reduce candidate counts before questions are fixed.
 
 ## Timing and reporting
 
@@ -389,9 +408,10 @@ and service work; it excludes request construction and response decoding. It is
 client-observed duration, not isolated inference time. All questions in a batch
 share that call's duration. Each round retains an `api_calls` list, including
 single-call rounds, with separate answers, usage, and timing references per call.
-Each call also records its prepared `body_bytes`. `selection.packing` measures
-local SDK preparation and sizing. Parallel call durations overlap, so their sum
-is not the round's elapsed time.
+Each call also records its prepared `body_bytes`. `selection.grouping` includes
+local sizing of proposed groups; `selection.packing` measures complete-round
+preparation and batch sizing. Neither sends API requests. Parallel call durations
+overlap, so their sum is not the round's elapsed time.
 
 Each cycle retains iteration, selections, native results, rounds, and route.
 Windows Search records both `hotkey` and `type_text` action events and timings

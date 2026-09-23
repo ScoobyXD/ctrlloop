@@ -40,7 +40,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
     origin_wall_ns = _MODULE_WALL_NS if _include_imports else time_ns()
     origin_label = "main_module_after_time_import" if _include_imports else "main_call"
     project_dir = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description="Repeat Jev window/control selection and CUA actions within an iteration limit.")
+    parser = argparse.ArgumentParser(description="Select a window, then repeat Jev control selection and CUA actions within an iteration limit.")
     parser.add_argument("request", nargs="?", help="Original user request, preserved in every Jev call")
     parser.add_argument("--request-file", type=Path, help="Read the exact request from a UTF-8 file")
     parser.add_argument("--text", help="Exact Windows Search text override; otherwise select words from the request")

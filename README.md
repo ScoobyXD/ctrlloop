@@ -1,8 +1,11 @@
 # ctrlloop
 
+[Minimal editable Hermes plugin: setup and exact input/output contract](docs/hermes-plugin.md).
+
 The Python pipeline offers discovered desktop windows plus a synthetic
-**Windows Search** option. Jev chooses a window; a real window is inspected through
-Windows UI Automation, then its observed controls are offered for selection.
+**Windows Search** option. Jev selects a destination; once it chooses a real window,
+the pipeline retains that window's native identity for the rest of the run. Each iteration
+inspects it through Windows UI Automation and offers its fresh controls for selection.
 For a real window, Jev chooses the control and whether to click or enter text.
 The pipeline dispatches that native CUA action, waits for the app to settle,
 and starts the next selection from fresh observations.
@@ -42,11 +45,13 @@ or caret-placement operation.
 The synthetic Windows Search opener is available when fresh discovery has no
 visible `SearchHost.exe` window titled `Search`. While that destination is open,
 only its real window is offered, preserving its observed order and native identity
-for control selection. Closing Search makes the opener available again.
+for control selection. This rule is evaluated whenever window discovery runs;
+discovery stops after the first real window is selected. A selected real Search
+window is retained just like any other real window.
 If the opener is selected immediately after the same query was typed and Search
 was not observed, the run stops with `observation_unavailable` instead of sending
-Win+S and typing again. An intervening control click or a new run permits a later
-search; there is no permanent one-shot flag. Driver errors remain errors.
+Win+S and typing again. A new run starts without that previous action; there is
+no permanent one-shot flag. Driver errors remain errors.
 
 The Windows Search window record has `synthetic: true` and no invented PID,
 window handle, control, geometry, or snapshot identity. It has no control
@@ -145,9 +150,13 @@ their existing behavior even when an override is supplied. No delivery-mode
 question or automatic background-to-foreground retry is added.
 
 Each iteration executes one selected control click/text action or the Windows Search
-activation-and-typing sequence. The next iteration discovers
-windows and controls again and selects the next action using the original request
-and previous action context. `--max-iterations` is a positive integer, default 10.
+activation-and-typing sequence. After a real window is selected, subsequent
+iterations skip window discovery and selection, bring the same window forward,
+and read fresh controls using the original request and previous action context.
+Windows Search's synthetic opener does not pin a window: the next iteration
+discovers and selects again until a real window is chosen. If that real window
+later closes or becomes unavailable, the driver error stops the run; there is no
+automatic switch to another window. `--max-iterations` is a positive integer, default 10.
 At the limit, the run returns `iteration_limit` without a further wait or observation.
 An unsupported or unavailable observation, unavailable synthetic action,
 unresolved text, a disabled text target, a native/API error, or user interruption
@@ -219,9 +228,9 @@ The source modules live directly in `src/` and feed into `src/main.py`:
 - `driver.py` discovers and activates windows, reads accessibility state, and dispatches native clicks, hotkeys, and text entry.
 - `cua_mcp.py` owns the request's MCP connection, framing, timeouts and client cleanup.
 - [`jev_questions.py`](src/jev_questions.py) holds the authored selection, action, timer, and word-inclusion questions; edit the wording here.
-- `selection.py` packs whole questions into HTTP bodies of at most 90,000 bytes, sends a round's calls in parallel, then advances its selected candidates together.
+- `selection.py` forms groups of at most 50 candidates within the request budget, packs whole questions into HTTP bodies of at most 90,000 bytes, sends a round's calls in parallel, then advances its selected candidates together.
 - `synthetic.py` defines synthetic windows, their controls, and duplicate-matching rules.
-- `pipeline.py` repeats window selection and real control click/text actions or direct Windows Search actions within the iteration limit.
+- `pipeline.py` retains the first selected real window, refreshes its controls for each click/text action, and supports direct Windows Search actions before a real window is selected.
 - `reporting.py` buffers events and actual Jev HTTP bodies, then saves the report and separate input/output files on a worker at the end.
 - `main.py` provides the CLI, loads configuration, and prints the result.
 
@@ -342,7 +351,8 @@ Reports contain these milestones:
 - `request_words_prepared`: ordered source words and their original character
   offsets, prepared once before the first loop.
 - `windows_discovered`: the complete observed window list, in discovery order;
-  it does not include the synthetic Windows Search option.
+  it does not include the synthetic Windows Search option. Discovery and window
+  selection stop once the run retains a real window.
 - `jev_request`: the actual JSON body captured by the HTTP client's request hook
   after SDK serialization and before network access, plus a request ID, URL, method,
   and byte count. Its `body` contains the exact JSON fields and values sent to Jev,
@@ -359,6 +369,8 @@ Reports contain these milestones:
   no selection question; a singleton control receives the selection question, with action and timing
   when executable. Windows Search is marked `synthetic: true` in
   `window_selected`; it has no `control_selected` or `window_observed` event.
+  Reusing a real window emits a fresh `window_observed` but no new
+  `window_selected`; that iteration has no window-selection rounds.
 - `text_selected`: destination, assembled text or unresolved result, and the
   word-selection round. Every Noul probability is retained with its API call.
 - `action_requested` and `action_returned`: native activation and input arguments
@@ -426,14 +438,18 @@ VS Code's graphical breakpoints. See the [VS Code Python debugger guide](https:/
 When no visible Search destination is observed, its synthetic opener is prepended
 to the first-stage options. Real windows preserve
 the driver's observed order, as do controls from real snapshots. Each group
-contains at most ten candidates and receives one Jev Choice question using
-`QUESTION`. Each group selects one supplied candidate, which advances in group
-order. Regroup survivors in tens for the next round.
+contains at most 50 candidates and receives one Jev Choice question using
+`QUESTION`. Before fixing the group, prepare its complete single-question body
+through the SDK, including shared state and the envelope. If 50 candidates do not
+fit within 90,000 bytes, use the largest contiguous prefix that fits and continue
+with the remaining candidates. Each group selects one supplied candidate, which
+advances in group order. Regroup survivors using the same rules for the next round.
 
 In window/control selection, only a singleton window bypasses Jev. A singleton control still receives
 the selection question, with action and timers when executable. For 1,000 control candidates,
-the round counts are `1000 -> 100 -> 10 -> 1`. Prepared body sizes determine
-the number of API calls per round. Group size ten is fixed.
+the candidate counts are `1000 -> 20 -> 1` when the groups fit. The fixed group
+maximum is 50; the byte budget can require smaller groups and additional rounds.
+A round is final only when all remaining candidates fit into one actual group.
 
 Authored questions `QUESTION`, `ACTION`, `TIMER`, and `TEXT_WORD` live in
 [`src/jev_questions.py`](src/jev_questions.py). `QUESTION` is reused for all window
@@ -462,8 +478,10 @@ word positions and offsets, and the assembled text or unresolved reason. A
 selection is one stage with one word round.
 
 Every loop request carries the unchanged `original_request`, current `iteration`,
-fresh `current_window` identity and `last_control`. The window is null before
-selection or when missing; the last control is null until control action dispatch.
+`current_window` app/title context and `last_control`. The window is null before
+selection; after a real window is retained, each fresh snapshot updates its
+app/title context while preserving its native identity. The last control is null
+until control action dispatch.
 Before dispatch, set `last_control` to `{window, control, action}` with its source
 window, descriptive control fields, and chosen tool. After CUA returns, `last_action` retains
 the tool and complete native result in `last_action.result` for the next selection.
@@ -499,8 +517,10 @@ succeed. Text selection uses the same packer and dispatch path, collecting every
 word's Noul answer before applying inclusion decisions. Packing drops no supplied
 candidates or words; multiple parallel calls remain one round.
 
-For 392 controls, the rounds are `392 -> 40 -> 4 -> 1`; for 631 controls, they
-are `631 -> 64 -> 7 -> 1`. Body sizes determine the API call count in each round.
+When groups fit, 300 controls narrow as `300 -> 6 -> 1`, and 963 narrow as
+`963 -> 20 -> 1`. Oversized descriptions or shared state can reduce group sizes
+and add rounds. Complete prepared body sizes determine the API call count within
+each round; even a final round can need parallel calls for its action/timer questions.
 
 Only the final control round adds the action Choice and two hypothetical
 `TIMER` questions per finalist. The
@@ -508,8 +528,8 @@ exact choices are `<50ms`, `100ms`, `200ms`, `300ms`, `400ms`, and `>500ms`, map
 in code to 50, 100, 200, 300, 400, and 500 ms. Include action and timer questions
 before sizing the final round; they may occupy different parallel calls. Only
 the winning candidate/action's interval is consumed. After CUA
-returns, the loop waits that interval before the next iteration's fresh window
-and control observations. The final permitted action has no following wait.
+returns, the loop waits that interval before the next iteration's fresh control
+observation in the retained window. The final permitted action has no following wait.
 Windows Search skips control selection and timers entirely and starts the next
 iteration after typing returns, without a settling wait.
 See the
@@ -519,9 +539,12 @@ The fixed **90,000-byte** budget has no CLI configuration. It counts the complet
 SDK-prepared HTTP body, equivalent to `len(request.content)` before transport;
 indented report-file sizes differ. Local sizing sends no API requests. Service
 token limits still apply. Automatic rejection retries, description compaction,
-and splitting an individual question are outside this implementation. If shared
-state plus one atomic group/action/timer/Noul question cannot fit, that round
-fails before any of its calls are dispatched.
+and splitting a formed question are outside this implementation. Group formation
+reduces the candidate count before a question is fixed. If shared state plus one
+candidate's selection question or one atomic action/timer/Noul question cannot fit,
+that round fails before any of its calls are dispatched. A multi-candidate round
+also fails before dispatch if only singleton groups fit, because it could not
+eliminate any candidates.
 Actual input/output token usage and prepared body bytes are retained for every
 call in the round's `api_calls` list. See
 [main workflow](docs/main-workflow.md) for the workflow and timing contract.
@@ -533,7 +556,8 @@ probabilities for inclusion at `>= 0.70`; they do not alter control elimination.
 
 ## Observation limits
 
-Observation calls use `list_windows({})` and `get_window_state` with
+Window discovery uses `list_windows({})` until the first real window is selected.
+Every real-window iteration uses `get_window_state` with
 the selected record's exact `pid`/`window_id`, accessibility enabled and screenshots
 disabled. The adapter validates the MCP result envelope and native structured
 payload, preserving tool errors before accepting an observation.

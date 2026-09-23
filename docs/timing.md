@@ -1,9 +1,11 @@
 # Reading run timings
 
 The [main workflow](main-workflow.md) defines the selection and timing contract.
-A candidate is one window, control, or source word. A group contains up to ten
-window/control candidates. Each selection round prepares its complete
-HTTP body, then packs whole questions into bodies of at most 90,000 bytes.
+A candidate is one window, control, or source word. A group contains up to 50
+window/control candidates. Its complete single-question request, including
+shared state, is sized locally first; groups shrink to the largest contiguous
+candidate prefix that fits 90,000 bytes. Each selection round prepares its
+complete HTTP body, then packs whole questions into bodies of at most 90,000 bytes.
 A fitting round uses one call; larger rounds dispatch batches in parallel.
 All batch winners recombine before the next round starts. Every window and
 control group uses the same
@@ -22,8 +24,9 @@ Windows Search bypasses control selection and timers:
 it resolves its query before activation, then sends Win+S and immediately types
 the exact resolved string in the same iteration.
 There is no intervening observation, confirmation, sleep, or Jev call, and no
-settling wait after typing. Each subsequent iteration starts with fresh window
-discovery. The byte cap bounds request size; it is
+settling wait after typing. Window discovery/selection repeats until a real
+window is chosen. Later iterations retain that window, skip discovery and window
+selection, and acquire fresh controls. The byte cap bounds request size; it is
 not a token-limit guarantee for unusually long descriptions or shared state.
 
 The CLI collects events, timestamps, and actual Jev payloads in memory. At the end
@@ -139,9 +142,9 @@ recorded startup work. `initialization.request_read`,
 | Operation | Measured work |
 | --- | --- |
 | `request_word_preparation` | Splitting the original request into ordered source words and offsets once, before the first loop. |
-| `window_discovery` | `driver.list_windows()` through return/error. |
+| `window_discovery` | `driver.list_windows()` through return/error; absent after the first real window is selected. |
 | `candidate_preparation` | Building window or control candidate descriptions. |
-| `window_selection`, `control_selection` | Complete window/control selection, including final action Choices and hypothetical timers where applicable. |
+| `window_selection`, `control_selection` | Complete window/control selection, including final action Choices and hypothetical timers where applicable. Window selection is absent when the real window is reused. |
 | `text_selection` | Complete text stage: one source-word Noul round with packing and parallel calls as needed, validation, thresholding, and local assembly of every selected word. |
 | `synthetic_resolution` | Looking up controls for a synthetic selection. |
 | `foreground_preparation` | Preparing native activation arguments. |
@@ -160,18 +163,24 @@ Within selection, inspect `selection.validation`, `selection.round`,
 before forming its groups and ends after all its winners are ready. A batch
 contains one SDK call and local validation/collection of its answers; batches
 execute concurrently with independent reporting context and span ancestry.
-`selection.packing` measures local SDK preparation and byte sizing; it sends no
-API requests. A singleton window can bypass selection. A singleton control
-is still selected, with its action Choice and both timers included before packing
+`selection.grouping` includes local SDK preparation and sizing of proposed
+groups. `selection.packing` measures complete-round preparation and batch byte
+sizing; neither sends API requests. A singleton window can bypass selection. A
+singleton control is still selected, with its action Choice and both timers included before packing
 when execution context is available. A trailing one-candidate group remains
 whole within the same round. Text round 1 uses this same packing/parallel-call
 path with one atomic Noul question per word. All words meeting the threshold
 are assembled locally; no subsequent text-selection question or round is added.
-An oversized atomic question plus state fails during packing, before that round
-sends any API calls. A missing HTTP event after that failure does
-not imply that words or candidates were silently skipped.
+An oversized single-candidate selection question plus state fails during grouping;
+an oversized atomic action/timer/Noul question fails during packing. A round of
+only singleton groups also fails during grouping when it cannot reduce multiple
+candidates. These failures occur before that round sends any API calls. A missing
+HTTP event after that failure does not imply that words or candidates were silently skipped.
 
-Foreground activation precedes the newly selected real window's control snapshot.
+Foreground activation precedes every real-window control snapshot, including
+snapshots of the retained window. Reuse has no `window_discovery`,
+`window_selection`, or `window_selected` event and no window-selection rounds;
+the fresh snapshot still emits `window_observed`.
 Windows Search uses `foreground_activation` for desktop Win+S, then directly
 dispatches desktop `type_text`. It has no live UIA read, control candidates,
 control-selection rounds, or settling timer. Both native requests and results
@@ -196,13 +205,16 @@ the final text. The `text_selected` event links this round to the destination.
 span and HTTP request IDs remain unique within the run.
 
 For a timeline, label each loop from the `window_discovery` operation's
-`started_elapsed_ms` to the final `native_action` operation's
+`started_elapsed_ms`, or `control_acquisition.started_elapsed_ms` when the real
+window is reused, to the final `native_action` operation's
 `started_elapsed_ms` in that iteration. These boundaries represent current-state
 acquisition through dispatch to the CUA adapter. The latter is entry to
 `driver.click()` or `driver.type_text()`; the report does not measure the later transport-send instant
 inside the adapter. Subtract those boundaries for the loop duration and use the
 end boundary for grand total elapsed time through that loop. Mark each loop's
 number in its start/end rows, with loop duration and grand total in the end row.
+Show any foreground activation before a reused window's control acquisition
+separately; it occurs before that loop's state-acquisition boundary.
 The corresponding `started_at` values provide UTC timeline times. Show native
 call duration and settling afterward, before the next loop's acquisition. The enclosing
 `loop.iteration` duration also includes that return and settling, so it is a

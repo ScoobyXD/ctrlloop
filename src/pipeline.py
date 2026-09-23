@@ -332,31 +332,40 @@ def _observed_controls(result, snapshot, report):
     return controls
 
 
-def _prepare_window(state, windows, driver, selector, result, report, synthetic, iteration=None):
-    result.status = "no_windows"
+def _prepare_window(state, driver, selector, result, report, synthetic, iteration=None):
+    """Select a real window once, then acquire fresh controls from that window."""
+    result.status = "selected"
     result.reason = None
-    result.window = None
     result.control = None
     result.snapshot_id = None
     result.observation = {}
     result.action_result = None
-    winner = _choose_window(state, windows, selector, result, report, synthetic, iteration)
-    if winner is None:
-        return None, {}
-    if _is_windows_search(result.window):
-        result.observation = {
-            "source": "synthetic",
-            "coverage": "application-defined destination; no live control snapshot was taken",
-        }
-        return [], {}
-    with report.span("synthetic_resolution", stage="controls") if report else nullcontext({}):
-        controls = synthetic.controls_for(winner.key)
-    if controls is not None:
-        result.observation = {
-            "source": "synthetic",
-            "coverage": "application-defined controls; no live control snapshot was taken",
-        }
-        return controls, {}
+    if result.window is None or result.window.get("synthetic"):
+        # A synthetic opener has no native window identity to retain. Discover
+        # its destination on the next iteration before pinning a real window.
+        result.status = "no_windows"
+        result.window = None
+        state["current_window"] = None
+        windows = _discover_windows(driver, report)
+        winner = _choose_window(state, windows, selector, result, report, synthetic, iteration)
+        if winner is None:
+            return None, {}
+        if _is_windows_search(result.window):
+            result.observation = {
+                "source": "synthetic",
+                "coverage": "application-defined destination; no live control snapshot was taken",
+            }
+            return [], {}
+        with report.span("synthetic_resolution", stage="controls") if report else nullcontext({}):
+            controls = synthetic.controls_for(winner.key)
+        if controls is not None:
+            result.observation = {
+                "source": "synthetic",
+                "coverage": "application-defined controls; no live control snapshot was taken",
+            }
+            return controls, {}
+    # Retain pid/window_id, never snapshot-bound targets. A closed or otherwise
+    # unusable window follows the existing driver error path without reselection.
     _activate_window(result, driver, report)
     snapshot = _observe_window(state, result, driver, report)
     return _observed_controls(result, snapshot, report), snapshot
@@ -486,10 +495,12 @@ def run_pipeline(
     text: str | None = None,
     delivery_mode: str | None = None,
 ) -> PipelineResult:
-    """Repeat fresh selection and native actions within an explicit limit.
+    """Select one real window and repeat fresh control selection and actions.
 
     Each call retains the original goal and the most recent decision/action.
     Windows Search resolves text before sending Win+S followed immediately by text.
+    Synthetic destinations require fresh window discovery until a real window is
+    selected; its native identity is then retained for the rest of the run.
     The iteration limit bounds execution; it does not establish task completion.
     Native delivery errors propagate without replaying the attempted action.
     delivery_mode overrides targeted typing with CUA's foreground/background enum.
@@ -521,16 +532,8 @@ def run_pipeline(
         trace = {"iteration": iteration}
         result.iterations.append(trace)
         with report.span("loop.iteration", iteration=iteration) if report else nullcontext({}):
-            windows = _discover_windows(driver, report)
-            if result.window is not None:
-                current_window = next((
-                    window for window in windows
-                    if all(window.get(name) == result.window.get(name) for name in ("pid", "window_id"))
-                ), None)
-                state["current_window"] = _app_context(current_window, {}) if current_window else None
-            # Select again from fresh windows; the next step may be in another app.
             controls, _ = _prepare_window(
-                state, windows, driver, selector, result, report, synthetic, iteration,
+                state, driver, selector, result, report, synthetic, iteration,
             )
             if controls is None:
                 _route(trace, result.status, report)

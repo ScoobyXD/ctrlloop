@@ -1,0 +1,5 @@
+name: ctrlloop
+version: "0.1.0"
+description: Launch the local ctrlloop computer-use program with a task request.
+provides_tools:
+  - ctrlloop_run

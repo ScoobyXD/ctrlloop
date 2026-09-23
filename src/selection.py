@@ -25,7 +25,8 @@ if TYPE_CHECKING:
 
 
 PINNED_MODEL = "jev-1.13.0"
-GROUP_SIZE = 10
+# Maximum options per selection question; byte sizing can make a group smaller.
+GROUP_SIZE = 50
 REQUEST_BUDGET_BYTES = 90_000
 # Include the boundary exactly; retain raw Nouls for later policy evaluation.
 WORD_INCLUSION_THRESHOLD = 0.70
@@ -152,6 +153,55 @@ class ChoiceSelector:
             )
         return choices, trace
 
+    def _group_candidates(
+        self, state: str | dict[str, Any], candidates: list[Candidate], round_id: str,
+    ) -> tuple[list[list[Candidate]], dict[str, Choice]]:
+        """Build the largest contiguous groups that fit, up to GROUP_SIZE."""
+        groups = []
+        questions = {}
+        start = 0
+        while start < len(candidates):
+            key = f"{round_id}_g{len(groups)}"
+
+            def question_for(count: int) -> Choice:
+                return Choice(
+                    instructions=QUESTION,
+                    criteria={
+                        candidate.key: candidate.description
+                        for candidate in candidates[start:start + count]
+                    },
+                )
+
+            count = min(GROUP_SIZE, len(candidates) - start)
+            question = question_for(count)
+            if _request_body_size(state, {key: question}, self.model) > REQUEST_BUDGET_BYTES:
+                low, high = 1, count - 1
+                count = 0
+                while low <= high:
+                    middle = (low + high) // 2
+                    proposed = question_for(middle)
+                    size = _request_body_size(state, {key: proposed}, self.model)
+                    if size <= REQUEST_BUDGET_BYTES:
+                        count, question = middle, proposed
+                        low = middle + 1
+                    else:
+                        high = middle - 1
+                if not count:
+                    raise SelectionError(
+                        f"A single candidate question with shared state exceeds the "
+                        f"{REQUEST_BUDGET_BYTES}-byte request budget."
+                    )
+            groups.append(candidates[start:start + count])
+            questions[key] = question
+            start += count
+
+        if len(candidates) > 1 and len(groups) == len(candidates):
+            raise SelectionError(
+                "The request budget permits only singleton groups; "
+                "selection cannot narrow these candidates."
+            )
+        return groups, questions
+
     def _pack_questions(
         self, state: str | dict[str, Any], questions: dict[str, Choice | Noul],
     ) -> list[tuple[dict[str, Choice | Noul], int]]:
@@ -167,7 +217,7 @@ class ChoiceSelector:
                 break
 
             # Search complete question prefixes: a control Choice keeps its
-            # entire group of ten, and each source-word Noul stays atomic.
+            # entire byte-sized group, and each source-word Noul stays atomic.
             low, high = 1, len(items) - start - 1
             count, body_bytes = 0, 0
             while low <= high:
@@ -358,18 +408,10 @@ class ChoiceSelector:
                     candidate_count=len(current),
                 ) if report else nullcontext({}) as round_timing:
                     with report.span("selection.grouping") if report else nullcontext({}) as grouping_timing:
-                        groups = [current[start : start + GROUP_SIZE] for start in range(0, len(current), GROUP_SIZE)]
-                        questions = {}
-                        group_keys = []
-                        final_round = len(current) <= GROUP_SIZE
-                        for group_index, group in enumerate(groups):
-                            key = f"{round_id}_g{group_index}"
-                            group_keys.append(key)
-                            criteria = {candidate.key: candidate.description for candidate in group}
-                            questions[key] = Choice(
-                                instructions=QUESTION,
-                                criteria=criteria,
-                            )
+                        round_state = deepcopy(original_request)
+                        groups, questions = self._group_candidates(round_state, current, round_id)
+                        group_keys = list(questions)
+                        final_round = len(groups) == 1
                         action_keys = {}
                         timing_keys = {}
                         if final_round and stage == "controls":
@@ -403,7 +445,6 @@ class ChoiceSelector:
                     ) if report else nullcontext({}) as packing_timing:
                         # Selection, action choices, and hypothetical timers are
                         # fixed before sizing and independent across batches.
-                        round_state = deepcopy(original_request)
                         questions = deepcopy(questions)
                         batches = self._pack_questions(round_state, questions)
                         packing_timing["batch_count"] = len(batches)
