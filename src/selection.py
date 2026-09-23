@@ -28,7 +28,7 @@ PINNED_MODEL = "jev-1.13.0"
 GROUP_SIZE = 10
 REQUEST_BUDGET_BYTES = 90_000
 # Include the boundary exactly; retain raw Nouls for later policy evaluation.
-WORD_INCLUSION_THRESHOLD = 0.80
+WORD_INCLUSION_THRESHOLD = 0.70
 SETTLING_MS = {
     "<50ms": 50,
     "100ms": 100,

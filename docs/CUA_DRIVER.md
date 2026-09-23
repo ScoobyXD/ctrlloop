@@ -189,9 +189,17 @@ An accessibility provider may raise or focus its window; direct activation does
 not guarantee background preservation. The pipeline's existing explicit
 `bring_to_front` step also remains in place.
 
+Targeted text entry uses the existing native `delivery_mode` argument. The app
+defaults supported observed browser process names to `foreground`; other apps
+retain the native default. `--delivery-mode {foreground,background}` or Python's
+`run_pipeline(..., delivery_mode=...)` overrides that choice for targeted typing
+only. The [main workflow](main-workflow.md#resolving-and-entering-text) documents
+the exact name policy. This changes no driver default, click delivery, or desktop
+Windows Search command, and adds no automatic delivery-mode retry.
+
 If the synthetic Windows Search window wins, its activation stage instead sends
 `hotkey({scope: "desktop", keys: ["win", "s"]})` and directly follows it with
-`type_text({scope: "desktop", text: <exact supplied text>})`. There is no
+`type_text({scope: "desktop", text: <resolved text>})`. There is no
 intervening observation, confirmation, sleep, control search, or Jev call. Both
 commands use the same MCP client and iteration; the next iteration observes the
 real search results without a settling wait. Real Start/Search windows remain
@@ -201,15 +209,20 @@ is not observed and the opener wins again immediately after the identical query,
 the pipeline returns `observation_unavailable` without another hotkey or typing
 call. The adapter retains each native result, and uncertain input is never replayed.
 
-Supply the exact query with `--text` or `run_pipeline(..., text=...)`; the app
-does not extract it from the request. Valid strings are preserved verbatim,
-while explicitly empty or whitespace-only strings are rejected. If Windows
-Search wins with no supplied text, the pipeline returns `no_action` before
-sending Win+S or typing.
+Supply the exact query with `--text` or `run_pipeline(..., text=...)`. Valid
+strings are preserved verbatim, while explicitly empty or whitespace-only
+strings are rejected. Otherwise, one round of source-word Nouls selects every
+word meeting `>= 0.70` in request order before either command. No selected words
+returns `no_action` before sending Win+S or typing.
 
-The `action_returned` event records driver facts, including an `unverifiable` or
-`suspected_noop` effect. It does not prove the application goal; the loop observes
-again to select the next action. `iteration_limit`/exit 2 does not establish completion.
+The `action_returned` event and `last_action.result` preserve native response
+facts, including their actual effect and delivery metadata. Clicks continue to
+fresh selection; successful targeted typing continues with `confirmed` or
+`unverifiable` effect, using the normal settling wait when another iteration
+remains. Targeted `partial` or `suspected_noop` effects still stop with
+`observation_unavailable`; unknown or malformed native effects fail adapter
+validation as `invalid_action_result`. No unverified typing is automatically replayed and no
+verification stage is added. `iteration_limit`/exit 2 does not establish completion.
 Native failures retain their diagnostic payload and return `error`/exit 1.
 See [full CLI status and report details](../README.md#run).
 

@@ -110,8 +110,11 @@ source spans throughout the run; do not regenerate or rewrite the request.
    preserving previous action/control history. No selected words returns
    `no_action`. Immediately before native dispatch, record the selected control,
    action, and source window as the latest attempted action. Execute the selected
-   native CUA action using the original snapshot target and retain its result. Unconfirmed
-   targeted typing stops with `observation_unavailable` to avoid automatic retyping.
+   native CUA action using the original snapshot target and retain its result.
+   Successful targeted typing with `confirmed` or `unverifiable` effect continues;
+   explicit `partial` or `suspected_noop` effects stop with
+   `observation_unavailable`. Unknown or malformed native effects fail adapter
+   validation. Native errors fail without replaying typing.
 7. At the iteration limit, return `iteration_limit` without another wait or
    observation. Otherwise, wait the winning control/action's timer interval after CUA
    returns, then begin the next iteration.
@@ -145,7 +148,7 @@ Every window and control request carries the same run context:
 | `iteration` | Current decision cycle, starting at 1; it does not count completed clicks. |
 | `current_window` | Observed app/title metadata, refreshed from discovery and changed when a new window is selected; `null` before selection or when the old window is absent. |
 | `last_control` | Previous dispatched control as `{window, control, action}`, or `null` before control dispatch. Retain it during text resolution; update immediately before dispatch. |
-| `last_action` | Previous tool and filtered native delivery/result facts, available after an action attempt. Text entry also retains the exact entered text. |
+| `last_action` | Previous tool and complete native response in `result`, including effect, route, delivery, and any evidence/escalation metadata, available after an action attempt. Text entry also retains the exact entered text. |
 
 One mutable dictionary is reused within the run. Each round freezes the current
 state for sizing and parallel dispatch. Each request serializes that complete
@@ -248,8 +251,8 @@ converted into a ten-word Choice group. Collect and validate every batch before
 deciding inclusion or dispatching text. No text call is needed after a click
 choice or for an explicit Windows Search `--text` override.
 
-Include every word whose Noul probability is **at least 0.80 (`>= 0.80`)**,
-including exactly 0.80. Preserve source order even when selected words are
+Include every word whose Noul probability is **at least 0.70 (`>= 0.70`)**,
+including exactly 0.70. Preserve source order even when selected words are
 separated by omitted words. The threshold determines the final selected words;
 there is no second Jev question, best-span choice, or span-length limit.
 No selected words returns `no_action`. A request or response failure remains an
@@ -266,17 +269,32 @@ packing happens before the round's requests are sent; a later provider rejection
 remains an error, without automatic smaller retries or truncation.
 
 For an observed control, the existing adapter sends native `type_text` with the
-same snapshot-bound target used for clicking. CUA Driver 0.28.2's Windows
-background UIA path appends to the existing value. The pipeline does not clear
-the field, select all, infer caret placement, switch to foreground delivery, or
-retry typing. Controls and editors unsupported by this path are not universal
-text-entry coverage.
+same snapshot-bound target used for clicking. A supplied `delivery_mode` of
+`foreground` or `background` is passed directly to this existing CUA argument.
+Without an override, the app explicitly sends `foreground` for these observed
+process basenames: `chrome`, `chromium`, `msedge`, `brave`, `opera`, `vivaldi`, and
+`firefox`. Matching uses the freshest existing `current_window.app_name`, is
+case-insensitive, and permits an optional `.exe` suffix. Titles and window
+classes are not used to infer a browser. Unknown and non-browser apps omit the
+argument, preserving the native default. This policy applies only to targeted
+typing; clicks and Windows Search desktop commands ignore the override.
 
-The native response's effect and readback facts remain in the report. Targeted
-typing continues only with a confirmed effect; otherwise the pipeline stops
-with `observation_unavailable`. A confirmed effect does not mean the overall
-task is complete. A later iteration makes the existing fresh observation; no
-extra Jev verification question or invented durable control identity is added.
+CUA Driver 0.28.2's Windows background UIA path appends to the existing value.
+The pipeline does not clear the field, select all, infer caret placement, or
+automatically retry typing with another delivery mode. Delivery uses the existing
+native enum; no Jev delivery-mode question or native-driver default change is
+needed. Unsupported controls still fail through the existing error path.
+
+The native response's effect, delivery metadata, and readback facts remain in the
+report and `last_action`. Successful targeted typing with `effect: "confirmed"`
+or `"unverifiable"` continues through the normal settling wait and next fresh
+observation when another iteration is allowed. The actual effect is never
+relabeled. Explicit `partial` or `suspected_noop` effects still stop with
+`observation_unavailable`; unknown or malformed native effects fail adapter
+validation as `invalid_action_result`. Hard CUA errors still fail. Unverified delivery
+does not automatically repeat typing or establish task completion. The next
+iteration uses the existing observe/select/act loop, without an extra verification
+stage, Jev question, or invented durable control identity.
 Windows Search keeps its existing desktop action and observation behavior.
 
 The selected native tool is retained as `Selection.action`. Final control traces
@@ -284,7 +302,7 @@ store `actions[candidate]` with its question key and chosen tool, and
 `settling[candidate][action]` with its question key, Choice answer, and
 milliseconds. The text stage uses the same `Selection` and `api_calls` records,
 including packing, batch, and prepared `body_bytes` information. `text_r1` retains
-every Noul probability, `threshold: 0.80`, `threshold_comparison: ">="`,
+every Noul probability, `threshold: 0.70`, `threshold_comparison: ">="`,
 `selected_indices`, `selected_offsets`, and assembled `text` or an unresolved
 `reason`. Its optional `source_span` records the exact source range only when the
 selected words were contiguous; it is omitted for disjoint selections. Text
@@ -297,7 +315,7 @@ uv run --locked python src/main.py 'Click the Test button in my test window.' --
 uv run --locked python src/main.py 'Open Chrome using Windows Search.' --text 'Chrome'
 ```
 
-The Python API is `run_pipeline(request, driver, selector, max_iterations=10, text=None)`.
+The Python API is `run_pipeline(request, driver, selector, max_iterations=10, text=None, delivery_mode=None)`.
 `--max-iterations` and the Python argument must be positive integers, default 10.
 `--text` and the Python `text` argument supply the exact query for the Windows
 Search route; they do not force its selection. Explicitly empty or whitespace-only
@@ -305,6 +323,9 @@ strings are rejected. Valid override text is retained verbatim, without
 rewriting, trimming, or line-ending normalization. Without that override, Search
 uses the same source-word selection as observed control text entry. The override
 does not replace the text selected for other fields.
+`--delivery-mode {foreground,background}` and Python's `delivery_mode` choose the
+existing native mode for targeted control typing; omitting them uses the browser
+policy above. The choice does not alter clicks or desktop Windows Search.
 Callers can supply `sleep=` for deterministic tests. The connection check in
 `scripts/check_jev.py` uses the production selector with one fictional control:
 one selection, one action Choice, and two timers in one call, with production response validation
@@ -317,7 +338,7 @@ and no desktop action.
 | `no_windows` | No window candidates; normally unreachable with Windows Search enabled. | 2 |
 | `no_controls` | Valid observation/synthetic definition has no indexed controls. | 2 |
 | `observation_degraded` | Degraded read has no indexed controls. | 2 |
-| `observation_unavailable` | Structured controls/snapshot identity unavailable, repeated unobserved Search query, or targeted typing unconfirmed. | 2 |
+| `observation_unavailable` | Structured controls/snapshot identity unavailable, repeated unobserved Search query, or targeted typing with `partial` or `suspected_noop` effect. | 2 |
 | `error` | Driver, configuration, or Jev request/response failure. | 1 |
 
 One persistent CUA MCP client belongs to each run. It opens lazily and closes on
@@ -335,13 +356,14 @@ delivery, not screen readiness or completion.
 | Jev timeout/retries | 30-second HTTP timeout configuration, zero automatic retries; not a total run deadline. |
 | CUA timeout/retries | 60-second deadline per transport attempt including lazy startup; reads may reconnect/retry once, actions are not replayed. |
 | Batching | Up to 10 window/control candidates per group. All rounds pack whole questions into HTTP bodies of at most 90,000 bytes and dispatch parallel batches; action/timers included before sizing the final control round; one Noul per source word in `text_r1`. |
-| Text assembly | All words meeting `>= 0.80` are typed in source order. Adjacent selected words retain their source whitespace; omitted-word gaps become one space. |
-| Settling | One 50–500 ms scheduled wait after a control click or confirmed targeted text action when another iteration follows; none on the Windows Search route. |
+| Text assembly | All words meeting `>= 0.70` are typed in source order. Adjacent selected words retain their source whitespace; omitted-word gaps become one space. |
+| Text delivery | Explicit native mode overrides the observed browser foreground default for targeted typing; unknown/non-browser targets retain the native default. No automatic mode retry. |
+| Settling | One 50–500 ms scheduled wait after a control click or confirmed/unverifiable targeted text action when another iteration follows; none on the Windows Search route. |
 | Iterations | Positive bound, default 10; no automatic completion judgment. |
 | Model | Exact pin `jev-1.13.0`, validated on every response. |
 | Action scope | Observed control clicks/targeted text entry and direct Windows Search activation/text entry; no coordinate fallback, automatic action retry, or general recovery planner. |
 | Response validation | Exact question/option labels and expected Choice/Noul answer kinds; finite probabilities/confidence in [0, 1]; Choice totals 0.97–1.03; nonnegative integer token counts. |
-| Confidence gating | Choices advance directly without ranking across groups; word Nouls use `>= 0.80` for inclusion. |
+| Confidence gating | Choices advance directly without ranking across groups; word Nouls use `>= 0.70` for inclusion. |
 
 Controls require structured indexed observations and snapshot identities. Actions
 use an observed element token or an element index with its snapshot ID. Old

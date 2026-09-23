@@ -9,7 +9,7 @@ and starts the next selection from fresh observations.
 Choosing Windows Search instead sends desktop **Win+S**, then directly types the
 query resolved before activation. An explicit `--text` supplies the exact Search
 query; otherwise Jev evaluates source words in one text round and code types every
-word meeting the inclusive 80% threshold, in source order. The round uses one
+word meeting the inclusive 70% threshold, in source order. The round uses one
 call when it fits the byte budget or parallel calls when needed.
 The Win+S-to-typing handoff has no intervening observation,
 confirmation, sleep, control selection, or Jev call. The next iteration observes
@@ -33,8 +33,11 @@ The loop
 uses the same generic question for every window and control selection round;
 every group selects a supplied candidate. It does not add automatic click escalation,
 coordinate fallback, additional waits, or action retries. Targeted text entry
-uses CUA's existing `type_text` operation and default background delivery. Its pinned Windows UIA path appends to
-the existing value; it does not implement replacement or caret insertion.
+uses CUA's existing `type_text` operation, explicitly choosing foreground delivery
+for supported browsers from their observed application identity. Other targets
+keep the native default unless a delivery mode is supplied. The pinned Windows
+background UIA path appends to the existing value; the app adds no replacement
+or caret-placement operation.
 
 The synthetic Windows Search opener is available when fresh discovery has no
 visible `SearchHost.exe` window titled `Search`. While that destination is open,
@@ -128,6 +131,18 @@ endings; explicitly empty or whitespace-only values are rejected. This override
 applies only to Windows Search and does not force Jev to select it. Other typing
 actions, and Search without the override, use words selected from the original
 request. No generative model rewrites or supplies missing text.
+
+Pass `--delivery-mode foreground` or `--delivery-mode background` (or
+`run_pipeline(..., delivery_mode="foreground")` / `"background"`) to choose the
+existing native delivery mode for targeted control typing. An explicit choice
+wins over the browser default. With no override, the app sends `foreground` when
+the freshest observed `current_window.app_name` is `chrome`, `chromium`, `msedge`,
+`brave`, `opera`, `vivaldi`, or `firefox`, compared case-insensitively with an
+optional `.exe` suffix. This small process-name policy does not infer a browser
+from its title or window class. Unknown and non-browser apps omit the argument
+and retain CUA's default. Clicks and Windows Search's desktop commands keep
+their existing behavior even when an override is supplied. No delivery-mode
+question or automatic background-to-foreground retry is added.
 
 Each iteration executes one selected control click/text action or the Windows Search
 activation-and-typing sequence. The next iteration discovers
@@ -247,7 +262,7 @@ it is not automatically attributed to daemon access.
 | `no_windows` | No first-stage candidate selected; normally unreachable with the Windows Search option | 2 |
 | `no_controls` | A valid read returned no indexed controls, or a synthetic window defines no controls | 2 |
 | `observation_degraded` | A degraded read returned no indexed controls | 2 |
-| `observation_unavailable` | Structured controls/snapshot identity unavailable, repeated unobserved Search query, or targeted typing unconfirmed | 2 |
+| `observation_unavailable` | Structured controls/snapshot identity unavailable, repeated unobserved Search query, or targeted typing with `partial` or `suspected_noop` effect | 2 |
 | `error` | Driver, configuration, or Jev request/response failure | 1 |
 
 Nonempty degraded observations remain selectable and retain their quality flags.
@@ -259,10 +274,16 @@ native refusals and failures return `error`/exit 1.
 `direct_accessibility_unsupported` means the daemon lacks the required contract,
 or the target/gesture has no supported direct activation. `direct_accessibility_failed`
 means direct activation failed or the driver returned a prohibited route.
-A targeted text action continues only after CUA reports a confirmed effect.
-Otherwise the run stops with `observation_unavailable`, retaining the native facts
-without automatically typing the same text again. This does not assess task
-completion. Windows Search retains its desktop handoff and fresh-observation flow.
+A successful targeted text action with `effect: "confirmed"` or `"unverifiable"`
+continues through the existing settling wait and fresh observation when another
+iteration remains. Reports and `last_action` preserve the actual effect and native
+metadata; an unverified dispatch is not relabeled as confirmed. Explicit `partial`
+or `suspected_noop` effects still stop with `observation_unavailable`; unknown or
+malformed native effects fail adapter validation as `invalid_action_result`.
+Native errors still fail. Typing is not automatically
+repeated because it was unverified, and no verification stage is added. This
+does not assess task completion. Windows Search retains its desktop handoff and
+fresh-observation flow.
 A timeout or unreadable response leaves delivery unknown and is never retried.
 
 ## Debug in VS Code
@@ -428,7 +449,7 @@ character offsets. Text round `text_r1` asks one Noul per source word, using the
 selected destination as context. The same 90,000-byte budget applies: use one
 API call when it fits, otherwise parallel batches of whole Noul questions.
 Collect and validate all answers before applying the inclusive inclusion rule:
-**probability >= 0.80**. Type every selected word in source order, including words
+**probability >= 0.70**. Type every selected word in source order, including words
 separated by omitted words. There is no second Jev selection, preferred phrase,
 or span-length limit. No selected words returns `no_action`.
 
@@ -445,8 +466,8 @@ fresh `current_window` identity and `last_control`. The window is null before
 selection or when missing; the last control is null until control action dispatch.
 Before dispatch, set `last_control` to `{window, control, action}` with its source
 window, descriptive control fields, and chosen tool. After CUA returns, `last_action` retains
-the tool and filtered native result facts for the next selection. The Windows
-Search route has no selected control; its final `last_action` records `type_text`,
+the tool and complete native result in `last_action.result` for the next selection.
+The Windows Search route has no selected control; its final `last_action` records `type_text`,
 the exact text, and native result facts.
 Text resolution still sees the previous action/control history; the pending
 control replaces `last_control` only immediately before its native dispatch.
@@ -508,7 +529,7 @@ call in the round's `api_calls` list. See
 Returned model identity, question keys, answer type, option labels, probability
 shape, and usage are validated. Choice confidence and probabilities never rank
 winners across groups or gate advancement. The word-inclusion Nouls use their
-probabilities for inclusion at `>= 0.80`; they do not alter control elimination.
+probabilities for inclusion at `>= 0.70`; they do not alter control elimination.
 
 ## Observation limits
 
@@ -519,8 +540,8 @@ payload, preserving tool errors before accepting an observation.
 For a real control, the selected action is `click` or `type_text`, using the selected
 window's `pid`/`window_id` and the original `element_token`, or the matching
 `element_index`/`snapshot_id` pair when no token is present. After a click or
-confirmed targeted text entry, the loop waits and observes again for the next
-selection when another iteration remains. Text entry preserves native readback
+confirmed or unverifiable targeted text entry, the loop waits and observes again
+for the next selection when another iteration remains. Text entry preserves native readback
 facts and does not add a separate Jev verification call.
 The patched click operation accepts a single left activation of a snapshot target.
 Coordinate, desktop, foreground-delivery, modified, multi-click, right-click, and
