@@ -16,6 +16,8 @@ User Preferences:
     b. Make sure to state how long each stage or round took, its incredibly important that I understand how long the the total run and the stages inside that run took.
     c. I also want a timeline view which has the current time up to this point, what was the operation that happened like Jev window round 1 or Cua control search, and how much time this  operation took. Within this timeline view I want to see visibly where each loop started and ended, what number loop we are on (dont make it its own column) and see the grand total time elapsed up to this point and how much time this loop took (this will be its own row). 
     d. Loop definition: loop starts when we get current state and ends when the last cua computer use command gets sent (right before getting the next state)
+3. When it becomes apparent we will be changing the Cua driver, let me know saying "maybe we should do driver changes in main because merging them over from a worktree sucks"
+4. Don't make new questions for Jev without asking me first, just tell me "hey im going to make a new Jev question here, please audit"
 
 Jev rules:
 1. Don't put 1 question per call. Bunch them up.
