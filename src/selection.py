@@ -1,14 +1,19 @@
 """Groups-of-ten Choice elimination for windows and controls."""
 
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import copy_context
 from copy import deepcopy
 from dataclasses import dataclass, field
 import logging
 import math
 from typing import Any, TYPE_CHECKING
 
-from typesafe_sdk import Choice, TypeSafeError
+import httpx2
+from typesafe_sdk import Choice, SystemOneResponse, TypeSafeError
+from typesafe_sdk._core.config import Config
+from typesafe_sdk._core.endpoints import prepare_system_one
 
 if __package__:
     from .jev_questions import QUESTION, TIMER
@@ -21,7 +26,7 @@ if TYPE_CHECKING:
 
 PINNED_MODEL = "jev-1.13.0"
 GROUP_SIZE = 10
-CONTROL_CANDIDATES_PER_CALL = 400
+REQUEST_BUDGET_BYTES = 90_000
 SETTLING_MS = {
     "<50ms": 50,
     "100ms": 100,
@@ -59,6 +64,32 @@ def _probability(value: Any) -> bool:
     )
 
 
+def _request_body_size(state: str | dict[str, Any], questions: dict[str, Choice], model: str) -> int:
+    """Count the encoded body with the pinned SDK's own request builder.
+
+    SDK 0.7.1 has no public preparation API. Isolate its internal builder here
+    instead of duplicating the request schema or serializer. This sends no HTTP
+    request; system_one receives the same state, questions, and model to send.
+    """
+    config = Config(
+        api_key="local-sizing-only", base_url="https://api.typesafe.ai",
+        default_model=model, timeout=30.0, default_headers=httpx2.Headers(),
+    )
+    try:
+        prepared = prepare_system_one(
+            config, state, questions, model, None, None, None, SystemOneResponse,
+        )
+    except TypeSafeError as error:
+        # Local preparation must retain judge's sanitized error contract too.
+        status = getattr(error, "status", None)
+        safe_status = status if type(status) is int else "unavailable"
+        raise SelectionError(
+            f"TypeSafe request failed: {type(error).__name__} (HTTP {safe_status})."
+        ) from None
+    assert prepared.content is not None
+    return len(prepared.content)
+
+
 class ChoiceSelector:
     def __init__(
         self,
@@ -77,10 +108,16 @@ class ChoiceSelector:
     ) -> tuple[dict[str, str], dict]:
         """Submit one complete batch using the pinned client and shared validation."""
         try:
+            body_bytes = _request_body_size(state, questions, self.model)
+            if body_bytes > REQUEST_BUDGET_BYTES:
+                raise SelectionError(
+                    f"Jev request exceeds the {REQUEST_BUDGET_BYTES}-byte request budget."
+                )
             # SDK time includes request encoding and response decoding. The
             # report's HTTP timing separately measures the client-observed call.
             with report.span(
                 "selection.sdk_call", question_keys=list(questions),
+                body_bytes=body_bytes, request_budget_bytes=REQUEST_BUDGET_BYTES,
             ) if report else nullcontext({}) as sdk_timing:
                 response = self.client.system_one(
                     state=state, questions=questions, model=self.model
@@ -102,12 +139,97 @@ class ChoiceSelector:
         with report.span("selection.response_validation") if report else nullcontext({}) as validation_timing:
             choices, trace = self._validate_response(questions, response)
             trace["state"] = deepcopy(state)
+            trace.update(body_bytes=body_bytes, request_budget_bytes=REQUEST_BUDGET_BYTES)
         if report:
             trace.update(
                 sdk_span_id=sdk_timing["span_id"],
                 response_validation_span_id=validation_timing["span_id"],
             )
         return choices, trace
+
+    def _pack_questions(
+        self, state: str | dict[str, Any], questions: dict[str, Choice],
+    ) -> list[tuple[dict[str, Choice], int]]:
+        """Measure the full round first, then find the largest fitting prefixes."""
+        items = list(questions.items())
+        batches = []
+        start = 0
+        while start < len(items):
+            remaining = dict(items[start:])
+            remaining_bytes = _request_body_size(state, remaining, self.model)
+            if remaining_bytes <= REQUEST_BUDGET_BYTES:
+                batches.append((remaining, remaining_bytes))
+                break
+
+            # Adding a question increases the encoded body size. Search whole
+            # question prefixes so groups of ten are never split internally.
+            low, high = 1, len(items) - start - 1
+            count, body_bytes = 0, 0
+            while low <= high:
+                middle = (low + high) // 2
+                size = _request_body_size(state, dict(items[start:start + middle]), self.model)
+                if size <= REQUEST_BUDGET_BYTES:
+                    count, body_bytes = middle, size
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if not count:
+                raise SelectionError(
+                    f"A complete question with shared state exceeds the "
+                    f"{REQUEST_BUDGET_BYTES}-byte request budget."
+                )
+            batches.append((dict(items[start:start + count]), body_bytes))
+            start += count
+        return batches
+
+    def _judge_batches(
+        self, state: str | dict[str, Any], batches: list[tuple[dict[str, Choice], int]],
+        group_sizes: dict[str, int], *, report: "RunReport | None",
+    ) -> tuple[dict[str, str], list[dict]]:
+        def run_batch(index: int, batch: tuple[dict[str, Choice], int]):
+            questions, body_bytes = batch
+            batch_groups = [key for key in questions if key in group_sizes]
+            candidate_count = sum(group_sizes[key] for key in batch_groups)
+            with report.span(
+                "selection.batch", batch=index + 1, batch_count=len(batches),
+                batch_candidate_count=candidate_count, group_keys=batch_groups,
+                question_keys=list(questions), body_bytes=body_bytes,
+                request_budget_bytes=REQUEST_BUDGET_BYTES,
+            ) if report else nullcontext({}) as timing:
+                choices, trace = self.judge(state, questions, report=report)
+                trace.update(
+                    batch=index + 1, batch_count=len(batches),
+                    candidate_count=candidate_count, group_keys=batch_groups,
+                )
+                if report:
+                    trace["batch_span_id"] = timing["span_id"]
+                return choices, trace
+
+        if len(batches) == 1:
+            results = [run_batch(0, batches[0])]
+        else:
+            # Submit every independent batch before waiting. Each worker keeps
+            # its own report context, inherited from this selection round.
+            with ThreadPoolExecutor(thread_name_prefix="jev-batch") as executor:
+                futures = [
+                    executor.submit(copy_context().run, run_batch, index, batch)
+                    for index, batch in enumerate(batches)
+                ]
+                try:
+                    results = [future.result() for future in futures]
+                except BaseException:
+                    for future in futures:
+                        future.cancel()
+                    raise
+
+        chosen = {}
+        api_calls = []
+        for choices, trace in results:
+            # Each response has been validated against its exact question keys.
+            # Ordered futures preserve batch order despite out-of-order replies.
+            chosen.update(choices)
+            api_calls.append(trace)
+        return chosen, api_calls
 
     def _validate_response(
         self, questions: dict[str, Choice], response: Any
@@ -242,37 +364,19 @@ class ChoiceSelector:
                                     },
                                     criteria={label: None for label in SETTLING_MS},
                                 )
-                        groups_per_call = (
-                            CONTROL_CANDIDATES_PER_CALL // GROUP_SIZE
-                            if stage == "controls" else len(groups)
-                        )
-                        batches = [
-                            group_keys[start : start + groups_per_call]
-                            for start in range(0, len(group_keys), groups_per_call)
-                        ]
-                    chosen = {}
-                    api_calls = []
-                    for batch_index, batch_keys in enumerate(batches, start=1):
-                        batch_candidate_count = sum(len(questions[key].criteria) for key in batch_keys)
-                        # Finalist timers stay in the final round's single batch.
-                        batch_questions = {
-                            key: questions[key] for key in (*batch_keys, *timing_keys.values())
-                        }
-                        with report.span(
-                            "selection.batch", batch=batch_index, batch_count=len(batches),
-                            batch_candidate_count=batch_candidate_count,
-                        ) if report else nullcontext({}) as batch_timing:
-                            batch_choices, api_call = self.judge(
-                                original_request, batch_questions, report=report,
-                            )
-                            api_call.update(
-                                batch=batch_index, batch_count=len(batches),
-                                candidate_count=batch_candidate_count,
-                            )
-                            if report:
-                                api_call["batch_span_id"] = batch_timing["span_id"]
-                            chosen.update(batch_choices)
-                            api_calls.append(api_call)
+                    with report.span(
+                        "selection.packing", request_budget_bytes=REQUEST_BUDGET_BYTES,
+                    ) if report else nullcontext({}) as packing_timing:
+                        # State, selection questions, and finalist timers are
+                        # fixed before sizing and shared by all parallel calls.
+                        round_state = deepcopy(original_request)
+                        questions = deepcopy(questions)
+                        batches = self._pack_questions(round_state, questions)
+                        packing_timing["batch_count"] = len(batches)
+                    chosen, api_calls = self._judge_batches(
+                        round_state, batches,
+                        dict(zip(group_keys, map(len, groups), strict=True)), report=report,
+                    )
                     # Advance only after every batch in this round succeeds.
                     with report.span("selection.advancement") if report else nullcontext({}) as advancement_timing:
                         winners = []
@@ -310,6 +414,7 @@ class ChoiceSelector:
                         round_trace.update(
                             span_id=round_timing["span_id"],
                             grouping_span_id=grouping_timing["span_id"],
+                            packing_span_id=packing_timing["span_id"],
                             advancement_span_id=advancement_timing["span_id"],
                         )
                     rounds.append(round_trace)

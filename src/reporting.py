@@ -2,12 +2,14 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import math
 import os
 from pathlib import Path
+from threading import RLock
 from time import perf_counter_ns, time_ns
 from types import TracebackType
 from typing import Any, Self
@@ -65,8 +67,12 @@ class RunReport:
         self._origin_ns = perf_counter_ns() if origin_ns is None else origin_ns
         self._origin_wall_ns = time_ns() if origin_wall_ns is None else origin_wall_ns
         self.origin_label = origin_label
+        self._lock = RLock()
         self._span_count = 0
-        self._contexts: list[dict[str, Any]] = []
+        # Workers inherit the round context, then replace their own span stack.
+        self._contexts: ContextVar[tuple[dict[str, Any], ...]] = ContextVar(
+            f"report_context_{id(self)}", default=(),
+        )
         self._pending_requests: dict[int, dict[str, Any]] = {}
         self._first_request_ns: int | None = None
         self._write_ns = 0
@@ -127,9 +133,10 @@ class RunReport:
         return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
     def _context(self) -> dict[str, Any]:
-        if not self._contexts:
+        contexts = self._contexts.get()
+        if not contexts:
             return {}
-        return {key: value for key, value in self._contexts[-1].items() if key != "_started_ns"}
+        return {key: value for key, value in contexts[-1].items() if key != "_started_ns"}
 
     def _summary(self, at_ns: int) -> dict[str, Any]:
         return {
@@ -157,14 +164,18 @@ class RunReport:
             self._finished_ns = at_ns
             record["timing"] = self._summary(at_ns)
         # Copy only the new observation. Immutable HTTP bytes need no copy or parse.
-        self._events.append(deepcopy(record))
+        record = deepcopy(record)
+        with self._lock:
+            self._events.append(record)
 
     def _new_span(self, operation: str, data: dict[str, Any]) -> dict[str, Any]:
-        self._span_count += 1
+        with self._lock:
+            self._span_count += 1
+            span_id = self._span_count
         context = self._context()
         return {
             **context, **data, "operation": operation,
-            "parent_span_id": context.get("span_id"), "span_id": self._span_count,
+            "parent_span_id": context.get("span_id"), "span_id": span_id,
         }
 
     def _finish_span(
@@ -186,7 +197,7 @@ class RunReport:
         span = self._new_span(operation, data)
         self.append("timing_started", **span)
         started_ns = perf_counter_ns()
-        self._contexts.append({**span, "_started_ns": started_ns})
+        token = self._contexts.set((*self._contexts.get(), {**span, "_started_ns": started_ns}))
         failure = None
         try:
             yield span
@@ -203,7 +214,7 @@ class RunReport:
                     self._finish_pending_requests(span["span_id"], finished_ns, failure)
                 self._finish_span(span, started_ns, finished_ns, status, failure)
             finally:
-                self._contexts.pop()
+                self._contexts.reset(token)
 
     def record_interval(
         self, operation: str, started_ns: int, finished_ns: int, **data: Any,
@@ -215,31 +226,34 @@ class RunReport:
 
     def on_request(self, request: httpx2.Request) -> None:
         """Capture the prepared request, then start timing before transport."""
-        self._request_count += 1
-        request_id = self._request_count
-        request.extensions[_REQUEST_ID_EXTENSION] = request_id
-        content = request.content
-        self.append(
-            "jev_request", request_id=request_id, method=request.method,
-            url=str(request.url.copy_with(userinfo=b"", query=None, fragment=None)),
-            body_bytes=len(content), body=content,
-            start_boundary="prepared_request_before_transport",
-        )
-        record = self._events[-1]
-        pending = {"context": self._context()}
-        self._pending_requests[request_id] = pending
-        # All payload capture precedes this boundary. Only lightweight timing
-        # assignments remain before httpx hands the encoded request to transport.
-        started_ns = perf_counter_ns()
-        pending["started_ns"] = started_ns
-        record["_at_ns"] = started_ns
-        record["elapsed_ms"] = self._elapsed_ms(started_ns)
-        if pending["context"].get("operation") == "selection.sdk_call":
-            sdk_start = self._contexts[-1]["_started_ns"]
-            record["request_preparation_duration_ms"] = (started_ns - sdk_start) / 1_000_000
-        record["started_elapsed_ms"] = record["elapsed_ms"]
-        if self._first_request_ns is None:
-            self._first_request_ns = started_ns
+        # Keep capture and timing initialization atomic with other appends.
+        # This lock is released before transport or any response-body read.
+        with self._lock:
+            self._request_count += 1
+            request_id = self._request_count
+            request.extensions[_REQUEST_ID_EXTENSION] = request_id
+            content = request.content
+            self.append(
+                "jev_request", request_id=request_id, method=request.method,
+                url=str(request.url.copy_with(userinfo=b"", query=None, fragment=None)),
+                body_bytes=len(content), body=content,
+                start_boundary="prepared_request_before_transport",
+            )
+            record = self._events[-1]
+            pending = {"context": self._context()}
+            self._pending_requests[request_id] = pending
+            # All payload capture precedes this boundary. Only lightweight timing
+            # assignments remain before httpx hands the encoded request to transport.
+            started_ns = perf_counter_ns()
+            pending["started_ns"] = started_ns
+            record["_at_ns"] = started_ns
+            record["elapsed_ms"] = self._elapsed_ms(started_ns)
+            if pending["context"].get("operation") == "selection.sdk_call":
+                sdk_start = self._contexts.get()[-1]["_started_ns"]
+                record["request_preparation_duration_ms"] = (started_ns - sdk_start) / 1_000_000
+            record["started_elapsed_ms"] = record["elapsed_ms"]
+            if self._first_request_ns is None:
+                self._first_request_ns = started_ns
 
     def on_response(self, response: httpx2.Response) -> None:
         """Retain the complete body before the SDK validates or rejects it."""
@@ -268,7 +282,8 @@ class RunReport:
         )
 
     def _request_timing(self, request_id: int | None, finished_ns: int, headers_ns: int) -> dict[str, Any]:
-        pending = self._pending_requests.pop(request_id, None)
+        with self._lock:
+            pending = self._pending_requests.pop(request_id, None)
         timing = {
             "response_headers_elapsed_ms": self._elapsed_ms(headers_ns),
             "response_body_read_duration_ms": (finished_ns - headers_ns) / 1_000_000,
@@ -286,10 +301,14 @@ class RunReport:
     def _finish_pending_requests(self, span_id: int, finished_ns: int, error: BaseException | None) -> None:
         # Public HTTP hooks have no transport-error callback. The enclosing SDK
         # exit is the first available failure boundary, not a claimed wire end.
-        for request_id, pending in list(self._pending_requests.items()):
-            if pending["context"].get("span_id") != span_id:
-                continue
-            del self._pending_requests[request_id]
+        with self._lock:
+            unfinished = [
+                (request_id, pending) for request_id, pending in self._pending_requests.items()
+                if pending["context"].get("span_id") == span_id
+            ]
+            for request_id, _ in unfinished:
+                del self._pending_requests[request_id]
+        for request_id, pending in unfinished:
             self.append(
                 "jev_request_unfinished", _at_ns=finished_ns, **{
                     **pending["context"], "request_id": request_id,
@@ -376,9 +395,9 @@ class RunReport:
                     )
                 elif record["operation"] == "selection.round":
                     if span_id in batches:
-                        # Batch processing intervals are disjoint. A span from
-                        # the first response to advancement would count later
-                        # HTTP calls as local response processing.
+                        # Sum local processing across batches even when they
+                        # overlap. A continuous interval would count waiting for
+                        # another HTTP response as local processing.
                         durations = [
                             batch["finished_elapsed_ms"]
                             - responses[batch["span_id"]]["finished_elapsed_ms"]

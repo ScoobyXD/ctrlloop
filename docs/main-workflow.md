@@ -14,13 +14,38 @@ The workflow uses exactly two question definitions in
 - `QUESTION` selects the next candidate at every window and control round,
   including the final round.
 - `TIMER` estimates the additional settling interval for a possible control click.
-  It is included once per finalist in the final control-selection request.
+  It is included once per finalist in the final control-selection round.
 
 These are two question types, reused as needed. A round with 40 groups still
-contains 40 instances of the selection question, all sent in one API call.
+contains 40 instances of the selection question, sent in one API call if the
+complete body fits the 90,000-byte budget, otherwise in parallel batches.
 There is no evidence-selection stage, action-confirmation question, or automatic
 completion judgment. Reaching the iteration limit does not assert that the
 user's request has been fulfilled.
+
+## Jev request budget
+
+**The application budget is 90,000 bytes per Jev API call, inclusive.** This is
+decimal **90 KB**, not 90 KiB. A prepared body of 90,000 bytes fits; 90,001 bytes
+exceeds the budget. `REQUEST_BUDGET_BYTES` in `src/selection.py` fixes this value;
+there is no request-budget CLI setting.
+
+Prepare the complete HTTP body locally through the pinned SDK's existing
+request builder, then count its encoded bytes. This is the same body measured
+as `len(request.content)` before transport. Count shared state, the model and
+JSON envelope, question IDs, instructions, candidate criteria, and every final
+control timer. Each call repeats its state and envelope, so count those bytes
+again for each call. HTTP headers and transport framing are outside the budget.
+Indented report-file sizes differ from the outgoing HTTP body sizes. Local sizing
+sends no API calls and creates no HTTP request events.
+
+The budget comes from a study of 780 successful calls in 38 saved runs:
+7,707,537 reported input tokens across 14,902,182 prepared HTTP body bytes, or
+approximately 1.93346 bytes per input token. Applying that observed ratio to a
+64,000-token reference gives approximately 123,741 bytes; reducing that by 25%
+gives approximately 92,806 bytes, rounded down to **90,000 bytes**. This is an
+application byte budget, not an exact tokenizer or a guarantee of passing Jev's
+token limits. The model remains pinned to `jev-1.13.0`.
 
 ## Vocabulary
 
@@ -30,7 +55,7 @@ user's request has been fulfilled.
 | Group | Up to 10 candidates considered together. |
 | Group question | One instance of `QUESTION` selecting a candidate from a group. |
 | Round | Evaluate all groups, then advance each group's selected candidate after every batch succeeds. |
-| API call | One request with a batch of group questions (up to 400 control candidates), plus any final control timers. |
+| API call | One request with a batch of whole questions and a complete body of at most 90,000 bytes, including any final control timers. |
 | Stage | Window discovery/selection, activation, control acquisition/selection, or action dispatch. |
 | Iteration | One decision cycle with fresh window discovery, selection, observation, and action when available. All calls in the cycle share its iteration number. |
 | Loop boundary for a timeline | Starts at current-state acquisition and ends when the last CUA command is sent: a control click or Windows Search text entry. Native return and any settling appear afterward, before the next loop starts. |
@@ -96,8 +121,9 @@ Every window and control request carries the same run context:
 | `last_control` | `null` until action selection, then `{window, control}` with source window and descriptive control fields. |
 | `last_action` | Previous tool and filtered native delivery/result facts, available after an action attempt. Windows Search text entry also retains the exact supplied text. |
 
-One mutable dictionary is reused within the run. Each request serializes a
-complete snapshot; this is not a server-side patch protocol. Round traces and
+One mutable dictionary is reused within the run. Each round freezes the current
+state for sizing and parallel dispatch. Each request serializes that complete
+snapshot; this is not a server-side patch protocol. Round traces and
 report events retain historical snapshots so later updates cannot change earlier
 requests. Refreshing the current window must not rewrite the source window
 retained with the previous control.
@@ -112,10 +138,12 @@ direct callers; the pipeline uses the existing shared dictionary.
 1. Divide candidates into groups of up to 10, preserving observed order.
 2. Give every group one `QUESTION` with only its candidates as criteria. There is
    no synthetic `none` response option.
-3. For controls, send consecutive batches of at most **400 candidates** (40 groups)
-   per Jev API call. Keep all window groups in one call. Final control timers share
-   the final round's single batch.
-4. Retain each selected option, confidence, and probability distribution.
+3. Include any final control timers and prepare the complete HTTP request through
+   the SDK. If it fits within **90,000 bytes**, send one call. Otherwise pack its
+   ordered questions into the largest contiguous batches that fit, keeping every
+   group question whole and counting shared state and the envelope in each body.
+4. Send the batches in parallel. Validate and retain each selected option,
+   confidence, and probability distribution by its existing question ID.
 5. After every batch succeeds, combine one winner per group in group order;
    regroup until one winner remains.
 
@@ -123,26 +151,27 @@ An initial singleton window bypasses Jev. A singleton control still receives the
 selection question and, for a real window, its timer. Every round uses the same
 `QUESTION` wording; observed window context is already in shared state.
 
-| Control round | Candidates entering | Groups / selection questions | API calls | Winners leaving |
-| --- | ---: | ---: | ---: | ---: |
-| 1 | 392 | 40 | 1 | 40 |
-| 2 | 40 | 4 | 1 | 4 |
-| 3 | 4 | 1 | 1 | 1 |
+| Control round | Candidates entering | Groups / selection questions | Winners leaving |
+| --- | ---: | ---: | ---: |
+| 1 | 392 | 40 | 40 |
+| 2 | 40 | 4 | 4 |
+| 3 | 4 | 1 | 1 |
 
-This uses three control calls in total. The final call adds four timers, for five questions
-in that request. Window selection with 17 candidates adds two calls: 17 become
-two winners, then one. The next iteration begins new window/control rounds.
+This uses three control rounds. The final round adds four timers, making five
+questions to measure before packing. Each round uses one call if its complete
+body fits, or parallel calls if it needs multiple batches. Window selection
+with 17 candidates adds two rounds: 17 become two winners, then one. The next
+iteration begins new window/control rounds.
 
-For 631 controls, round 1 sends the first 400 candidates in 40 groups and the
-remaining 231 in 24 groups, using two sequential API calls. All 64 winners enter
-round 2 together, then seven enter the final round: four control calls in total.
-For 647 controls, the first round sends 400 and 247 candidates in 40 and 25 groups.
-The rounds are `647 -> 65 -> 7 -> 1`, also using four control calls in total.
-For 1,000 controls, the first round sends 400, 400, and 200 candidates. The rounds
-are `1000 -> 100 -> 10 -> 1`, using three calls, then one, then one: five control
-calls in total. Larger rounds require further batches, each capped at 400 candidates.
+For 631 controls, the rounds are `631 -> 64 -> 7 -> 1`; for 647, they are
+`647 -> 65 -> 7 -> 1`; for 1,000, they are `1000 -> 100 -> 10 -> 1`.
+The prepared byte sizes determine API call boundaries, not a fixed candidate
+count. Multiple calls within a round remain one round.
 
-Questions within one call are independent. Later rounds depend on all earlier
+The shared SDK client dispatches batches through a thread pool. All batches are
+submitted before waiting; the pool bounds the number in flight. Answers may
+arrive in any order, but question IDs preserve their original group membership.
+Questions within a round are independent. Later rounds depend on all earlier
 group winners and start only after every batch response is validated. If any
 batch fails, selection stops before advancing or acting on partial results.
 Candidates are not silently removed.
@@ -212,7 +241,7 @@ delivery, not screen readiness or completion.
 | Description size | App/title/control text capped at 240 characters; up to two indexed ancestors with 120-character labels. Original request and source records remain intact. |
 | Jev timeout/retries | 30-second HTTP timeout configuration, zero automatic retries; not a total run deadline. |
 | CUA timeout/retries | 60-second deadline per transport attempt including lazy startup; reads may reconnect/retry once, actions are not replayed. |
-| Batching | Up to 10 candidates per group; at most 400 control candidates per call; window rounds use one call; timers only in final control call. |
+| Batching | Up to 10 candidates per group; whole questions packed into complete HTTP bodies of at most 90,000 bytes; parallel calls within a round; timers included before sizing the final control round. |
 | Settling | One 50–500 ms scheduled wait after a control click when another iteration follows; no settling wait on the Windows Search route. |
 | Iterations | Positive bound, default 10; no automatic completion judgment. |
 | Model | Exact pin `jev-1.13.0`, validated on every response. |
@@ -224,10 +253,12 @@ Controls require structured indexed observations and snapshot identities. Clicks
 use an observed element token or an element index with its snapshot ID. Old
 targets are cleared before new observation; stale failures are not replayed.
 
-There is no local token cap, byte-packing heuristic, or total runtime cap.
+There is no local token cap or total runtime cap.
 Provider limits apply to shared state plus questions; see
 [TypeSafe model documentation](https://docs.typesafe.ai/models). Observation and
-text bounds and the 400-candidate cap do not guarantee a batch fits those limits.
+text bounds and the 90,000-byte cap do not guarantee a batch fits those limits.
+Automatic token-limit retries, description compaction, and splitting within an
+oversized individual group are outside this implementation.
 
 ## Timing and reporting
 
@@ -242,6 +273,9 @@ and service work; it excludes request construction and response decoding. It is
 client-observed duration, not isolated inference time. All questions in a batch
 share that call's duration. Each round retains an `api_calls` list, including
 single-call rounds, with separate answers, usage, and timing references per call.
+Each call also records its prepared `body_bytes`. `selection.packing` measures
+local SDK preparation and sizing. Parallel call durations overlap, so their sum
+is not the round's elapsed time.
 
 Each cycle retains iteration, selections, native results, rounds, and route.
 Windows Search records both `hotkey` and `type_text` action events and timings

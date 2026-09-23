@@ -2,17 +2,18 @@
 
 The [main workflow](main-workflow.md) defines the selection and timing contract.
 A candidate is one window or control. A group contains up to ten candidates and
-advances one selected candidate. A control round sends batches of at most 400
-candidates, preserving groups of ten within each API call. All batch winners
-recombine before the next round starts. Window rounds send all their group
-questions in one API call. Every window and control group uses the same
+advances one selected candidate. Each window/control round prepares its complete
+HTTP body, then packs whole questions into bodies of at most 90,000 bytes.
+A fitting round uses one call; larger rounds dispatch batches in parallel.
+All batch winners recombine before the next round starts. Every window and
+control group uses the same
 `QUESTION` from [`src/jev_questions.py`](../src/jev_questions.py). The final control
-round's request also includes `TIMER` for every finalist. Only the chosen control's
+round includes `TIMER` for every finalist before sizing. Only the chosen control's
 timer is used. Windows Search bypasses control selection and timers: it sends
 Win+S and immediately types the supplied exact string in the same iteration.
 There is no intervening observation, confirmation, sleep, or Jev call, and no
 settling wait after typing. Each subsequent iteration starts with fresh window
-discovery. The candidate cap bounds request size; it is
+discovery. The byte cap bounds request size; it is
 not a token-limit guarantee for unusually long descriptions or shared state.
 
 The CLI collects events, timestamps, and actual Jev payloads in memory. At the end
@@ -38,7 +39,8 @@ reports/run-<timestamp>-<id>/
 The prefix uses at least four digits, expanding uniformly for longer runs to
 preserve chronological order across all inputs and outputs in the run. This file
 sequence is separate from `request_id`, which still pairs request/response events
-and counts API calls. Input files
+and counts API calls. Concurrent input/output files need not be adjacent; use
+request IDs to pair them. Input files
 contain the entire `model`, `state`, and `questions` payload, including failed
 calls. They use two-space indentation and a blank line between top-level fields,
 with `state` first, `questions` second, and remaining fields afterward. This
@@ -100,9 +102,9 @@ begins. Intervals marked `recorded_after_completion: true` were recorded after
 both boundaries were captured, as with startup and client cleanup.
 
 Nested operations overlap. A selection includes its rounds; a round includes
-forming groups, each batch's request preparation, API call, and response
-processing, and advancing all group winners. Do not add parent and child
-durations to reconstruct the total.
+forming groups, local packing, each batch's request preparation, API call, and
+response processing, and advancing all group winners. Parallel batch durations
+also overlap. Do not add them or parent and child durations to reconstruct the total.
 
 ## Following a run
 
@@ -138,14 +140,15 @@ recorded startup work. `initialization.request_read`,
 | `settling_wait` | The requested app/browser settling wait, starting after CUA returns for the action. |
 
 Within selection, inspect `selection.validation`, `selection.round`,
-`selection.grouping`, `selection.batch`, `selection.sdk_call`,
+`selection.grouping`, `selection.packing`, `selection.batch`, `selection.sdk_call`,
 `selection.response_validation`, and `selection.advancement`. A round starts
 before forming its groups and ends after all its winners are ready. A batch
 contains one SDK call and local validation/collection of its answers; batches
-execute sequentially. Only a singleton window can bypass selection. A singleton
-control is still selected, with its timing question in the same request when
-execution context is available. A trailing one-candidate group stays in the
-round's final batch.
+execute concurrently with independent reporting context and span ancestry.
+`selection.packing` measures local SDK preparation and byte sizing; it sends no
+API requests. Only a singleton window can bypass selection. A singleton control
+is still selected, with its timer included before packing when execution context
+is available. A trailing one-candidate group remains whole within the same round.
 
 Foreground activation precedes the newly selected real window's control snapshot.
 Windows Search uses `foreground_activation` for desktop Win+S, then directly
@@ -220,8 +223,9 @@ unique across the whole round. `iteration`, `round_id`, `batch`, and
 `question_keys` link each group to its API call. Every newly produced round trace
 uses one `api_calls` list, including rounds with only one call. Each call retains
 its own model identities, token usage, questions, answers, probabilities, and
-SDK/validation span IDs, plus its batch number, batch count, candidate count, and
-batch span ID. The round's groups retain their options and winners. Historical
+SDK/validation span IDs, plus its batch number, batch count, candidate count,
+prepared `body_bytes`, and batch span ID. The round's groups retain their options
+and winners in original group order, regardless of response order. Historical
 reports used a singular `api_call` record; consumers reading them should treat
 it as a one-item list. New reports do not duplicate the singular field.
 
@@ -234,8 +238,9 @@ be added together.
 The timing summary's `jev_api_call_count` counts actual prepared requests seen
 by the HTTP hook. It is zero when no request occurs; Python callers must register
 the report hooks to obtain this count. It can also be checked by counting
-`jev_request` events across all iterations. The per-finalist timing questions
-share the final control selection's call and duration. Inspect each
+`jev_request` events across all iterations, including failed calls; local sizing
+is excluded. Each per-finalist timer shares the duration of its batch in the
+final control round. Inspect each
 request/response pair to see its complete question and probability distributions;
 do not count individual questions as requests.
 
@@ -274,8 +279,9 @@ headers alone does not complete an API call.
 
 All questions in a batch share that API duration. Individual group question
 durations are not observed. Dividing call time by the number of groups does not
-measure per-question latency. Sum the round's HTTP request durations for its API
-time; the enclosing round duration also includes local preparation and processing.
+measure per-question latency. Parallel API durations overlap, so their sum is
+not the round's elapsed time. The enclosing round duration includes local packing,
+preparation, waiting for all batches, and processing.
 
 The enclosing `selection.sdk_call` includes SDK preparation and processing as
 well as the HTTP call. It is labeled separately and must not substitute for API
@@ -283,11 +289,12 @@ call duration. Local selection response validation follows the SDK return.
 
 The request event's `request_preparation_duration_ms` measures from SDK entry
 through the prepared request's transport boundary, including lightweight request
-capture. Each finished `selection.batch` with a complete response contains
+capture; earlier `selection.packing` work is measured separately. Each finished
+`selection.batch` with a complete response contains
 `response_processing_started_elapsed_ms`, `response_processing_finished_elapsed_ms`,
 and `response_processing_duration_ms`: complete response receipt through local
 validation and collection of that batch's answers. These fields include SDK
-decoding. The finished `selection.round` sums those disjoint processing durations
+decoding. The finished `selection.round` sums those per-batch processing durations
 and adds its winner-advancement duration once. It exposes the summed
 `response_processing_duration_ms` without a misleading continuous start/end
 interval that would include later batches' HTTP waits. Do not add the round
