@@ -7,17 +7,15 @@ from itertools import count
 from time import sleep as system_sleep
 from typing import Any, Protocol
 
-from typesafe_sdk import Choice
-
 if __package__:
     from .driver import DriverError
     from .reporting import RunReport
-    from .selection import Candidate, ChoiceSelector, SETTLING_MS
+    from .selection import Candidate, ChoiceSelector
     from .synthetic import DEFAULT_REGISTRY, SyntheticRegistry
 else:
     from driver import DriverError
     from reporting import RunReport
-    from selection import Candidate, ChoiceSelector, SETTLING_MS
+    from selection import Candidate, ChoiceSelector
     from synthetic import DEFAULT_REGISTRY, SyntheticRegistry
 
 
@@ -40,6 +38,7 @@ class PipelineResult:
     selections: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     reason: str | None = None
     action_result: dict[str, Any] | None = None
+    last_control: dict[str, Any] | None = None
 
     iterations: list[dict[str, Any]] = field(default_factory=list)
 
@@ -124,12 +123,12 @@ def _discover_windows(driver, report):
     return windows
 
 
-def _choose_window(original_request, windows, selector, result, report, synthetic, iteration=None):
+def _choose_window(state, windows, selector, result, report, synthetic, iteration=None):
     with report.span("candidate_preparation", stage="windows") if report is not None else nullcontext({}):
         candidates = window_candidates(windows, synthetic=synthetic)
     with report.span("window_selection", stage="windows") if report is not None else nullcontext({}):
         window_selection = selector.select(
-            original_request, candidates, stage="windows",
+            state, candidates, stage="windows",
             **({"report": report} if report is not None else {}),
         )
     _retain_rounds(result, "windows", window_selection.rounds, iteration)
@@ -137,6 +136,7 @@ def _choose_window(original_request, windows, selector, result, report, syntheti
         result.reason = "Window discovery returned no candidates."
         return None
     result.window = window_selection.winner.record
+    state["current_window"] = _app_context(result.window, {})
     if report is not None:
         report.append("window_selected", window=result.window, selections=window_selection.rounds)
     return window_selection.winner
@@ -163,7 +163,7 @@ def _activate_window(result, driver, report):
         report.append("action_returned", tool="bring_to_front", action_result=foreground_result)
 
 
-def _observe_window(result, driver, report):
+def _observe_window(state, result, driver, report):
     # Clear snapshot-bound targets before every read, including failed reads.
     result.control = None
     result.snapshot_id = None
@@ -188,6 +188,11 @@ def _observe_window(result, driver, report):
         })
         raise
     with report.span("observation_processing", stage="controls") if report is not None else nullcontext({}):
+        context = _app_context(result.window, snapshot)
+        if context != state["current_window"]:
+            # Replace metadata rather than editing the source window retained by
+            # last_control. A changed title does not imply a new window selection.
+            state["current_window"] = context
         result.snapshot_id = snapshot.get("snapshot_id")
         result.observation = {
             name: snapshot[name]
@@ -210,7 +215,7 @@ def _observe_window(result, driver, report):
     return snapshot
 
 
-def _observed_controls(result, snapshot, report):
+def _observed_controls(result, snapshot, report, *, stage="controls"):
     elements = snapshot.get("elements")
     if elements is None:
         result.status = "observation_unavailable"
@@ -224,17 +229,17 @@ def _observed_controls(result, snapshot, report):
         result.status = "observation_unavailable"
         result.reason = "The control observation has no snapshot identity."
         return None
-    with report.span("candidate_preparation", stage="controls") if report is not None else nullcontext({}):
+    with report.span("candidate_preparation", stage=stage) if report is not None else nullcontext({}):
         controls = control_candidates(elements)
     return controls
 
 
-def _prepare_window(original_request, windows, driver, selector, result, report, synthetic, iteration=None):
+def _prepare_window(state, windows, driver, selector, result, report, synthetic, iteration=None):
     result.status = "no_windows"
     result.reason = None
     result.control = None
     result.snapshot_id = None
-    winner = _choose_window(original_request, windows, selector, result, report, synthetic, iteration)
+    winner = _choose_window(state, windows, selector, result, report, synthetic, iteration)
     if winner is None:
         return None, {}
     with report.span("synthetic_resolution", stage="controls") if report else nullcontext({}):
@@ -246,22 +251,25 @@ def _prepare_window(original_request, windows, driver, selector, result, report,
         }
         return controls, {}
     _activate_window(result, driver, report)
-    snapshot = _observe_window(result, driver, report)
+    snapshot = _observe_window(state, result, driver, report)
     return _observed_controls(result, snapshot, report), snapshot
 
 
-def _select_and_act(original_request, controls, driver, selector, result, report,
+def _select_and_act(state, controls, driver, selector, result, report,
                     execute_click, settling_context=None, iteration=None):
     with report.span("control_selection", stage="controls") if report is not None else nullcontext({}):
         control_selection = selector.select(
-            original_request, controls, stage="controls",
+            state, controls, stage="controls",
             **({"settling_context": settling_context} if settling_context is not None else {}),
             **({"report": report} if report is not None else {}),
         )
     _retain_rounds(result, "controls", control_selection.rounds, iteration)
     if control_selection.winner is None:
-        result.status = "no_controls"
-        result.reason = "The selected synthetic window defines no controls."
+        result.status = "no_control_selected" if controls else "no_controls"
+        result.reason = (
+            "Jev found no suitable control for the requested action."
+            if controls else "The selected synthetic window defines no controls."
+        )
         return None
     # Include selection reporting and argument handoff in dispatch latency;
     # only native_action measures the click invocation through its return.
@@ -270,6 +278,12 @@ def _select_and_act(original_request, controls, driver, selector, result, report
         if report is not None and execute_click else nullcontext({})
     ):
         result.control = control_selection.winner.record
+        state["last_control"] = {
+            "window": state["current_window"],
+            "control": _control_context(control_selection.winner.description),
+            "status": "(unverified)",
+        }
+        result.last_control = state["last_control"]
         if report is not None:
             report.append("control_selected", control=result.control, selections=control_selection.rounds)
         result.status = "selected"
@@ -313,85 +327,51 @@ def _app_context(window, snapshot):
     return context
 
 
-def _comparison_observation(windows, result, snapshot):
-    # Reuse candidate descriptions; exclude native target tokens and layout noise.
-    controls = control_candidates(snapshot.get("elements") or [])
+def _jev_state(original_request, iteration, current_window, last_control):
+    """Initialize the single mutable context owned by a pipeline run."""
     return {
-        "available_windows": [
-            {name: window[name] for name in ("app_name", "title", "is_on_screen", "minimized")
-             if name in window}
-            for window in windows
-        ],
-        "current_window": _app_context(result.window, snapshot),
-        "observation": result.observation,
-        "controls": [
-            {name: value for name, value in candidate.description.items() if name != "frame"}
-            for candidate in controls
-        ],
+        "original_request": original_request,
+        "iteration": iteration,
+        "current_window": current_window,
+        "last_control": last_control,
     }
 
 
-def _loop_questions():
-    return {
-        "changed": Choice(
-            instructions=(
-                "Did anything meaningfully change between the previous and current observations "
-                "for the user's original request? Compare the provided observations, considering "
-                "the last action; a CUA action return alone is not evidence of UI change."
-            ), criteria={"yes": None, "no": None},
-        ),
-        "done": Choice(
-            instructions=(
-                "Are we done with the user's original requested task? Judge from the current "
-                "observed state. An action return alone or missing/partial observation is not "
-                "proof of completion."
-            ), criteria={"yes": None, "no": None},
-        ),
-        "another_window": Choice(
-            instructions=(
-                "If the user's task is unfinished, do we need another window to continue, "
-                "instead of the currently observed window? Use the observed available windows "
-                "and current controls. Answer independently of the other questions."
-            ), criteria={"yes": None, "no": None},
-        ),
-    }
+def _control_context(description):
+    # Remember the selected control without retaining native targets or geometry.
+    return {name: value for name, value in description.items() if name not in {"frame", "actions"}}
 
 
-def _wait_questions(context):
-    return {
-        "recovery": Choice(
-            instructions=(
-                "The task is unfinished and nothing meaningfully changed. Should we wait "
-                "longer for the last action's resulting app state, or report an error? "
-                "Waiting only observes again; it never repeats the action."
-            ), criteria={"wait": "Allow more app settling time", "error": "Stop: no useful progress"},
-        ),
-        "wait_timing": Choice(
-            instructions={
-                "question": (
-                    "If we wait longer without repeating the last action, how much additional "
-                    "time should this observed browser/app need to become ready for the next step? "
-                    "Estimate app settling time after CUA has already returned, not CUA duration. "
-                    "The >500ms option schedules a first observation after 500ms, not guaranteed readiness."
-                ),
-                "observed_app_browser": context,
-            }, criteria={label: None for label in SETTLING_MS},
-        ),
-    }
-
-
-def _judge_loop(selector, state, questions, report, iteration, kind):
-    with report.span("loop.judgment", kind=kind) if report else nullcontext({}):
-        answers, api_call = selector.judge(state, questions, report=report)
+def _verify_action(state, controls, selector, result, report, iteration):
+    with report.span("action_verification", stage="evidence") if report else nullcontext({}):
+        evidence = selector.select(
+            state, controls, stage="evidence",
+            **({"report": report} if report is not None else {}),
+        )
+    _retain_rounds(result, "evidence", evidence.rounds, iteration)
+    if evidence.winner is None:
+        result.status = "no_evidence"
+        result.reason = "No suitable observed evidence supports the attempted action."
+    elif evidence.verification is not True:
+        result.status = "action_unverified"
+        result.reason = "Jev did not confirm that the action achieved its intended result."
+    else:
+        state["last_control"]["status"] = "(verified)"
+        result.status = "action_verified"
+        result.reason = None
     if report:
-        report.append("loop_judgment", iteration=iteration, kind=kind, api_call=api_call)
-    return answers, api_call
+        report.append(
+            "action_verification", iteration=iteration,
+            verified=result.status == "action_verified", last_control=result.last_control,
+            evidence=evidence.winner.description if evidence.winner is not None else None,
+            reason=result.reason,
+        )
 
 
-def _settle(milliseconds, sleep, report, *, kind):
+def _settle(milliseconds, sleep, report):
     with report.span(
-        "settling_wait", requested_ms=milliseconds, kind=kind,
-        start_boundary="after_cua_call_return" if kind == "after_action" else "after_wait_decision",
+        "settling_wait", requested_ms=milliseconds, kind="after_action",
+        start_boundary="after_cua_call_return",
     ) if report else nullcontext({}):
         sleep(milliseconds / 1000)
 
@@ -408,94 +388,72 @@ def run_pipeline(
     synthetic: SyntheticRegistry = DEFAULT_REGISTRY,
     sleep: Callable[[float], None] = system_sleep,
 ) -> PipelineResult:
-    """Observe and execute until completion, a stop condition, or interruption.
+    """Select and execute one action, then judge fresh evidence of its success.
 
-    There is no iteration cap. Native delivery errors propagate without retrying
-    an action, and every new action uses a freshly observed control target.
+    This version stops after verification; task-completion and new-window routing
+    are deferred. Native delivery errors propagate without retrying an action.
     """
     result = PipelineResult(status="no_windows")
-    previous = None
-    last_action = None
+    state = _jev_state(original_request, 0, None, None)
     for iteration in count(1):
+        state["iteration"] = iteration
         trace = {"iteration": iteration}
         result.iterations.append(trace)
         with report.span("loop.iteration", iteration=iteration) if report else nullcontext({}):
             windows = _discover_windows(driver, report)
             if iteration == 1:
                 controls, snapshot = _prepare_window(
-                    original_request, windows, driver, selector, result, report, synthetic, iteration,
+                    state,
+                    windows, driver, selector, result, report, synthetic, iteration,
                 )
                 _route(result, trace, "first_pass", report)
                 if controls is None:
                     return result
-            else:
-                # Discovery refreshes app/title metadata and tells us if the old
-                # window vanished. Never query or act on an absent old handle.
-                current_window = next((
-                    window for window in windows
-                    if all(window.get(name) == result.window.get(name) for name in ("pid", "window_id"))
-                ), None)
-                if current_window is None:
-                    result.control = None
-                    result.snapshot_id = None
-                    result.observation = {"window_missing": True, "coverage": "current window no longer observed"}
-                    snapshot = {}
-                else:
-                    result.window = current_window
-                    snapshot = _observe_window(result, driver, report)
-                current = _comparison_observation(windows, result, snapshot)
-                state = {
-                    "original_request": original_request, "previous": previous, "current": current,
-                    "last_action": last_action,
+                settling_ms = _select_and_act(
+                    state, controls, driver, selector, result, report, True,
+                    settling_context=None if result.window.get("synthetic") else state["current_window"],
+                    iteration=iteration,
+                )
+                if result.status != "action_returned":
+                    return result
+                state["last_action"] = {
+                    "tool": "click",
+                    "result": {name: result.action_result[name] for name in ("effect", "route", "delivery")
+                               if name in result.action_result},
+                    "requested_wait_ms_so_far": settling_ms,
                 }
-                answers, api_call = _judge_loop(selector, state, _loop_questions(), report, iteration, "routing")
-                trace["routing_judgment"] = api_call
-                if answers["done"] == "yes":
-                    result.status = "completed"
-                    _route(result, trace, "done", report)
+                trace["settling_ms"] = settling_ms
+                # CUA has returned. Only now begin the app settling timer.
+                _settle(settling_ms, sleep, report)
+                continue
+
+            # Discovery refreshes metadata without selecting a different window.
+            # Never read an absent old handle or replay its executable target.
+            current_window = next((
+                window for window in windows
+                if all(window.get(name) == result.window.get(name) for name in ("pid", "window_id"))
+            ), None)
+            if current_window is None:
+                state["current_window"] = None
+                result.control = None
+                result.snapshot_id = None
+                result.observation = {"window_missing": True, "coverage": "current window no longer observed"}
+                controls = []
+            else:
+                result.window = current_window
+                snapshot = _observe_window(state, result, driver, report)
+                controls = _observed_controls(result, snapshot, report, stage="evidence")
+                if controls is None and result.status not in {"no_controls", "observation_degraded"}:
+                    _route(result, trace, "observation_unavailable", report)
                     return result
-                if answers["changed"] == "no":
-                    recovery, api_call = _judge_loop(
-                        selector, state, _wait_questions(_app_context(result.window, snapshot)),
-                        report, iteration, "unchanged",
-                    )
-                    trace["unchanged_judgment"] = api_call
-                    if recovery["recovery"] == "error":
-                        result.status = "unchanged_error"
-                        result.reason = "Jev chose to report an error after no meaningful observed change."
-                        _route(result, trace, "error", report)
-                        return result
-                    _route(result, trace, "wait", report)
-                    trace["settling_ms"] = SETTLING_MS[recovery["wait_timing"]]
-                    previous = current
-                    _settle(trace["settling_ms"], sleep, report, kind="additional_wait")
-                    last_action["requested_wait_ms_so_far"] += trace["settling_ms"]
-                    continue
-                if answers["another_window"] == "yes":
-                    _route(result, trace, "select_window", report)
-                    controls, snapshot = _prepare_window(
-                        original_request, windows, driver, selector, result, report, synthetic, iteration,
-                    )
-                else:
-                    _route(result, trace, "reuse_window", report)
-                    controls = _observed_controls(result, snapshot, report)
-                if controls is None:
-                    return result
-            previous = _comparison_observation(windows, result, snapshot)
-            settling_ms = _select_and_act(
-                original_request, controls, driver, selector, result, report, True,
-                settling_context=None if result.window.get("synthetic") else _app_context(result.window, snapshot),
-                iteration=iteration,
-            )
-            if result.status != "action_returned":
-                return result
-            last_action = {
-                "tool": "click", "app_browser": _app_context(result.window, snapshot),
-                "control": next(candidate.description for candidate in controls if candidate.record is result.control),
-                "result": {name: result.action_result[name] for name in ("effect", "route", "delivery")
-                           if name in result.action_result},
-                "requested_wait_ms_so_far": settling_ms,
+            state["observation"] = {
+                name: value for name, value in result.observation.items()
+                if name not in {"element_count", "total_element_count", "returned_element_count",
+                                "filtered_element_count", "observed_control_count"}
             }
-            trace["settling_ms"] = settling_ms
-            # The driver call above has returned. Only now begin the app timer.
-            _settle(settling_ms, sleep, report, kind="after_action")
+            _verify_action(state, controls or [], selector, result, report, iteration)
+            _route(result, trace, {
+                "action_verified": "verified", "no_evidence": "no_evidence",
+                "action_unverified": "unverified",
+            }[result.status], report)
+            return result

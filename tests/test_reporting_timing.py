@@ -272,7 +272,7 @@ class ReportingTimingTests(unittest.TestCase):
             client = stack.enter_context(patch.object(cli, "TypeSafeClient"))
             client.return_value.__exit__.side_effect = cleanup_error
             stack.enter_context(patch.object(cli, "run_pipeline", side_effect=error,
-                                            return_value=result or PipelineResult("completed")))
+                                            return_value=result or PipelineResult("action_verified")))
             stack.enter_context(redirect_stdout(output))
             stack.enter_context(redirect_stderr(errors))
             status = cli.main(["Find Save"], _include_imports=include_imports)
@@ -295,7 +295,7 @@ class ReportingTimingTests(unittest.TestCase):
         self.assertEqual(events[-1]["timing"]["duration_ms"], events[-1]["elapsed_ms"])
 
     def test_cleanup_failure_uses_original_cli_error_path(self):
-        result = PipelineResult("completed", action_result={"effect": "unverifiable"})
+        result = PipelineResult("action_verified", action_result={"effect": "unverifiable"})
         status, output, errors = self.invoke_cli(result=result, cleanup_error=OSError("private cleanup"))
         self.assertEqual(status, 1)
         self.assertEqual(output["status"], "error")

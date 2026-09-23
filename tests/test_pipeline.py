@@ -1,6 +1,7 @@
 """Shared observation/selection stage checks and thin always-loop CLI boundaries."""
 
 import contextlib
+from copy import deepcopy
 import importlib
 import io
 import json
@@ -16,7 +17,7 @@ from src.pipeline import (
     window_candidates,
 )
 from pipeline_fixtures import select_once
-from src.selection import ChoiceSelector, PINNED_MODEL, QUESTION
+from src.selection import ChoiceSelector, NONE_KEY, PINNED_MODEL, QUESTION
 from src.synthetic import START_MENU_KEY, START_MENU_SEARCH_KEY
 
 
@@ -68,13 +69,14 @@ class ChoosingClient:
         self.preferred_key = preferred_key
 
     def system_one(self, **request):
-        self.calls.append(request)
+        self.calls.append(deepcopy(request))
         answers = {}
         for key, question in request["questions"].items():
             labels = list(question.criteria)
+            eligible = [label for label in labels if label != NONE_KEY]
             answers[key] = SimpleNamespace(
                 type="choice",
-                choice=self.preferred_key if self.preferred_key in labels else labels[-1],
+                choice=self.preferred_key if self.preferred_key in labels else eligible[-1],
                 confidence=0,
                 probabilities={label: 1 / len(labels) for label in labels},
             )
@@ -144,12 +146,12 @@ class PipelineTests(unittest.TestCase):
 
         stages = []
         for call in client.calls:
-            self.assertEqual(call["state"], request)
+            self.assertEqual(call["state"]["original_request"], request)
             self.assertEqual(call["model"], PINNED_MODEL)
             for key, question in call["questions"].items():
                 stages.append(key.split("_")[0])
                 self.assertEqual(question.instructions, QUESTION)
-                self.assertLessEqual(len(question.criteria), 10)
+                self.assertLessEqual(len(question.criteria), 11 if key.startswith("controls_") else 10)
             wire_content = json.dumps({
                 "state": call["state"],
                 "questions": {key: q.model_dump() for key, q in call["questions"].items()},
@@ -161,16 +163,18 @@ class PipelineTests(unittest.TestCase):
         # Multiple independent questions are combined before advancing a round.
         self.assertTrue(any(len(call["questions"]) > 1 for call in client.calls))
 
-    def test_no_real_windows_forwards_virtual_start_and_search_without_jev_or_window_read(self):
+    def test_no_real_windows_judges_virtual_search_against_none_without_window_read(self):
         result, driver, client = self.run_observation({}, windows=[])
         self.assertEqual(result.status, "selected")
         self.assertEqual(result.window["title"], "Start Menu")
         self.assertTrue(result.window["synthetic"])
         self.assertEqual(result.control["label"], "Search")
         self.assertTrue(result.control["synthetic"])
-        self.assertEqual(result.selections, {"windows": [], "controls": []})
+        self.assertEqual(result.selections["windows"], [])
+        self.assertEqual(result.selections["controls"][0]["groups"][0]["options"],
+                         [START_MENU_SEARCH_KEY, NONE_KEY])
         self.assertEqual(driver.calls, [("list_windows",)])
-        self.assertEqual(client.calls, [])
+        self.assertEqual(len(client.calls), 1)
 
     def test_virtual_start_win_has_one_search_target_without_observing_or_acting(self):
         request = "  Open an app from Start.\r\n"
@@ -184,7 +188,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(driver.calls, [("list_windows",)])
         self.assertEqual(select.call_count, 2)
         control_call = select.call_args_list[1]
-        self.assertEqual(control_call.args[0], request)
+        self.assertEqual(control_call.args[0]["original_request"], request)
         self.assertEqual(control_call.kwargs, {"stage": "controls"})
         controls = control_call.args[1]
         self.assertEqual(len(controls), 1)
@@ -206,8 +210,8 @@ class PipelineTests(unittest.TestCase):
                 "pid", "window_id", "element_index", "element_token", "snapshot_id", "frame", "bounds",
             ):
                 self.assertNotIn(field, record)
-        self.assertEqual(result.selections["controls"], [])
-        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(result.selections["controls"][0]["groups"][0]["winner"], START_MENU_SEARCH_KEY)
+        self.assertEqual(len(client.calls), 2)
         self.assertTrue(all(key.startswith("windows_") for key in client.calls[0]["questions"]))
         self.assertEqual(json.loads(json.dumps(result.to_dict()))["control"], result.control)
 
@@ -331,13 +335,15 @@ class PipelineTests(unittest.TestCase):
         result, _, client = self.run_observation({"snapshot_id": "s", "elements": [minimal, nullable]})
         self.assertIs(result.control, nullable)
         descriptions = next(iter(client.calls[-1]["questions"].values())).criteria
-        self.assertEqual(descriptions, {"control_0": {"role": "text"}, "control_1": {"role": "button"}})
+        self.assertIn(NONE_KEY, descriptions)
+        self.assertEqual({key: value for key, value in descriptions.items() if key != NONE_KEY},
+                         {"control_0": {"role": "text"}, "control_1": {"role": "button"}})
 
-    def test_single_observed_control_forwards_without_control_jev_and_result_is_json_serializable(self):
+    def test_single_observed_control_is_judged_against_none_and_result_is_json_serializable(self):
         result, _, client = self.run_observation({"snapshot_id": "s", "elements": [make_element()]})
         self.assertEqual(result.status, "selected")
-        self.assertEqual(len(client.calls), 1)
-        self.assertEqual(result.selections["controls"], [])
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(result.selections["controls"][0]["groups"][0]["options"], ["control_0", NONE_KEY])
         self.assertEqual(result.selections["windows"][0]["candidate_count"], 2)
         self.assertTrue(all(key.startswith("windows_") for key in client.calls[0]["questions"]))
         self.assertEqual(json.loads(json.dumps(result.to_dict()))["snapshot_id"], "s")
@@ -440,7 +446,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(report.events, [
             {"event": "windows_discovered", "windows": []},
             {"event": "window_selected", "window": result.window, "selections": []},
-            {"event": "control_selected", "control": result.control, "selections": []},
+            {"event": "control_selected", "control": result.control,
+             "selections": result.selections["controls"]},
         ])
 
     def test_report_keeps_unavailable_observation_before_early_return(self):
@@ -476,7 +483,7 @@ class CliTests(unittest.TestCase):
             ))
             driver = stack.enter_context(patch.object(self.cli, "CuaDriver"))
             pipeline = stack.enter_context(patch.object(self.cli, "run_pipeline", side_effect=error,
-                                                        return_value=result or PipelineResult("completed")))
+                                                        return_value=result or PipelineResult("action_verified")))
             stack.enter_context(contextlib.redirect_stdout(output))
             stack.enter_context(contextlib.redirect_stderr(self.stderr))
             status = self.cli.main(arguments)
@@ -489,7 +496,7 @@ class CliTests(unittest.TestCase):
             status, output, pipeline, client, driver = self.invoke(["--request-file", str(path)])
         read_bytes.assert_called_once_with(path)
         self.assertEqual(status, 0)
-        self.assertEqual(output["status"], "completed")
+        self.assertEqual(output["status"], "action_verified")
         self.assertEqual(pipeline.call_args.args[0], text)
         self.assertEqual(client.call_args.kwargs["model"], PINNED_MODEL)
         self.assertEqual(client.call_args.kwargs["api_key"], "test-key")
@@ -556,7 +563,7 @@ class CliTests(unittest.TestCase):
             "effect": "unverifiable", "route": "accessibility", "delivery": {"mode": "background"},
         }
         result = PipelineResult(
-            "completed", window=make_window(), control=make_element(),
+            "action_verified", window=make_window(), control=make_element(),
             snapshot_id="snapshot-secret", action_result=native_result,
         )
 
@@ -624,7 +631,7 @@ class CliTests(unittest.TestCase):
 
     def test_completed_loop_keeps_stdout_and_exit_zero_when_final_report_write_fails(self):
         result = PipelineResult(
-            "completed", window=make_window(), control=make_element(),
+            "action_verified", window=make_window(), control=make_element(),
             action_result={
                 "effect": "unverifiable", "route": "accessibility", "delivery": {"mode": "background"},
             },
@@ -684,7 +691,7 @@ class CliTests(unittest.TestCase):
         self.assertTrue(self.report.closed)
 
     def test_success_attaches_wire_hooks_and_returns_report_timing_with_operational_result(self):
-        result = PipelineResult("completed", window=make_window(), control=make_element())
+        result = PipelineResult("action_verified", window=make_window(), control=make_element())
         status, output, pipeline, client, _ = self.invoke(["Find Save"], result=result)
 
         self.assertEqual(status, 0)

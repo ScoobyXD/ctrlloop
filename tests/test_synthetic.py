@@ -1,5 +1,6 @@
 """Offline checks for registry-defined windows and shared selection stages."""
 
+from copy import deepcopy
 import json
 from types import SimpleNamespace
 import unittest
@@ -8,7 +9,7 @@ from src.pipeline import window_candidates
 from pipeline_fixtures import select_once
 from test_driver import foreground_result
 from test_pipeline import RecordingReport
-from src.selection import Candidate, ChoiceSelector, PINNED_MODEL
+from src.selection import Candidate, ChoiceSelector, NONE_KEY, PINNED_MODEL
 from src.synthetic import (
     DEFAULT_REGISTRY, START_MENU_KEY,
     SyntheticRegistry, SyntheticWindow,
@@ -34,7 +35,7 @@ class ChoosingClient:
         self.calls = []
 
     def system_one(self, **request):
-        self.calls.append(request)
+        self.calls.append(deepcopy(request))
         answers = {}
         for key, question in request["questions"].items():
             choice = self.winners[key.split("_")[0]]
@@ -198,9 +199,9 @@ class SyntheticPipelineTests(unittest.TestCase):
         self.assertEqual(list(client.calls[0]["questions"]["windows_r1_g0"].criteria),
                          [START_MENU_KEY, "launcher", "window_0"])
         self.assertEqual(list(client.calls[1]["questions"]["controls_r1_g0"].criteria),
-                         ["browse", "search"])
+                         ["browse", "search", NONE_KEY])
         for call in client.calls:
-            self.assertEqual(call["state"], request)
+            self.assertEqual(call["state"]["original_request"], request)
             self.assertEqual(call["model"], PINNED_MODEL)
         self.assertEqual(result.selections["controls"][0]["groups"][0]["winner"], "search")
         self.assertEqual([entry["event"] for entry in report.events],
@@ -230,7 +231,7 @@ class SyntheticPipelineTests(unittest.TestCase):
         start = {"app_name": "StartMenuExperienceHost.exe", "title": "Start", "pid": 1, "window_id": 2}
         control = {"element_index": 7, "role": "Edit", "label": "Search", "element_token": "real:7"}
         driver = ObservingDriver([start], {"snapshot_id": "real", "elements": [control]})
-        client = ChoosingClient()
+        client = ChoosingClient(control="control_0")
         result = select_once("Search Start", driver, ChoiceSelector(client), synthetic=SyntheticRegistry([]))
 
         self.assertEqual(result.status, "selected")
@@ -239,7 +240,9 @@ class SyntheticPipelineTests(unittest.TestCase):
         self.assertEqual(result.snapshot_id, "real")
         self.assertNotIn("synthetic", result.window)
         self.assertEqual(driver.calls, [("list_windows",), ("bring_to_front", {"pid": 1, "window_id": 2}), ("get_window_state", start)])
-        self.assertEqual(client.calls, [])
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(list(client.calls[0]["questions"]["controls_r1_g0"].criteria),
+                         ["control_0", NONE_KEY])
 
     def test_empty_registry_and_no_real_windows_returns_no_windows(self):
         driver = ObservingDriver()
@@ -288,7 +291,7 @@ class SyntheticPipelineTests(unittest.TestCase):
         self.assertEqual(second.control["actions"], ["type_text"])
         self.assertIsNot(first.window, second.window)
         self.assertIsNot(first.control, second.control)
-        self.assertEqual(client.calls, [])
+        self.assertEqual(len(client.calls), 2)
 
 
 if __name__ == "__main__":

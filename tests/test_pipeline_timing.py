@@ -187,7 +187,7 @@ class PipelineTimingTests(unittest.TestCase):
             ["controls_r1_g0", "controls_r1_g1", "controls_r1_g2"], ["controls_r2_g0"],
         ])
         for call in timed_client.calls:
-            self.assertEqual(call["state"], "Click Save")
+            self.assertEqual(call["state"]["original_request"], "Click Save")
             for question in call["questions"].values():
                 self.assertEqual(question.instructions, QUESTION)
         self.assertEqual(plain_driver.calls, timed_driver.calls)
@@ -233,7 +233,7 @@ class PipelineTimingTests(unittest.TestCase):
             # Isolate the CLI cleanup/report boundary from loop routing. The
             # shared stages still incur their deterministic fake driver costs.
             result = select_once(*args, **kwargs, deliver_click=True)
-            result.status = "completed"
+            result.status = "action_verified"
             return result
 
         with (
@@ -254,7 +254,7 @@ class PipelineTimingTests(unittest.TestCase):
 
         self.assertEqual(status, 0)
         output = json.loads(stdout.getvalue())
-        self.assertEqual(output["status"], "completed")
+        self.assertEqual(output["status"], "action_verified")
         self.assertEqual(output["action_result"], driver.native_result)
         timing = output["timing"]
         self.assertEqual(timing["duration_ms"], 65)

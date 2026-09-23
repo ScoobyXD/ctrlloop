@@ -40,7 +40,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
     origin_wall_ns = _MODULE_WALL_NS if _include_imports else time_ns()
     origin_label = "main_module_after_time_import" if _include_imports else "main_call"
     project_dir = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description="Run the Jev/CUA loop until the task completes, stops, or is interrupted.")
+    parser = argparse.ArgumentParser(description="Select and execute one CUA action, then verify its result with Jev.")
     parser.add_argument("request", nargs="?", help="Original user request, preserved in every Jev call")
     parser.add_argument("--request-file", type=Path, help="Read the exact request from a UTF-8 file")
     parser.add_argument("--env-file", type=Path, default=project_dir / ".env")
@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
         output_finished_ns = perf_counter_ns()
         report.record_interval("result_preparation", output_started_ns, output_finished_ns)
         report.append("run_finished", result=output)
-        exit_code = 0 if result.status == "completed" else 2
+        exit_code = 0 if result.status == "action_verified" else 2
     except (DriverError, SelectionError, ValueError, OSError, TypeSafeError, KeyError) as error:
         # Raw SDK/OS messages may contain file content, request bodies, or credentials.
         if isinstance(error, (DriverError, SelectionError)) or type(error) is ValueError:

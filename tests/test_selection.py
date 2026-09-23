@@ -1,5 +1,6 @@
 """Policy and boundary tests for Choice elimination; no external API calls."""
 
+from copy import deepcopy
 import json
 from types import SimpleNamespace
 import unittest
@@ -11,6 +12,7 @@ from src.selection import (
     Candidate,
     ChoiceSelector,
     GROUP_SIZE,
+    NONE_KEY,
     PINNED_MODEL,
     QUESTION,
     SelectionError,
@@ -39,7 +41,7 @@ class FakeClient:
     def __init__(self, mutate=None, choose=None):
         self.calls = []
         self.mutate = mutate
-        self.choose = choose or (lambda labels: labels[-1])
+        self.choose = choose or (lambda labels: next(label for label in reversed(labels) if label != NONE_KEY))
 
     def system_one(self, *, state, questions, model):
         self.calls.append({"state": state, "questions": questions, "model": model})
@@ -72,9 +74,13 @@ class SelectionTests(unittest.TestCase):
             for question in call["questions"].values():
                 self.assertIsInstance(question, Choice)
                 self.assertEqual(question.instructions, EXPECTED_QUESTION)
-                self.assertLessEqual(len(question.criteria), 10)
-                self.assertGreaterEqual(len(question.criteria), 1)
+                real_options = {key: value for key, value in question.criteria.items() if key != NONE_KEY}
+                self.assertLessEqual(len(real_options), 10)
+                self.assertGreaterEqual(len(real_options), 1)
                 for key, description in question.criteria.items():
+                    if key == NONE_KEY:
+                        self.assertIn("None of these candidates", description)
+                        continue
                     self.assertEqual(description, descriptions[key])
                     self.assertNotIn("private_context", description)
 
@@ -122,6 +128,56 @@ class SelectionTests(unittest.TestCase):
                 ChoiceSelector(client).select(ORIGINAL, observed, stage=stage)
                 self.assert_request_contract(client, observed)
 
+    def test_structured_state_reaches_every_round_and_trace_is_a_snapshot(self):
+        for stage in ("windows", "controls"):
+            with self.subTest(stage=stage):
+                state = {
+                    "original_request": ORIGINAL,
+                    "iteration": 3,
+                    "current_window": {"app_name": "Browser", "title": "Details"},
+                    "last_control": {"role": "Link", "label": "History"},
+                }
+                expected = deepcopy(state)
+                client = FakeClient()
+                result = ChoiceSelector(client).select(
+                    state, candidates(123), stage=stage,
+                )
+                self.assertEqual([len(call["questions"]) for call in client.calls], [13, 2, 1])
+                for call, round_trace in zip(client.calls, result.rounds, strict=True):
+                    self.assertEqual(call["state"], expected)
+                    self.assertEqual(call["model"], PINNED_MODEL)
+                    self.assertEqual(round_trace["api_call"]["state"], expected)
+                    for question in call["questions"].values():
+                        self.assertEqual(question.instructions, EXPECTED_QUESTION)
+                state["iteration"] = 4
+                state["current_window"]["title"] = "New page"
+                state["last_control"]["label"] = "Continue"
+                for round_trace in result.rounds:
+                    self.assertEqual(round_trace["api_call"]["state"], expected)
+
+    def test_first_loop_state_preserves_empty_window_and_last_control(self):
+        state = {
+            "original_request": ORIGINAL, "iteration": 1,
+            "current_window": None, "last_control": None,
+        }
+        client = FakeClient()
+        result = ChoiceSelector(client).select(state, candidates(2), stage="windows")
+        self.assertEqual(client.calls[0]["state"], state)
+        self.assertEqual(result.rounds[0]["api_call"]["state"], state)
+
+    def test_invalid_original_request_in_structured_state_fails_before_call(self):
+        invalid_states = [{}, {"request": ORIGINAL}]
+        invalid_states.extend(
+            {"original_request": value, "iteration": 1}
+            for value in (None, "", " \n\t ", 12, True, [], {})
+        )
+        for state in invalid_states:
+            with self.subTest(state=state):
+                client = FakeClient()
+                with self.assertRaisesRegex(ValueError, "original request.*nonempty string"):
+                    ChoiceSelector(client).select(state, candidates(2), stage="windows")
+                self.assertEqual(client.calls, [])
+
     def test_392_candidates_use_one_call_per_round_with_all_group_questions(self):
         observed = candidates(392)
         # Exceed the former 48,000-byte heuristic without changing descriptions.
@@ -130,18 +186,18 @@ class SelectionTests(unittest.TestCase):
         client = FakeClient()
         result = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
         self.assertEqual([len(call["questions"]) for call in client.calls], [40, 4, 1])
-        self.assertEqual([len(q.criteria) for q in client.calls[0]["questions"].values()], [10] * 39 + [2])
+        self.assertEqual([len(q.criteria) for q in client.calls[0]["questions"].values()], [11] * 39 + [3])
         self.assertEqual(
             [list(call["questions"]) for call in client.calls],
             [round_trace["api_call"]["question_keys"] for round_trace in result.rounds],
         )
         self.assertEqual(
-            [key for q in client.calls[0]["questions"].values() for key in q.criteria],
+            [key for q in client.calls[0]["questions"].values() for key in q.criteria if key != NONE_KEY],
             [candidate.key for candidate in observed],
         )
         expected_winners = [c.key for c in observed[9::10]] + [observed[-1].key]
         self.assertEqual(
-            [key for q in client.calls[1]["questions"].values() for key in q.criteria],
+            [key for q in client.calls[1]["questions"].values() for key in q.criteria if key != NONE_KEY],
             expected_winners,
         )
         self.assert_request_contract(client, observed)
@@ -152,7 +208,8 @@ class SelectionTests(unittest.TestCase):
         result = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
         self.assertEqual([len(call["questions"]) for call in client.calls], [2, 1])
         singleton = client.calls[0]["questions"]["controls_r1_g1"]
-        self.assertEqual(singleton.criteria, {observed[-1].key: observed[-1].description})
+        self.assertEqual(list(singleton.criteria), [observed[-1].key, NONE_KEY])
+        self.assertEqual(singleton.criteria[observed[-1].key], observed[-1].description)
         self.assertEqual(result.rounds[0]["groups"][1]["question_key"], "controls_r1_g1")
 
     def test_choice_controls_winner_even_at_zero_confidence(self):
@@ -165,7 +222,7 @@ class SelectionTests(unittest.TestCase):
         client = FakeClient(mutate=flat_distribution)
         result = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
         self.assertIs(result.winner, observed[-1])
-        self.assertEqual(result.rounds[1]["groups"][0]["options"], [c.key for c in observed[9::10]])
+        self.assertEqual(result.rounds[1]["groups"][0]["options"], [c.key for c in observed[9::10]] + [NONE_KEY])
 
     def test_group_order_is_observation_order_not_sorted_key_order(self):
         observed = list(reversed(candidates(24)))
@@ -196,7 +253,10 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(len(client.calls), 1)
                 self.assertEqual(client.calls[0]["state"], prompt)
                 question = next(iter(client.calls[0]["questions"].values()))
-                self.assertEqual(question.criteria, {c.key: c.description for c in observed})
+                self.assertEqual(
+                    {key: value for key, value in question.criteria.items() if key != NONE_KEY},
+                    {c.key: c.description for c in observed},
+                )
 
     def test_service_rejecting_round_surfaces_error_without_splitting_or_dropping(self):
         class RejectingClient(FakeClient):
@@ -223,10 +283,46 @@ class SelectionTests(unittest.TestCase):
             ChoiceSelector(client).select(ORIGINAL, [observed[0], observed[0]], stage="windows")
         self.assertEqual(client.calls, [])
 
+    def test_none_key_is_reserved_only_in_control_and_evidence_groups(self):
+        collision = Candidate(NONE_KEY, {"label": "Observed control"}, {})
+        for stage in ("controls", "evidence"):
+            with self.subTest(stage=stage):
+                client = FakeClient()
+                with self.assertRaisesRegex(ValueError, "none option key is reserved"):
+                    ChoiceSelector(client).select(ORIGINAL, [collision], stage=stage)
+                self.assertEqual(client.calls, [])
+        window = ChoiceSelector(FakeClient()).select(ORIGINAL, [collision], stage="windows")
+        self.assertIs(window.winner, collision)
+
+    def test_single_control_is_judged_against_none_even_without_settling(self):
+        for choose_none in (False, True):
+            with self.subTest(choose_none=choose_none):
+                observed = candidates(1)
+                client = FakeClient(choose=lambda labels: NONE_KEY if choose_none else labels[0])
+                selection = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
+                self.assertEqual(len(client.calls), 1)
+                self.assertEqual(list(client.calls[0]["questions"]["controls_r1_g0"].criteria), [observed[0].key, NONE_KEY])
+                self.assertIs(selection.winner, None if choose_none else observed[0])
+                self.assertIsNone(selection.settling_ms)
+                self.assertIsNone(selection.verification)
+
+    def test_all_none_stops_elimination_without_an_extra_call(self):
+        for stage in ("controls", "evidence"):
+            with self.subTest(stage=stage):
+                client = FakeClient(choose=lambda labels: NONE_KEY)
+                selection = ChoiceSelector(client).select(ORIGINAL, candidates(101), stage=stage)
+                self.assertIsNone(selection.winner)
+                self.assertEqual(len(client.calls), 1)
+                self.assertEqual(len(client.calls[0]["questions"]), 11)
+                self.assertEqual(selection.rounds[0]["candidate_count"], 101)
+                self.assertEqual(selection.rounds[0]["winner_count"], 0)
+                self.assertTrue(all(group["winner"] == NONE_KEY for group in selection.rounds[0]["groups"]))
+                self.assertEqual(selection.verification, False if stage == "evidence" else None)
+
     def assert_bad_response(self, mutate):
         client = FakeClient(mutate=mutate)
         with self.assertRaises(SelectionError):
-            ChoiceSelector(client).select(ORIGINAL, candidates(2), stage="controls")
+            ChoiceSelector(client).select(ORIGINAL, candidates(2), stage="windows")
         self.assertEqual(len(client.calls), 1)
 
     def test_wrong_or_missing_returned_model(self):
@@ -273,7 +369,7 @@ class SelectionTests(unittest.TestCase):
 
                 observed = candidates(10)
                 client = FakeClient(mutate=set_distribution, choose=lambda labels: labels[1])
-                result = ChoiceSelector(client).select(ORIGINAL, observed, stage="controls")
+                result = ChoiceSelector(client).select(ORIGINAL, observed, stage="windows")
                 self.assertIs(result.winner, observed[1])
 
     def test_probability_total_rejects_more_than_three_percent_deviation(self):
@@ -286,7 +382,7 @@ class SelectionTests(unittest.TestCase):
 
                 client = FakeClient(mutate=set_distribution)
                 with self.assertRaisesRegex(SelectionError, "more than 3%"):
-                    ChoiceSelector(client).select(ORIGINAL, candidates(10), stage="controls")
+                    ChoiceSelector(client).select(ORIGINAL, candidates(10), stage="windows")
                 self.assertEqual(len(client.calls), 1)
 
     def test_confidence_must_be_finite_probability(self):

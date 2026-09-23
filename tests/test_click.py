@@ -59,7 +59,7 @@ class ClickPipelineTests(unittest.TestCase):
         })
         self.assertEqual(len(client.calls), 2)
         for stage, call in zip(("windows", "controls"), client.calls):
-            self.assertEqual(call["state"], request)
+            self.assertEqual(call["state"]["original_request"], request)
             self.assertEqual(call["model"], PINNED_MODEL)
             self.assertTrue(all(key.startswith(stage + "_") for key in call["questions"]))
         self.assertEqual(result.to_dict()["action_result"], native_result)
@@ -77,7 +77,7 @@ class ClickPipelineTests(unittest.TestCase):
             "element_index": 901, "snapshot_id": "snapshot:chosen",
         })
         self.assertEqual(len(runner.calls), 4)
-        self.assertEqual(len(client.calls), 1)  # One control needs no Jev question.
+        self.assertEqual(len(client.calls), 2)  # A singleton control still competes with none.
 
     def test_selection_stage_can_be_inspected_before_dispatch(self):
         driver, runner, client = self.set_up_run()
@@ -101,7 +101,7 @@ class ClickPipelineTests(unittest.TestCase):
                 self.assertTrue(result.window["synthetic"])
                 self.assertTrue(result.control["synthetic"])
                 self.assertEqual([call[0][-1] for call in runner.calls], ["list_windows"])
-                self.assertLessEqual(len(client.calls), 1)
+                self.assertEqual(len(client.calls), 2 if windows else 1)
 
     def test_unusable_observations_keep_their_status_and_never_click(self):
         cases = (
@@ -138,7 +138,7 @@ class ClickPipelineTests(unittest.TestCase):
                 self.assertEqual([call[0][-1] for call in runner.calls], [
                     "list_windows", "bring_to_front", "get_window_state", "click",
                 ])
-                self.assertEqual(len(client.calls), 1)
+                self.assertEqual(len(client.calls), 2)
 
     def test_failed_pre_action_report_stops_before_dispatch(self):
         for report_error in (OSError("report write failed"), ValueError("report closed")):

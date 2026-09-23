@@ -1,12 +1,15 @@
 # Reading run timings
 
 The [main workflow](main-workflow.md) defines the selection and timing contract.
-A candidate is one window or control; a group contains up to ten candidates; a
-group question chooses one winner from that group. **Every selection round sends
+A candidate is one window or control; fresh controls also serve as verification
+evidence. A group contains up to ten candidates. A control/evidence group question
+adds `none`, allowing the group to advance no candidate. **Every selection round sends
 all its group questions in exactly one Jev API call.** The final
 control round's request also includes a conditional settling-time question for
-every finalist. The next round uses the previous round's winners. An iteration
-is one observation pass of the loop, not a selection round.
+every finalist. The final evidence round batches one independent action
+confirmation question with its group question. The next round uses the previous
+round's surviving candidates. An iteration is one observation pass, not a
+selection round: pass 1 selects/acts, pass 2 verifies and stops.
 
 The CLI collects events, timestamps, and actual Jev payloads in memory. At the end
 it generates and writes the existing `reports/run-*.json` event array once. Use
@@ -77,7 +80,8 @@ recorded startup work. `initialization.request_read`,
 | --- | --- |
 | `window_discovery` | `driver.list_windows()` through return/error. |
 | `candidate_preparation` | Building window or control candidate descriptions. |
-| `window_selection`, `control_selection` | Complete selection for that stage. |
+| `window_selection`, `control_selection` | Complete window/control selection, including final control timing questions where applicable. |
+| `action_verification` | Complete evidence selection under stage `evidence`, including the final confirmation when candidates reach that round. |
 | `synthetic_resolution` | Looking up controls for a synthetic selection. |
 | `foreground_preparation` | Preparing activation arguments and recording `action_requested`. |
 | `foreground_activation` | `driver.bring_to_front()` through return/error. |
@@ -86,41 +90,44 @@ recorded startup work. `initialization.request_read`,
 | `action_dispatch` | Selected-control recording through action preparation and return. |
 | `action_preparation` | Checking synthetic targets, building click arguments, and recording `action_requested`. |
 | `native_action` | `driver.click()` through return/error. |
-| `loop.iteration` | The current pass, including its observation, judgments, selection, action, or wait as applicable. |
-| `loop.judgment` | Preparing, requesting, and validating the three loop questions, or the unchanged-state wait/error and conditional timing pair. |
-| `settling_wait` | The requested additional app/browser wait, starting after CUA returns for an action, or after the wait-longer judgment. |
+| `loop.iteration` | The current pass, including observation, selection, action/wait, or verification as applicable. |
+| `settling_wait` | The requested app/browser settling wait, starting after CUA returns for the action. |
 
 Within selection, inspect `selection.validation`, `selection.round`,
 `selection.grouping`, `selection.sdk_call`, `selection.response_validation`, and
 `selection.advancement`. A round starts before forming its groups and ends after
-its winners are ready. A selection starting with one candidate needs no selection
-question; an executable singleton still gets its timing question
-through the same selector. A trailing one-candidate group within a larger round
-still belongs to that round's single request.
+its winners are ready. Only a singleton window can bypass selection. A singleton
+control or evidence candidate is still judged against `none`, with final timing
+or confirmation in the same request. A trailing one-candidate group within a
+larger round still belongs to that round's single request.
 
 Foreground activation precedes the newly selected real window's control snapshot.
 Synthetic controls require no live UIA read or foreground activation. A skipped
 synthetic action can have preparation records but has no `native_action`.
 Absent stages mean the work did not occur.
 
-Loop events retain the `iteration`, observed state, all judgment questions,
-answers and full probabilities in `loop_judgment.api_call`, and the chosen route
-in the `loop_route` event. The result's `iterations` array keeps each pass's
-route, judgment traces, and `settling_ms` when used. Later passes retain
-their own window/control selection traces. Use `(iteration, round_id)` when
+Evidence selection uses the existing selection traces with stage `evidence`.
+Its round `api_call` records retain all group and confirmation questions, answers,
+and probabilities. A final round's `verification` trace identifies the confirmation
+question, returned choice, and whether evidence plus confirmation verified the
+action. The `action_verification`
+event records `verified`, `last_control` including its status, selected evidence
+or `null`, and the reason. `loop_route` records the terminal verification route:
+`verified`, `no_evidence`, or `unverified`. The result's `iterations` array retains
+the pass route and `settling_ms` when used. Use `(iteration, round_id)` when
 correlating repeated names such as `controls_r1`; `round_id` alone can identify
 different rounds in different passes. The existing span and HTTP request IDs
 remain unique within the run.
 
 `settling_wait` records `requested_ms` and its measured `duration_ms`, with `kind`
-set to `after_action` or `additional_wait`;
+set to `after_action`;
 the scheduler may return later than the request. It starts only after the CUA
 action result returns, so its duration excludes `native_action`. The timing
 Choice estimates additional app/browser readiness time. The exact options
 `<50ms`, `100ms`, `200ms`, `300ms`, `400ms`, and `>500ms` map in code to 50, 100,
 200, 300, 400, and 500 ms. The last option is a 500 ms first observation, not a
-readiness guarantee. Additional wait passes sleep and observe without repeating
-the prior click.
+readiness guarantee. The workflow does not retry the click or add another wait
+if verification fails.
 
 On a successful pipeline return, `client_cleanup` measures closing the SDK and
 HTTP clients. The total operational duration ends after the operational result
@@ -140,17 +147,16 @@ and iteration/round context, linking `jev_request` with `jev_response`,
 The timing summary's `jev_api_call_count` counts actual prepared requests seen
 by the HTTP hook. It is zero when no request occurs; Python callers must register
 the report hooks to obtain this count. It can also be checked by counting
-`jev_request` events, including
-the later-pass three-question batches and wait/error batches. Counting only
-selection rounds would miss those judgment calls. The per-finalist timing
-questions share the final control selection's call and duration. Inspect each
+`jev_request` events, including the evidence-selection rounds in pass 2. The
+per-finalist timing questions share the final control selection's call and
+duration; action confirmation shares the final evidence round's call and
+duration. There are no separate routing or recovery-wait calls. Inspect each
 request/response pair to see its complete question and probability distributions;
 do not count individual questions as requests.
 
-The loop's `last_action.requested_wait_ms_so_far` is code-computed cumulative
-scheduled settling time supplied to later judgments. It includes additional
-waits and excludes CUA duration. Use measured `settling_wait` spans for actual
-elapsed wait time rather than treating this requested-time total as a clock.
+The loop's last-action wait facts describe scheduled settling time and exclude
+CUA duration. Use measured `settling_wait` spans for actual elapsed wait time
+rather than treating the requested interval as a clock.
 
 The primary API duration has these boundaries:
 
@@ -160,7 +166,7 @@ Capture request data in memory
     START: prepared_request_before_transport
     Send request -> wait for Jev -> receive complete response body
     END: response_body_read
-Decode and validate the response; advance one winner per group
+Decode and validate the response; advance selected candidates (none advances nothing)
 ```
 
 The start is after request preparation and capture, immediately before the
@@ -249,7 +255,7 @@ no per-event durable copy. A missing finish record does not mean zero duration.
 
 Native action duration ends when the adapter returns. Its result does not prove
 that the screen changed or the user's task completed. The loop waits, observes
-fresh state, and asks the later-pass judgments described
+fresh state, and selects evidence with the final action confirmation described
 in the [main workflow](main-workflow.md). Offline fixtures verify boundaries and correlation;
 their durations are not production Jev benchmarks. The model remains
 `jev-1.13.0` and the driver remains CUA Driver `0.28.2`.

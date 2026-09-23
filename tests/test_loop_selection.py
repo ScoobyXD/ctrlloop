@@ -5,7 +5,10 @@ import unittest
 
 from typesafe_sdk import Choice
 
-from src.selection import Candidate, ChoiceSelector, PINNED_MODEL, SETTLING_MS, SelectionError
+from src.selection import (
+    Candidate, ChoiceSelector, EVIDENCE_CONFIRMATION_QUESTION, EVIDENCE_QUESTION,
+    NONE_KEY, PINNED_MODEL, SETTLING_MS, SelectionError,
+)
 
 
 REQUEST = "Open the details in my observed browser."
@@ -24,10 +27,13 @@ def candidates(count):
 
 
 class FakeClient:
-    def __init__(self, timing_labels=("100ms",), *, choose_first=False):
+    def __init__(self, timing_labels=("100ms",), *, choose_first=False,
+                 group_choices=None, confirmation="yes"):
         self.calls = []
         self.timing_labels = timing_labels
         self.choose_first = choose_first
+        self.group_choices = group_choices or {}
+        self.confirmation = confirmation
 
     def system_one(self, *, state, questions, model):
         self.calls.append({"state": state, "questions": questions, "model": model})
@@ -38,8 +44,11 @@ class FakeClient:
             if labels == list(SETTLING_MS):
                 chosen = self.timing_labels[timing_index % len(self.timing_labels)]
                 timing_index += 1
+            elif key.endswith("_confirmation"):
+                chosen = self.confirmation
             else:
-                chosen = labels[0] if self.choose_first else labels[-1]
+                real_labels = [label for label in labels if label != NONE_KEY]
+                chosen = self.group_choices.get(key, real_labels[0] if self.choose_first else real_labels[-1])
             answers[key] = SimpleNamespace(
                 type="choice", choice=chosen, confidence=0.5,
                 probabilities={
@@ -54,6 +63,17 @@ class FakeClient:
 
 
 class LoopSelectionTests(unittest.TestCase):
+    def evidence_state(self):
+        return {
+            "original_request": REQUEST, "iteration": 2,
+            "current_window": CONTEXT,
+            "last_control": {
+                "window": CONTEXT, "control": {"role": "Button", "label": "Open details"},
+                "status": "unverified",
+            },
+            "last_action": {"tool": "click", "result": {"delivery": "returned"}},
+        }
+
     def test_only_final_round_has_per_finalist_timing_in_same_request(self):
         client = FakeClient()
         selection = ChoiceSelector(client).select(
@@ -64,7 +84,7 @@ class LoopSelectionTests(unittest.TestCase):
         for call in client.calls[:-1]:
             self.assertTrue(all("settling" not in key for key in call["questions"]))
         final = selection.rounds[-1]
-        self.assertEqual(set(final["settling"]), set(final["groups"][0]["options"]))
+        self.assertEqual(set(final["settling"]), set(final["groups"][0]["options"]) - {NONE_KEY})
         self.assertEqual(len(final["settling"]), 2)
         self.assertEqual(selection.winner.key, "control_111")
         self.assertEqual(selection.settling_ms, 100)
@@ -98,6 +118,24 @@ class LoopSelectionTests(unittest.TestCase):
             self.assertIn("excluding CUA execution duration", question.instructions)
             self.assertEqual(list(question.criteria), list(SETTLING_MS))
 
+    def test_loop_state_is_shared_by_selection_and_batched_settling_questions(self):
+        state = {
+            "original_request": REQUEST, "iteration": 2,
+            "current_window": CONTEXT,
+            "last_control": {"role": "Button", "label": "Open"},
+        }
+        client = FakeClient()
+        selection = ChoiceSelector(client).select(
+            state, candidates(112), stage="controls", settling_context=CONTEXT,
+        )
+        self.assertEqual([len(call["questions"]) for call in client.calls], [12, 2, 3])
+        self.assertEqual(selection.settling_ms, 100)
+        for call, round_trace in zip(client.calls, selection.rounds, strict=True):
+            self.assertEqual(call["state"], state)
+            self.assertEqual(call["model"], PINNED_MODEL)
+            self.assertEqual(round_trace["api_call"]["state"], state)
+        self.assertEqual(len(selection.rounds[-1]["settling"]), 2)
+
     def test_only_winning_candidates_timing_is_consumed_and_all_are_retained(self):
         client = FakeClient(("200ms", ">500ms"), choose_first=True)
         result = ChoiceSelector(client).select(
@@ -128,8 +166,8 @@ class LoopSelectionTests(unittest.TestCase):
                 self.assertIs(result.winner, observed[0])
                 self.assertEqual(result.settling_ms, milliseconds)
                 self.assertEqual(len(client.calls), 1)
-                self.assertEqual(len(client.calls[0]["questions"]), 1)
-                self.assertIsNone(result.rounds[0]["groups"][0]["question_key"])
+                self.assertEqual(len(client.calls[0]["questions"]), 2)
+                self.assertEqual(result.rounds[0]["groups"][0]["question_key"], "controls_r1_g0")
                 self.assertEqual(result.rounds[0]["candidate_count"], 1)
 
     def test_no_timing_when_no_control_or_execution_context(self):
@@ -141,8 +179,10 @@ class LoopSelectionTests(unittest.TestCase):
                 result = ChoiceSelector(client).select(
                     REQUEST, candidates(count), stage=stage, settling_context=context,
                 )
-                self.assertEqual(client.calls, [])
-                self.assertEqual(result.rounds, [])
+                expected_calls = int(count == 1 and stage == "controls")
+                self.assertEqual(len(client.calls), expected_calls)
+                self.assertEqual(len(result.rounds), expected_calls)
+                self.assertTrue(all("settling" not in key for call in client.calls for key in call["questions"]))
                 self.assertIsNone(result.settling_ms)
 
     def test_trace_preserves_actual_questions_state_and_full_probabilities(self):
@@ -191,6 +231,125 @@ class LoopSelectionTests(unittest.TestCase):
                 REQUEST, candidates(2), stage="controls", settling_context=CONTEXT,
             )
         self.assertEqual(len(client.calls), 1)
+
+    def test_none_final_control_has_no_winning_timing(self):
+        client = FakeClient(group_choices={"controls_r1_g0": NONE_KEY})
+        result = ChoiceSelector(client).select(
+            REQUEST, candidates(2), stage="controls", settling_context=CONTEXT,
+        )
+        self.assertIsNone(result.winner)
+        self.assertIsNone(result.settling_ms)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(len(client.calls[0]["questions"]), 3)
+        self.assertEqual(set(result.rounds[0]["settling"]), {"control_0", "control_1"})
+        self.assertNotIn(NONE_KEY, result.rounds[0]["settling"])
+
+    def test_evidence_rounds_share_context_and_only_final_round_confirms(self):
+        state = self.evidence_state()
+        observed = candidates(112)
+        client = FakeClient()
+        result = ChoiceSelector(client).select(
+            state, observed, stage="evidence", settling_context=CONTEXT,
+        )
+        self.assertEqual([round_["candidate_count"] for round_ in result.rounds], [112, 12, 2])
+        self.assertEqual([len(call["questions"]) for call in client.calls], [12, 2, 2])
+        self.assertIs(result.winner, observed[-1])
+        self.assertTrue(result.verification)
+        self.assertIsNone(result.settling_ms)
+        for call in client.calls:
+            self.assertIs(call["state"], state)
+            self.assertEqual(call["model"], PINNED_MODEL)
+            for key, question in call["questions"].items():
+                self.assertNotIn("settling", key)
+                if key.endswith("_confirmation"):
+                    continue
+                self.assertEqual(question.instructions, EVIDENCE_QUESTION)
+                self.assertIn("last_control", question.instructions)
+                self.assertIn("last_action", question.instructions)
+                self.assertEqual(list(question.criteria)[-1], NONE_KEY)
+                self.assertLessEqual(len(question.criteria), 11)
+        final_call = client.calls[-1]
+        confirmation = final_call["questions"]["evidence_r3_confirmation"]
+        self.assertEqual(confirmation.instructions["question"], EVIDENCE_CONFIRMATION_QUESTION)
+        self.assertEqual(confirmation.instructions["evidence_candidates"], {
+            "control_99": observed[99].description, "control_111": observed[111].description,
+        })
+        self.assertEqual(confirmation.criteria, {"yes": None, "no": None})
+        self.assertNotIn("private_token", str(confirmation.instructions))
+        final_trace = result.rounds[-1]
+        self.assertEqual(final_trace["verification"], {
+            "question_key": "evidence_r3_confirmation", "choice": "yes", "verified": True,
+        })
+        answer = final_trace["api_call"]["answers"]["evidence_r3_confirmation"]
+        self.assertEqual(answer["choice"], "yes")
+        self.assertEqual(answer["probabilities"], {"yes": 0.7, "no": 0.3})
+        state["last_control"]["status"] = "verified"
+        observed[99].description["label"] = "Changed after the request"
+        self.assertEqual(final_trace["api_call"]["state"]["last_control"]["status"], "unverified")
+        self.assertEqual(
+            final_trace["api_call"]["questions"]["evidence_r3_confirmation"]["instructions"]["evidence_candidates"]["control_99"]["label"],
+            "Details 99",
+        )
+
+    def test_evidence_singleton_batches_selection_and_confirmation(self):
+        for confirmation in ("yes", "no"):
+            with self.subTest(confirmation=confirmation):
+                observed = candidates(1)
+                client = FakeClient(confirmation=confirmation)
+                result = ChoiceSelector(client).select(self.evidence_state(), observed, stage="evidence")
+                self.assertIs(result.winner, observed[0])
+                self.assertEqual(result.verification, confirmation == "yes")
+                self.assertIsNone(result.settling_ms)
+                self.assertEqual(len(client.calls), 1)
+                self.assertEqual(list(client.calls[0]["questions"]), ["evidence_r1_g0", "evidence_r1_confirmation"])
+                self.assertEqual(result.rounds[0]["groups"][0]["options"], ["control_0", NONE_KEY])
+
+    def test_sparse_evidence_advancement_still_confirms_surviving_singleton(self):
+        client = FakeClient(group_choices={
+            "evidence_r1_g0": NONE_KEY, "evidence_r1_g1": "control_10",
+        })
+        observed = candidates(11)
+        result = ChoiceSelector(client).select(self.evidence_state(), observed, stage="evidence")
+        self.assertEqual([round_["candidate_count"] for round_ in result.rounds], [11, 1])
+        self.assertEqual([round_["winner_count"] for round_ in result.rounds], [1, 1])
+        self.assertEqual([len(call["questions"]) for call in client.calls], [2, 2])
+        self.assertIs(result.winner, observed[10])
+        self.assertTrue(result.verification)
+        final_questions = client.calls[-1]["questions"]
+        self.assertEqual(list(final_questions["evidence_r2_g0"].criteria), ["control_10", NONE_KEY])
+        self.assertEqual(final_questions["evidence_r2_confirmation"].instructions["evidence_candidates"], {
+            "control_10": observed[10].description,
+        })
+
+    def test_none_evidence_cannot_be_overridden_by_yes_confirmation(self):
+        client = FakeClient(group_choices={"evidence_r1_g0": NONE_KEY}, confirmation="yes")
+        result = ChoiceSelector(client).select(self.evidence_state(), candidates(3), stage="evidence")
+        self.assertIsNone(result.winner)
+        self.assertFalse(result.verification)
+        self.assertEqual(result.rounds[0]["verification"]["choice"], "yes")
+        self.assertFalse(result.rounds[0]["verification"]["verified"])
+
+    def test_empty_evidence_is_unverified_without_inference(self):
+        client = FakeClient()
+        result = ChoiceSelector(client).select(self.evidence_state(), [], stage="evidence")
+        self.assertIsNone(result.winner)
+        self.assertFalse(result.verification)
+        self.assertEqual(result.rounds, [])
+        self.assertEqual(client.calls, [])
+
+    def test_confirmation_choice_is_used_without_a_probability_or_confidence_gate(self):
+        class LowConfidenceClient(FakeClient):
+            def system_one(self, **kwargs):
+                response = super().system_one(**kwargs)
+                confirmation = response.answers["evidence_r1_confirmation"]
+                confirmation.confidence = 0.0
+                confirmation.probabilities = {"yes": 0.01, "no": 0.99}
+                return response
+
+        result = ChoiceSelector(LowConfidenceClient()).select(
+            self.evidence_state(), candidates(2), stage="evidence",
+        )
+        self.assertTrue(result.verification)
 
 
 if __name__ == "__main__":

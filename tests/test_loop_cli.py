@@ -15,10 +15,10 @@ class LoopCliTests(unittest.TestCase):
     invoke = test_pipeline.CliTests.invoke
 
     def test_request_runs_loop_by_default_without_execution_modes(self):
-        result = PipelineResult("completed", iterations=[{"iteration": 2, "route": "done"}])
+        result = PipelineResult("action_verified", iterations=[{"iteration": 2, "route": "verified"}])
         status, output, pipeline, _, _ = self.invoke(["Save document"], result=result)
         self.assertEqual(status, 0)
-        self.assertEqual(output["status"], "completed")
+        self.assertEqual(output["status"], "action_verified")
         self.assertEqual(output["iterations"], result.iterations)
         pipeline.assert_called_once()
         self.assertEqual(pipeline.call_args.args[0], "Save document")
@@ -29,7 +29,7 @@ class LoopCliTests(unittest.TestCase):
         self.assertTrue(self.report.closed)
 
     def test_unfinished_loop_returns_exit_two_and_existing_report_format(self):
-        for reason in ("no_action", "unchanged_error"):
+        for reason in ("no_action", "no_control_selected", "no_evidence", "action_unverified"):
             with self.subTest(reason=reason):
                 result = PipelineResult(reason, reason="Fixture stop")
                 status, output, pipeline, _, _ = self.invoke(["Save document"], result=result)
@@ -62,7 +62,7 @@ class LoopCliTests(unittest.TestCase):
     def test_final_report_failure_retains_native_action_facts_and_loop_exit_code(self):
         native_result = {"effect": "unverifiable", "route": "accessibility",
                          "delivery": {"mode": "background"}}
-        for result_status, expected_exit in (("completed", 0), ("unchanged_error", 2)):
+        for result_status, expected_exit in (("action_verified", 0), ("action_unverified", 2)):
             with self.subTest(result_status=result_status):
                 result = PipelineResult(result_status, action_result=native_result)
                 with patch.object(test_pipeline.RecordingReport, "close",
