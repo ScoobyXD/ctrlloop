@@ -19,8 +19,8 @@ The workflow keeps its authored question definitions in
   Separate hypothetical click and text timers accompany each finalist in the
   final control-selection round, before request sizing and packing.
 - `TEXT_WORD`, a Noul, asks whether each source word belongs in the text for the
-  current destination. All words are evaluated in one text stage only when text
-  needs to be resolved. Its whole questions use the same request budget and
+  current destination. All words are evaluated in text round `text_r1` only when
+  text needs to be resolved. Its whole questions use the same request budget and
   parallel batching as window/control selection.
 
 Question definitions are reused as needed. A round with 40 groups still
@@ -41,7 +41,7 @@ Prepare the complete HTTP body locally through the pinned SDK's existing
 request builder, then count its encoded bytes. This is the same body measured
 as `len(request.content)` before transport. Count shared state, the model and
 JSON envelope, question IDs, instructions, candidate criteria, every final
-control action/timer, and every word Noul in the text stage. Each call repeats
+control action/timer and every word Noul. Each call repeats
 its state and envelope, so count those bytes
 again for each call. HTTP headers and transport framing are outside the budget.
 Indented report-file sizes differ from the outgoing HTTP body sizes. Local sizing
@@ -49,8 +49,8 @@ sends no API calls and creates no HTTP request events.
 
 Window/control selection and text selection reuse the same packing and parallel
 dispatch helpers. Complete all local packing before dispatching any batch. If
-the shared state plus one whole question exceeds the budget, fail the round or
-text stage before any of its API calls are sent. A question is atomic: do not
+the shared state plus one whole question exceeds the budget, fail that round
+before any of its API calls are sent. A question is atomic: do not
 split a Choice group's candidates, remove words, or trim the original request.
 
 The budget comes from a study of 780 successful calls in 38 saved runs:
@@ -65,10 +65,10 @@ token limits. The model remains pinned to `jev-1.13.0`.
 
 | Term | Meaning |
 | --- | --- |
-| Candidate | One observed or synthetic window/control option. |
+| Candidate | One observed or synthetic window/control option, or one source word in the text round. |
 | Group | Up to 10 candidates considered together. |
-| Group question | One instance of `QUESTION` selecting a candidate from a group. |
-| Round | Evaluate all groups, then advance each group's selected candidate after every batch succeeds. |
+| Group question | One `QUESTION` selecting a window/control candidate from a group. |
+| Round | Evaluate all questions, then advance selected candidates after every batch succeeds. The single text round evaluates all source-word Nouls. |
 | API call | One request with a batch of whole questions and a complete body of at most 90,000 bytes; questions can be group selections, final action/timers, or source-word Nouls. |
 | Stage | Window discovery/selection, activation, control acquisition/selection, text selection, or action dispatch. |
 | Iteration | One decision cycle with fresh window discovery, selection, observation, and action when available. All calls in the cycle share its iteration number. |
@@ -93,7 +93,7 @@ source spans throughout the run; do not regenerate or rewrite the request.
 3. Select the next window with `QUESTION`. This happens again every iteration,
    allowing the next action to move to another window.
 4. For Windows Search, use the exact explicit `--text` when supplied; otherwise
-   resolve a source phrase with the word-inclusion Nouls. An unresolved phrase
+   assemble all words meeting the inclusion threshold. No selected words
    returns `no_action` before activation. Send desktop Win+S, then immediately send
    desktop `type_text` with the resolved string, and skip to the next iteration
    (or return `iteration_limit` at the configured bound). No control read,
@@ -106,8 +106,8 @@ source spans throughout the run; do not regenerate or rewrite the request.
    final control round, include an action Choice and a hypothetical timer for
    each of `click` and `type_text` per finalist. Consume the winning candidate's
    action and its matching timer.
-6. For `type_text`, resolve the phrase in one Noul text stage while preserving
-   previous action/control history. An empty or noncontiguous selection returns
+6. For `type_text`, assemble all words meeting the inclusion threshold while
+   preserving previous action/control history. No selected words returns
    `no_action`. Immediately before native dispatch, record the selected control,
    action, and source window as the latest attempted action. Execute the selected
    native CUA action using the original snapshot target and retain its result. Unconfirmed
@@ -126,7 +126,7 @@ candidates. It uses the existing activation stage for
 `type_text({scope: "desktop", text: <resolved text>})`. Both commands belong
 to the same iteration. This route makes zero control-selection rounds and zero
 timer requests, and adds no settling wait after typing. Without an explicit
-Search override, its word-selection stage completes before Win+S. The next normal
+Search override, its complete text-selection stage finishes before Win+S. The next normal
 iteration reads fresh state and can select real search results. Real Start and
 Search windows remain observed window candidates; the synthetic route does not
 replace them. After a result click closes Search, the next discovery offers the
@@ -159,10 +159,12 @@ control list, accumulating action history, or local snapshot diff. Native target
 identities remain local. The selector also supports a plain request string for
 direct callers; the pipeline uses the existing shared dictionary.
 Source words remain local until text resolution; they are not added to every
-window/control request. The text request adds only its `text_target` context and
-the word questions to the existing state.
+window/control request. Text requests add only their `text_target` context and
+word questions to the existing state.
 
 ## Selection rounds and API batches
+
+Window and control selection follow these steps:
 
 1. Divide candidates into groups of up to 10, preserving observed order.
 2. Give every group one `QUESTION` with only its candidates as criteria. There is
@@ -190,8 +192,8 @@ Every round uses the same
 This uses three control rounds. The final round adds four action Choices and
 eight hypothetical timers, making 13 questions to measure before packing.
 Each round uses one call if its complete body fits, or parallel calls if it needs
-multiple batches. If text wins, the text stage also uses one or more calls under
-the same budget. Window selection with 17 candidates adds two rounds: 17 become
+multiple batches. If text wins, its stage adds one word round packed under the
+same budget. Window selection with 17 candidates adds two rounds: 17 become
 two winners, then one. The next iteration begins new window/control rounds.
 
 For 631 controls, the rounds are `631 -> 64 -> 7 -> 1`; for 647, they are
@@ -235,26 +237,33 @@ iteration. No wait follows the last permitted action.
 
 ## Resolving and entering text
 
-Text resolution reuses the original request's ordered word spans. One Noul per
-word asks whether it belongs in the text for the selected control or Windows
-Search destination, with the original request and current action context.
-Evaluate **all source words in one text stage**, using the same complete-body
-byte sizing, whole-question packing, and parallel dispatch helpers as selection.
-A small request uses one API call. If it exceeds 90,000 bytes, pack its Nouls into
-parallel calls, each counting the full shared state and envelope. No word is
-omitted, and words are not converted into ten-word Choice groups. Collect and
-validate every batch before deciding inclusion or dispatching text. No text call
-is needed after a click choice or for an explicit Windows Search `--text` override.
+Text resolution reuses the original request's ordered word spans. In `text_r1`,
+one `TEXT_WORD` Noul per word asks whether it belongs in the text for the selected
+control or Windows Search destination, with the original request and current
+action context. Evaluate **all source words in that one round**, using the same
+complete-body byte sizing, whole-question packing, and parallel dispatch helpers
+as selection. A fitting round uses one API call; a larger round uses parallel
+calls, each counting the full shared state and envelope. No word is omitted or
+converted into a ten-word Choice group. Collect and validate every batch before
+deciding inclusion or dispatching text. No text call is needed after a click
+choice or for an explicit Windows Search `--text` override.
 
-A word is included when its Noul probability exceeds 0.5. Accept only a nonempty
-contiguous sequence of included positions; scattered words or no words leave the
-action unresolved. Code copies the exact substring from the first selected
-word's start to the last selected word's end. This preserves internal whitespace,
-punctuation, URLs, and repeated-word identity through offsets. It does not remove
-quotes or punctuation, assemble multiple separated phrases, infer a URL from a
-site name, or generate text absent from the request. Local byte packing happens
-before requests are sent; a later provider rejection remains an error, without
-automatic smaller retries or truncation.
+Include every word whose Noul probability is **at least 0.80 (`>= 0.80`)**,
+including exactly 0.80. Preserve source order even when selected words are
+separated by omitted words. The threshold determines the final selected words;
+there is no second Jev question, best-span choice, or span-length limit.
+No selected words returns `no_action`. A request or response failure remains an
+error and cannot dispatch partially resolved text.
+
+Copy selected words verbatim using their source offsets, preserving punctuation,
+URLs, and repeated-word identity. Preserve the original whitespace between
+adjacent selected words. When omitted words separate two selected words, join
+them with one space. For example, selecting `red` and `blue` from
+`red and blue` produces `red blue`; selecting both from a tab-separated source
+preserves the original tab. No quotes or punctuation are removed, no site name
+becomes a URL, and no words absent from the request are generated. Local byte
+packing happens before the round's requests are sent; a later provider rejection
+remains an error, without automatic smaller retries or truncation.
 
 For an observed control, the existing adapter sends native `type_text` with the
 same snapshot-bound target used for clicking. CUA Driver 0.28.2's Windows
@@ -274,10 +283,12 @@ The selected native tool is retained as `Selection.action`. Final control traces
 store `actions[candidate]` with its question key and chosen tool, and
 `settling[candidate][action]` with its question key, Choice answer, and
 milliseconds. The text stage uses the same `Selection` and `api_calls` records,
-including packing, batch, and prepared `body_bytes` information;
-its trace adds `selected_indices`, `selected_offsets`, `source_span`, `text`, and
-an unresolved `reason` when applicable. Word-selection rounds are separate from
-window/control rounds and do not use groups-of-ten elimination.
+including packing, batch, and prepared `body_bytes` information. `text_r1` retains
+every Noul probability, `threshold: 0.80`, `threshold_comparison: ">="`,
+`selected_indices`, `selected_offsets`, and assembled `text` or an unresolved
+`reason`. Its optional `source_span` records the exact source range only when the
+selected words were contiguous; it is omitted for disjoint selections. Text
+selection is one stage with one word round, separate from window/control rounds.
 
 ## Running and stopping
 
@@ -302,7 +313,7 @@ and no desktop action.
 | Status | Meaning | CLI exit |
 | --- | --- | ---: |
 | `iteration_limit` | Configured action-cycle bound reached; overall completion unknown. | 2 |
-| `no_action` | Text selection empty/noncontiguous, text target disabled, or custom synthetic control lacks a live CUA target. | 2 |
+| `no_action` | No request words meet the text threshold, text target disabled, or custom synthetic control lacks a live CUA target. | 2 |
 | `no_windows` | No window candidates; normally unreachable with Windows Search enabled. | 2 |
 | `no_controls` | Valid observation/synthetic definition has no indexed controls. | 2 |
 | `observation_degraded` | Degraded read has no indexed controls. | 2 |
@@ -323,13 +334,14 @@ delivery, not screen readiness or completion.
 | Description size | App/title/control text capped at 240 characters; up to two indexed ancestors with 120-character labels. Original request and source records remain intact. |
 | Jev timeout/retries | 30-second HTTP timeout configuration, zero automatic retries; not a total run deadline. |
 | CUA timeout/retries | 60-second deadline per transport attempt including lazy startup; reads may reconnect/retry once, actions are not replayed. |
-| Batching | Up to 10 window/control candidates per group; all stages pack whole questions into complete HTTP bodies of at most 90,000 bytes and dispatch parallel batches; action/timers included before sizing the final control round; one Noul per source word. |
+| Batching | Up to 10 window/control candidates per group. All rounds pack whole questions into HTTP bodies of at most 90,000 bytes and dispatch parallel batches; action/timers included before sizing the final control round; one Noul per source word in `text_r1`. |
+| Text assembly | All words meeting `>= 0.80` are typed in source order. Adjacent selected words retain their source whitespace; omitted-word gaps become one space. |
 | Settling | One 50–500 ms scheduled wait after a control click or confirmed targeted text action when another iteration follows; none on the Windows Search route. |
 | Iterations | Positive bound, default 10; no automatic completion judgment. |
 | Model | Exact pin `jev-1.13.0`, validated on every response. |
 | Action scope | Observed control clicks/targeted text entry and direct Windows Search activation/text entry; no coordinate fallback, automatic action retry, or general recovery planner. |
 | Response validation | Exact question/option labels and expected Choice/Noul answer kinds; finite probabilities/confidence in [0, 1]; Choice totals 0.97–1.03; nonnegative integer token counts. |
-| Confidence gating | Choices advance directly without ranking across groups; word Nouls use an inclusion probability greater than 0.5. |
+| Confidence gating | Choices advance directly without ranking across groups; word Nouls use `>= 0.80` for inclusion. |
 
 Controls require structured indexed observations and snapshot identities. Actions
 use an observed element token or an element index with its snapshot ID. Old
@@ -365,7 +377,7 @@ under that iteration. The final action and exact query remain in `last_action`;
 there are no control-selection rounds or fake control records for this route.
 Correlate repeated round names with `(iteration, round_id)` and span/request IDs.
 Retain the original request, question text, all probabilities, action/timer answers,
-word-inclusion answers, resolved substring, consumed timer, requested wait, and
+word-inclusion answers, assembled text, consumed timer, requested wait, and
 measured durations. No evidence rounds or
 confirmation traces are generated.
 

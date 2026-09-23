@@ -8,8 +8,9 @@ The pipeline dispatches that native CUA action, waits for the app to settle,
 and starts the next selection from fresh observations.
 Choosing Windows Search instead sends desktop **Win+S**, then directly types the
 query resolved before activation. An explicit `--text` supplies the exact Search
-query; otherwise Jev selects words from the original request in one text stage,
-using one call when it fits the byte budget or parallel calls when needed.
+query; otherwise Jev evaluates source words in one text round and code types every
+word meeting the inclusive 80% threshold, in source order. The round uses one
+call when it fits the byte budget or parallel calls when needed.
 The Win+S-to-typing handoff has no intervening observation,
 confirmation, sleep, control selection, or Jev call. The next iteration observes
 the real search results.
@@ -47,8 +48,8 @@ search; there is no permanent one-shot flag. Driver errors remain errors.
 The Windows Search window record has `synthetic: true` and no invented PID,
 window handle, control, geometry, or snapshot identity. It has no control
 candidates: selecting it executes the two native desktop commands directly.
-Without an explicit Search query, word selection happens before either native
-command. An empty or noncontiguous selection returns `no_action` without typing.
+Without an explicit Search query, text selection happens before either native
+command. No words meeting the threshold returns `no_action` without typing.
 
 ## Defining synthetic windows and controls
 
@@ -242,7 +243,7 @@ it is not automatically attributed to daemon access.
 | Status | Meaning | CLI exit |
 | --- | --- | --- |
 | `iteration_limit` | Configured action-cycle bound reached; task completion was not assessed | 2 |
-| `no_action` | Text selection empty/noncontiguous, text target disabled, or custom synthetic control lacks live CUA identifiers | 2 |
+| `no_action` | No request words meet the text threshold, text target disabled, or custom synthetic control lacks live CUA identifiers | 2 |
 | `no_windows` | No first-stage candidate selected; normally unreachable with the Windows Search option | 2 |
 | `no_controls` | A valid read returned no indexed controls, or a synthetic window defines no controls | 2 |
 | `observation_degraded` | A degraded read returned no indexed controls | 2 |
@@ -337,8 +338,8 @@ Reports contain these milestones:
   no selection question; a singleton control receives the selection question, with action and timing
   when executable. Windows Search is marked `synthetic: true` in
   `window_selected`; it has no `control_selected` or `window_observed` event.
-- `text_selected`: destination, exact resolved substring or unresolved result,
-  and the word-selection trace. Every Noul probability is retained with its API call.
+- `text_selected`: destination, assembled text or unresolved result, and the
+  word-selection round. Every Noul probability is retained with its API call.
 - `action_requested` and `action_returned`: native activation and input arguments
   and returned action facts. Windows Search records `hotkey` and `type_text`
   separately under the same iteration, including the exact resolved text. Unresolved
@@ -408,7 +409,7 @@ contains at most ten candidates and receives one Jev Choice question using
 `QUESTION`. Each group selects one supplied candidate, which advances in group
 order. Regroup survivors in tens for the next round.
 
-Only a singleton window bypasses selection. A singleton control still receives
+In window/control selection, only a singleton window bypasses Jev. A singleton control still receives
 the selection question, with action and timers when executable. For 1,000 control candidates,
 the round counts are `1000 -> 100 -> 10 -> 1`. Prepared body sizes determine
 the number of API calls per round. Group size ten is fixed.
@@ -423,16 +424,21 @@ calls. Consume only the winning control's action and matching timer after every
 batch succeeds.
 
 The original request is split once into whitespace-delimited words with original
-character offsets. When text is needed, one text stage asks one Noul per word,
-including all words and using the selected destination as context. The same
-90,000-byte budget applies: use one API call when it fits, otherwise parallel
-batches of whole Noul questions. All answers must validate before text is assembled.
-Words whose inclusion probability exceeds 0.5 are included. The chosen positions
-must form one nonempty continuous phrase; code copies its exact original substring,
-preserving punctuation and internal whitespace. Empty or scattered selections
-stop the action. A name is not converted into a URL, and text absent from the
-request cannot be generated. All Noul answers and probabilities remain in the
-existing selection/reporting traces.
+character offsets. Text round `text_r1` asks one Noul per source word, using the
+selected destination as context. The same 90,000-byte budget applies: use one
+API call when it fits, otherwise parallel batches of whole Noul questions.
+Collect and validate all answers before applying the inclusive inclusion rule:
+**probability >= 0.80**. Type every selected word in source order, including words
+separated by omitted words. There is no second Jev selection, preferred phrase,
+or span-length limit. No selected words returns `no_action`.
+
+Code copies each selected word with its original punctuation. It preserves
+source whitespace between adjacent selected words and uses one space across an
+omitted-word gap. A name is not converted into a URL, and words absent from the
+request cannot be generated. Reports retain every Noul probability, selected
+word positions and offsets, and the assembled text or unresolved reason. A
+`source_span` is recorded only when the selected words were contiguous. Text
+selection is one stage with one word round.
 
 Every loop request carries the unchanged `original_request`, current `iteration`,
 fresh `current_window` identity and `last_control`. The window is null before
@@ -461,7 +467,7 @@ the full observed records remain local and the original prompt is never shortene
 Selection does not send PID, HWND, snapshot token, screenshot, or a redundant full
 tree as state.
 
-**Every window/control round and text stage first prepares its complete HTTP body through the SDK.**
+**Every window, control, and text round first prepares its complete HTTP body through the SDK.**
 If it is at most **90,000 bytes**, send one call. Otherwise, preserve question
 order and pack the largest contiguous batches of whole questions that fit,
 counting shared state and the envelope in each body. Each batch repeats the
@@ -469,8 +475,8 @@ same frozen state for the round. A thread pool sends the batches concurrently
 through the shared SDK client. Collect validated answers by their existing
 question IDs, then advance winners in original group order after all batches
 succeed. Text selection uses the same packer and dispatch path, collecting every
-word's Noul answer before applying inclusion decisions. No candidates or words
-are dropped, and multiple calls remain one round or text stage.
+word's Noul answer before applying inclusion decisions. Packing drops no supplied
+candidates or words; multiple parallel calls remain one round.
 
 For 392 controls, the rounds are `392 -> 40 -> 4 -> 1`; for 631 controls, they
 are `631 -> 64 -> 7 -> 1`. Body sizes determine the API call count in each round.
@@ -493,8 +499,8 @@ SDK-prepared HTTP body, equivalent to `len(request.content)` before transport;
 indented report-file sizes differ. Local sizing sends no API requests. Service
 token limits still apply. Automatic rejection retries, description compaction,
 and splitting an individual question are outside this implementation. If shared
-state plus one atomic group/action/timer/Noul question cannot fit, the entire
-round or text stage fails before any of its calls are dispatched.
+state plus one atomic group/action/timer/Noul question cannot fit, that round
+fails before any of its calls are dispatched.
 Actual input/output token usage and prepared body bytes are retained for every
 call in the round's `api_calls` list. See
 [main workflow](docs/main-workflow.md) for the workflow and timing contract.
@@ -502,7 +508,7 @@ call in the round's `api_calls` list. See
 Returned model identity, question keys, answer type, option labels, probability
 shape, and usage are validated. Choice confidence and probabilities never rank
 winners across groups or gate advancement. The word-inclusion Nouls use their
-probabilities for inclusion decisions; they do not alter control elimination.
+probabilities for inclusion at `>= 0.80`; they do not alter control elimination.
 
 ## Observation limits
 

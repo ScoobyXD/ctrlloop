@@ -126,7 +126,7 @@ def _retain_rounds(result, stage, rounds, iteration):
 
 
 def _request_words(original_request):
-    """Keep source positions locally; copy exact spans after Jev chooses words."""
+    """Keep source positions to assemble included words in request order."""
     return [
         Candidate(f"word_{index}", {"text": match.group()},
                   {"start": match.start(), "end": match.end()})

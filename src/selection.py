@@ -1,4 +1,4 @@
-"""Choice elimination and source-word Nouls using shared byte-budgeted batches."""
+"""Choice elimination and source-word inclusion with byte-budgeted batches."""
 
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -27,9 +27,8 @@ if TYPE_CHECKING:
 PINNED_MODEL = "jev-1.13.0"
 GROUP_SIZE = 10
 REQUEST_BUDGET_BYTES = 90_000
-# Experimental decision policy, not a calibrated reliability guarantee. A tie
-# stays excluded; retain every raw Noul so this policy can be evaluated later.
-WORD_INCLUSION_THRESHOLD = 0.5
+# Include the boundary exactly; retain raw Nouls for later policy evaluation.
+WORD_INCLUSION_THRESHOLD = 0.80
 SETTLING_MS = {
     "<50ms": 50,
     "100ms": 100,
@@ -476,7 +475,7 @@ class ChoiceSelector:
         self, state: str | dict[str, Any], words: Sequence[Candidate], *,
         target: Mapping[str, Any], report: "RunReport | None" = None,
     ) -> Selection:
-        """Judge all words in one budgeted round, then copy an exact source span."""
+        """Include every word that meets the threshold, in original source order."""
         with report.span("selection", stage="text") if report else nullcontext({}):
             with report.span("selection.validation") if report else nullcontext({}):
                 request = state.get("original_request") if isinstance(state, dict) else state
@@ -491,11 +490,16 @@ class ChoiceSelector:
                         not isinstance(word.key, str) or not word.key or word.key in keys
                         or type(start) is not int or type(end) is not int
                         or not previous_end <= start < end <= len(request)
+                        or (keys and start == previous_end)
+                        or request[previous_end:start].strip()
                         or word.description.get("text") != request[start:end]
+                        or any(character.isspace() for character in request[start:end])
                     ):
-                        raise ValueError("Words must have unique keys and ordered exact source offsets.")
+                        raise ValueError("Words must have unique keys and exact whitespace-delimited source spans.")
                     keys.add(word.key)
                     previous_end = end
+                if request[previous_end:].strip():
+                    raise ValueError("Words must cover every non-whitespace source character.")
                 text_state = dict(state) if isinstance(state, dict) else {"original_request": request}
                 text_state["text_target"] = dict(target)
             round_id = "text_r1"
@@ -525,31 +529,41 @@ class ChoiceSelector:
                 with report.span("selection.advancement") if report else nullcontext({}) as advancement_timing:
                     selected_indices = [
                         index for index, word in enumerate(words)
-                        if outcomes[f"{round_id}_{word.key}"] > WORD_INCLUSION_THRESHOLD
+                        if outcomes[f"{round_id}_{word.key}"] >= WORD_INCLUSION_THRESHOLD
                     ]
-                    winner = None
-                    reason = None
-                    if not selected_indices:
-                        reason = "No request words exceeded the text-inclusion threshold."
-                    elif selected_indices != list(range(selected_indices[0], selected_indices[-1] + 1)):
-                        reason = "Selected request words are not one contiguous source span."
-                    else:
-                        start = words[selected_indices[0]].record["start"]
-                        end = words[selected_indices[-1]].record["end"]
-                        exact_text = request[start:end]
-                        winner = Candidate("text", {"text": exact_text}, {"text": exact_text})
+                    # Keep every included word. Preserve original whitespace
+                    # between adjacent words; replace omitted-word gaps with a space.
+                    parts = []
+                    previous_index = None
+                    for index in selected_indices:
+                        start, end = words[index].record["start"], words[index].record["end"]
+                        if previous_index is not None:
+                            parts.append(
+                                request[words[previous_index].record["end"]:start]
+                                if index == previous_index + 1 else " "
+                            )
+                        parts.append(request[start:end])
+                        previous_index = index
+                    text = "".join(parts)
+                    winner = Candidate("text", {"text": text}, {"text": text}) if text else None
                     round_trace = {
                         "round": 1, "round_id": round_id, "candidate_count": len(words),
                         "question_count": len(questions), "winner_count": int(winner is not None),
                         "api_calls": api_calls, "threshold": WORD_INCLUSION_THRESHOLD,
                         "request_budget_bytes": REQUEST_BUDGET_BYTES,
-                        "threshold_comparison": ">", "selected_indices": selected_indices,
+                        "threshold_comparison": ">=", "selected_indices": selected_indices,
                         "selected_offsets": [dict(words[index].record) for index in selected_indices],
-                        "reason": reason,
+                        "reason": None if winner else (
+                            f"No request words met the text-inclusion threshold (>= {WORD_INCLUSION_THRESHOLD:.2f})."
+                        ),
                     }
                     if winner is not None:
-                        round_trace["source_span"] = {"start": start, "end": end}
-                        round_trace["text"] = winner.record["text"]
+                        round_trace["text"] = text
+                        if selected_indices[-1] - selected_indices[0] + 1 == len(selected_indices):
+                            round_trace["source_span"] = {
+                                "start": words[selected_indices[0]].record["start"],
+                                "end": words[selected_indices[-1]].record["end"],
+                            }
                 if report:
                     round_trace.update(
                         span_id=round_timing["span_id"], grouping_span_id=grouping_timing["span_id"],
