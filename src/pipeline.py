@@ -20,6 +20,11 @@ else:
 
 
 DEFAULT_MAX_ITERATIONS = 10
+# Native app_name process identities only; do not infer browsers from titles or
+# Chromium window classes shared with Electron apps. Unknown apps keep CUA's default.
+_FOREGROUND_TYPING_APPS = frozenset({
+    "chrome", "chromium", "msedge", "brave", "opera", "vivaldi", "firefox",
+})
 
 
 class Driver(Protocol):
@@ -153,8 +158,7 @@ def _remember_action(state, result, tool, text=None):
     state["last_action"] = {
         "tool": tool,
         **({"text": text} if tool == "type_text" else {}),
-        "result": {name: result.action_result[name] for name in ("effect", "route", "delivery")
-                   if name in result.action_result},
+        "result": result.action_result,
     }
 
 
@@ -359,7 +363,7 @@ def _prepare_window(state, windows, driver, selector, result, report, synthetic,
 
 
 def _select_and_act(state, controls, driver, selector, result, report,
-                    words, settling_context=None, iteration=None):
+                    words, settling_context=None, iteration=None, delivery_mode=None):
     with report.span("control_selection", stage="controls") if report is not None else nullcontext({}):
         control_selection = selector.select(
             state, controls, stage="controls",
@@ -417,14 +421,21 @@ def _select_and_act(state, controls, driver, selector, result, report,
                 arguments.update(element_index=result.control.get("element_index"), snapshot_id=result.snapshot_id)
             if tool == "type_text":
                 arguments["text"] = text
+                mode = delivery_mode
+                app_name = state["current_window"].get("app_name", "")
+                if mode is None and isinstance(app_name, str):
+                    if app_name.casefold().removesuffix(".exe") in _FOREGROUND_TYPING_APPS:
+                        mode = "foreground"
+                if mode is not None:
+                    arguments["delivery_mode"] = mode
         result.action_result = _invoke_action(result, driver, report, tool, arguments)
     _remember_action(state, result, tool, text)
     result.status = "action_returned"
-    if tool == "type_text" and result.action_result.get("effect") != "confirmed":
-        # A returned input call can have changed the field without synchronous
-        # evidence. Stop before another append rather than replay uncertain text.
+    if tool == "type_text" and result.action_result.get("effect") not in {"confirmed", "unverifiable"}:
+        # Successful but unverified dispatch follows normal settling/observation;
+        # partial/no-op evidence still stops before another input decision.
         result.status = "observation_unavailable"
-        result.reason = "CUA did not confirm the targeted text entry; inspect the field before further input."
+        result.reason = "CUA reported incomplete or ineffective targeted text entry; inspect the field before further input."
     return control_selection.settling_ms
 
 
@@ -473,6 +484,7 @@ def run_pipeline(
     sleep: Callable[[float], None] = system_sleep,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     text: str | None = None,
+    delivery_mode: str | None = None,
 ) -> PipelineResult:
     """Repeat fresh selection and native actions within an explicit limit.
 
@@ -480,6 +492,9 @@ def run_pipeline(
     Windows Search resolves text before sending Win+S followed immediately by text.
     The iteration limit bounds execution; it does not establish task completion.
     Native delivery errors propagate without replaying the attempted action.
+    delivery_mode overrides targeted typing with CUA's foreground/background enum.
+    By default, known browser app identities use foreground; other apps retain the
+    native default. Desktop Windows Search typing and clicks are unaffected.
     """
     if type(max_iterations) is not int or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer.")
@@ -487,6 +502,10 @@ def run_pipeline(
         raise ValueError("The original request must be nonempty.")
     if text is not None and (not isinstance(text, str) or not text.strip()):
         raise ValueError("text must be a string containing non-whitespace text.")
+    if delivery_mode is not None and (
+        not isinstance(delivery_mode, str) or delivery_mode not in {"foreground", "background"}
+    ):
+        raise ValueError("delivery_mode must be foreground or background.")
     result = PipelineResult(status="no_windows")
     state = _jev_state(original_request, 0, None, None)
     with report.span("request_word_preparation") if report else nullcontext({}):
@@ -528,7 +547,7 @@ def run_pipeline(
                 settling_ms = _select_and_act(
                     state, controls, driver, selector, result, report, words,
                     settling_context=None if result.window.get("synthetic") else state["current_window"],
-                    iteration=iteration,
+                    iteration=iteration, delivery_mode=delivery_mode,
                 )
             if result.action_result is not None:
                 trace["last_action"] = state["last_action"]

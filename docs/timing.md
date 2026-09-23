@@ -13,7 +13,7 @@ round also includes `ACTION` for every finalist and a hypothetical
 matching timer are used. These questions are included before sizing the round.
 Text round `text_r1` evaluates a `TEXT_WORD` Noul for every source word, in one
 call when it fits the same byte budget or parallel calls otherwise. All batches
-must validate before the inclusive `>= 0.80` inclusion rule is applied. Code types
+must validate before the inclusive `>= 0.70` inclusion rule is applied. Code types
 every selected word in source order, including disjoint selections. There is no
 second Jev selection or span-length limit. Selected words keep their punctuation;
 adjacent selected words keep their source whitespace, and omitted-word gaps become
@@ -183,7 +183,7 @@ Absent stages mean the work did not occur.
 Selection traces retain every group question, answer, and probability distribution
 in each round's `api_calls` list. The final control round also retains every
 finalist's action and both timing answers. Text round 1 retains every Noul
-probability, `threshold: 0.80`, `threshold_comparison: ">="`,
+probability, `threshold: 0.70`, `threshold_comparison: ">="`,
 `selected_indices`, `selected_offsets`, and assembled `text` or an unresolved
 `reason`. `source_span` appears only for contiguous selections and is omitted
 when selected words were disjoint. All words meeting the threshold appear in
@@ -221,9 +221,13 @@ Choice estimates additional app/browser readiness time. The exact options
 200, 300, 400, and 500 ms. The last option is a 500 ms first observation, not a
 readiness guarantee. The wait runs after a returned action only when another
 observation will follow. Its duration remains separate from the native action.
-This wait applies to selected control clicks and confirmed targeted text entry;
-Windows Search has no timer or wait. Unconfirmed targeted text entry stops with
-its native facts and no automatic replay.
+This wait applies to selected control clicks and successful targeted text entry
+with `confirmed` or `unverifiable` effect; Windows Search has no timer or wait.
+Reports and `last_action` retain the original effect and native metadata. Explicit
+`partial` or `suspected_noop` targeted text effects still stop with
+`observation_unavailable`. Unknown or malformed native effects fail adapter
+validation; hard CUA errors still fail. Unverified typing does not add a retry or verification
+stage; a permitted next iteration observes and selects normally.
 
 On a successful pipeline return, `client_cleanup` measures closing the SDK and
 HTTP clients. The total operational duration ends after the operational result
@@ -406,8 +410,8 @@ no per-event durable copy. A missing finish record does not mean zero duration.
 Native action duration ends when the adapter returns. Its result does not prove
 that the screen changed or the user's task completed. When continuing, the loop
 observes fresh state and selects the next action, after a settling wait for
-control clicks/confirmed targeted typing or directly after Windows Search typing,
-as described in the
+control clicks or confirmed/unverifiable targeted typing, or directly after
+Windows Search typing, as described in the
 [main workflow](main-workflow.md). Offline fixtures verify boundaries and correlation;
 their durations are not production Jev benchmarks. The model remains
 `jev-1.13.0` and the driver remains CUA Driver `0.28.2`.

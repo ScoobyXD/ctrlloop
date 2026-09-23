@@ -44,6 +44,8 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
     parser.add_argument("request", nargs="?", help="Original user request, preserved in every Jev call")
     parser.add_argument("--request-file", type=Path, help="Read the exact request from a UTF-8 file")
     parser.add_argument("--text", help="Exact Windows Search text override; otherwise select words from the request")
+    parser.add_argument("--delivery-mode", choices=("foreground", "background"),
+                        help="Override targeted typing delivery (default: foreground for known browsers, native default otherwise); does not affect Windows Search desktop typing or clicks")
     parser.add_argument("--env-file", type=Path, default=project_dir / ".env")
     parser.add_argument("--driver", help="Path to cua-driver.exe")
     parser.add_argument("--driver-socket", help=r"Named pipe of an already-running CUA daemon (default: \\.\pipe\cua-driver)")
@@ -92,7 +94,11 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
                 args.request_file.read_bytes().decode("utf-8")
                 if args.request_file is not None else args.request
             )
-        report.append("run_started", request=original_request, **({"text": args.text} if args.text is not None else {}))
+        report.append(
+            "run_started", request=original_request,
+            **({"text": args.text} if args.text is not None else {}),
+            **({"delivery_mode": args.delivery_mode} if args.delivery_mode is not None else {}),
+        )
         with report.span("initialization.configuration"):
             if not original_request.strip():
                 raise ValueError("The original request must be nonempty.")
@@ -127,6 +133,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
                         result = run_pipeline(
                             original_request, driver, selector,
                             report=report, max_iterations=args.max_iterations, text=args.text,
+                            delivery_mode=args.delivery_mode,
                         )
                     cleanup_started_ns = perf_counter_ns()
             report.record_interval("client_cleanup", cleanup_started_ns, perf_counter_ns())
