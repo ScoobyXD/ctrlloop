@@ -7,9 +7,12 @@ candidates, preserving groups of ten within each API call. All batch winners
 recombine before the next round starts. Window rounds send all their group
 questions in one API call. Every window and control group uses the same
 `QUESTION` from [`src/jev_questions.py`](../src/jev_questions.py). The final control
-round's request also includes `TIMER` for every finalist. Only the chosen control's
-timer is used. Windows Search bypasses control selection and timers: it sends
-Win+S and immediately types the supplied exact string in the same iteration.
+round's request also includes `ACTION` for every finalist and a hypothetical
+`TIMER` for each of `click` and `type_text`. Only the chosen control's action and
+matching timer are used. Text resolution adds one call containing a `TEXT_WORD`
+Noul for every source word. Windows Search bypasses control selection and timers:
+it resolves its query before activation, then sends Win+S and immediately types
+the exact resolved string in the same iteration.
 There is no intervening observation, confirmation, sleep, or Jev call, and no
 settling wait after typing. Each subsequent iteration starts with fresh window
 discovery. The candidate cap bounds request size; it is
@@ -33,6 +36,8 @@ reports/run-<timestamp>-<id>/
   0006_jev_output_loop_1_control_round_1_batch_1.json
   0007_jev_input_loop_1_control_round_1_batch_2.json
   0008_jev_output_loop_1_control_round_1_batch_2.json
+  0009_jev_input_loop_1_text_round_1.json
+  0010_jev_output_loop_1_text_round_1.json
 ```
 
 The prefix uses at least four digits, expanding uniformly for longer runs to
@@ -123,16 +128,18 @@ recorded startup work. `initialization.request_read`,
 
 | Operation | Measured work |
 | --- | --- |
+| `request_word_preparation` | Splitting the original request into ordered source words and offsets once, before the first loop. |
 | `window_discovery` | `driver.list_windows()` through return/error. |
 | `candidate_preparation` | Building window or control candidate descriptions. |
-| `window_selection`, `control_selection` | Complete window/control selection, including final control timing questions where applicable. |
+| `window_selection`, `control_selection` | Complete window/control selection, including final action Choices and hypothetical timers where applicable. |
+| `text_selection` | Complete source-word selection, including the one batched Noul call and local contiguous-substring resolution. |
 | `synthetic_resolution` | Looking up controls for a synthetic selection. |
 | `foreground_preparation` | Preparing native activation arguments. |
 | `foreground_activation` | `driver.bring_to_front()` for a real window or `driver.hotkey()` for Windows Search, through return/error. |
 | `control_acquisition` | `driver.get_window_state()` through return/error. |
 | `observation_processing` | Extracting snapshot metadata and quality information. |
-| `action_dispatch` | Selected-control recording through preparation and click return, or Windows Search activation through text-entry return. |
-| `action_preparation` | Checking synthetic control targets and building click arguments. |
+| `action_dispatch` | Native control action preparation through click/text return, or Windows Search activation through text-entry return. Text resolution precedes this span. |
+| `action_preparation` | Building native click/text arguments from the selected snapshot target. Synthetic target checks precede this span. |
 | `native_action` | `driver.click()` or `driver.type_text()` through return/error. |
 | `loop.iteration` | The containing cycle, including observation, selection, native action return, and settling when another observation follows. |
 | `settling_wait` | The requested app/browser settling wait, starting after CUA returns for the action. |
@@ -143,7 +150,7 @@ Within selection, inspect `selection.validation`, `selection.round`,
 before forming its groups and ends after all its winners are ready. A batch
 contains one SDK call and local validation/collection of its answers; batches
 execute sequentially. Only a singleton window can bypass selection. A singleton
-control is still selected, with its timing question in the same request when
+control is still selected, with its action Choice and both timers in the same request when
 execution context is available. A trailing one-candidate group stays in the
 round's final batch.
 
@@ -151,13 +158,17 @@ Foreground activation precedes the newly selected real window's control snapshot
 Windows Search uses `foreground_activation` for desktop Win+S, then directly
 dispatches desktop `type_text`. It has no live UIA read, control candidates,
 control-selection rounds, or settling timer. Both native requests and results
-are recorded separately under the same iteration. A skipped synthetic action,
-including Windows Search without text, has no `native_action`.
+are recorded separately under the same iteration. Its text-selection call occurs
+before `foreground_activation`, and is absent when the exact `--text` override
+is supplied. Unresolved text has no `native_action` or Search activation.
 Absent stages mean the work did not occur.
 
 Selection traces retain every group question, answer, and probability distribution
 in each round's `api_calls` list. The final control round also retains every
-finalist's timing answer.
+finalist's action and both timing answers. Text traces retain every Noul
+probability, inclusion threshold, selected positions/offsets, and the exact
+resolved substring or unresolved reason. The `text_selected` event links these
+traces to the destination. `request_words_prepared` records the source spans once.
 `loop_route` records whether the pipeline continues or stops. The result's
 `iterations` array retains the route and selected `settling_ms`. Use
 `(iteration, round_id)` when correlating repeated names such as `controls_r1`;
@@ -168,7 +179,7 @@ For a timeline, label each loop from the `window_discovery` operation's
 `started_elapsed_ms` to the final `native_action` operation's
 `started_elapsed_ms` in that iteration. These boundaries represent current-state
 acquisition through dispatch to the CUA adapter. The latter is entry to
-`driver.click()` or the Windows Search route's `driver.type_text()`; the report does not measure the later transport-send instant
+`driver.click()` or `driver.type_text()`; the report does not measure the later transport-send instant
 inside the adapter. Subtract those boundaries for the loop duration and use the
 end boundary for grand total elapsed time through that loop. Mark each loop's
 number in its start/end rows, with loop duration and grand total in the end row.
@@ -190,7 +201,9 @@ Choice estimates additional app/browser readiness time. The exact options
 200, 300, 400, and 500 ms. The last option is a 500 ms first observation, not a
 readiness guarantee. The wait runs after a returned action only when another
 observation will follow. Its duration remains separate from the native action.
-This wait applies to selected control clicks; Windows Search has no timer or wait.
+This wait applies to selected control clicks and confirmed targeted text entry;
+Windows Search has no timer or wait. Unconfirmed targeted text entry stops with
+its native facts and no automatic replay.
 
 On a successful pipeline return, `client_cleanup` measures closing the SDK and
 HTTP clients. The total operational duration ends after the operational result
@@ -234,16 +247,17 @@ be added together.
 The timing summary's `jev_api_call_count` counts actual prepared requests seen
 by the HTTP hook. It is zero when no request occurs; Python callers must register
 the report hooks to obtain this count. It can also be checked by counting
-`jev_request` events across all iterations. The per-finalist timing questions
-share the final control selection's call and duration. Inspect each
+`jev_request` events across all iterations. The per-finalist action and timing
+questions share the final control selection's call and duration. All word Nouls
+share one additional text-selection call; they are not separate API calls. Inspect each
 request/response pair to see its complete question and probability distributions;
 do not count individual questions as requests.
 
 The round and iteration traces retain the selected timer interval. Use measured
 `settling_wait` spans for actual elapsed wait time rather than treating the
 requested interval as a clock. `last_action` retains the tool and native result
-facts used as context for the next selection, including the exact supplied text
-after Windows Search text entry.
+facts used as context for the next selection, including the exact text after
+either targeted control typing or Windows Search text entry.
 
 The primary API duration has these boundaries:
 
@@ -364,7 +378,8 @@ no per-event durable copy. A missing finish record does not mean zero duration.
 Native action duration ends when the adapter returns. Its result does not prove
 that the screen changed or the user's task completed. When continuing, the loop
 observes fresh state and selects the next action, after a settling wait for
-control clicks or directly after Windows Search typing, as described in the
+control clicks/confirmed targeted typing or directly after Windows Search typing,
+as described in the
 [main workflow](main-workflow.md). Offline fixtures verify boundaries and correlation;
 their durations are not production Jev benchmarks. The model remains
 `jev-1.13.0` and the driver remains CUA Driver `0.28.2`.

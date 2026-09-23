@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
     parser = argparse.ArgumentParser(description="Repeat Jev window/control selection and CUA actions within an iteration limit.")
     parser.add_argument("request", nargs="?", help="Original user request, preserved in every Jev call")
     parser.add_argument("--request-file", type=Path, help="Read the exact request from a UTF-8 file")
-    parser.add_argument("--text", help="Exact text to type if Windows Search is selected; preserved unchanged")
+    parser.add_argument("--text", help="Exact Windows Search text override; otherwise select words from the request")
     parser.add_argument("--env-file", type=Path, default=project_dir / ".env")
     parser.add_argument("--driver", help="Path to the installed cua-driver.exe")
     parser.add_argument("--max-elements", type=int, default=5000)

@@ -406,7 +406,7 @@ class RunReport:
                 iteration = record.get("iteration")
                 if type(iteration) is int and iteration > 0:
                     parts.append(f"loop_{iteration}")
-                stage = {"windows": "window", "controls": "control"}.get(record.get("stage"))
+                stage = {"windows": "window", "controls": "control", "text": "text"}.get(record.get("stage"))
                 round_number = record.get("round")
                 if stage is not None and type(round_number) is int and round_number > 0:
                     parts.append(f"{stage}_round_{round_number}")

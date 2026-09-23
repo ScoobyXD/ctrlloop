@@ -3,10 +3,13 @@
 The Python pipeline offers discovered desktop windows plus a synthetic
 **Windows Search** option. Jev chooses a window; a real window is inspected through
 Windows UI Automation, then its observed controls are offered for selection.
-For a real window, the pipeline executes the selected control's CUA click, waits
-for the app to settle, and starts the next selection from fresh observations.
+For a real window, Jev chooses the control and whether to click or enter text.
+The pipeline dispatches that native CUA action, waits for the app to settle,
+and starts the next selection from fresh observations.
 Choosing Windows Search instead sends desktop **Win+S**, then directly types the
-exact supplied `--text` string. This route has no intervening observation,
+query resolved before activation. An explicit `--text` supplies the exact Search
+query; otherwise Jev selects words from the original request in one batched call.
+The Win+S-to-typing handoff has no intervening observation,
 confirmation, sleep, control selection, or Jev call. The next iteration observes
 the real search results.
 It repeats within an explicit iteration limit; task completion is not assessed.
@@ -17,12 +20,13 @@ is brought to the foreground using CUA `bring_to_front({pid, window_id})` before
 taking the control snapshot, regardless of its minimized state.
 Activation failures stop the run; native results are retained in the report.
 
-Selection retains identities in Python. Click execution uses the control's
+Selection retains identities in Python. Click and targeted text execution use the control's
 existing snapshot-bound target and CUA's default background delivery. The loop
 uses the same generic question for every window and control selection round;
 every group selects a supplied candidate. It does not add automatic click escalation,
-coordinate fallback, additional waits, or action retries. Text entry is currently
-limited to the direct Windows Search route.
+coordinate fallback, additional waits, or action retries. Targeted text entry
+uses CUA's existing `type_text` operation. Its pinned Windows UIA path appends to
+the existing value; it does not implement replacement or caret insertion.
 
 The synthetic Windows Search opener is available when fresh discovery has no
 visible `SearchHost.exe` window titled `Search`. While that destination is open,
@@ -36,8 +40,8 @@ search; there is no permanent one-shot flag. Driver errors remain errors.
 The Windows Search window record has `synthetic: true` and no invented PID,
 window handle, control, geometry, or snapshot identity. It has no control
 candidates: selecting it executes the two native desktop commands directly.
-If it is selected without supplied text, the pipeline returns `no_action` before
-sending either command, with a reason identifying the missing `--text` input.
+Without an explicit Search query, word selection happens before either native
+command. An empty or noncontiguous selection returns `no_action` without typing.
 
 ## Defining synthetic windows and controls
 
@@ -105,22 +109,25 @@ From the repository root, with Python 3.11+ and `uv`:
 uv sync --locked
 # Set TYPESAFE_API_KEY in your process environment or local .env (not committed).
 uv run --locked python src/main.py 'Click the Test button in my test window.' --max-iterations 1
+uv run --locked python src/main.py 'Open Slack and search for budget review'
 uv run --locked python src/main.py 'Open Chrome using Windows Search.' --text 'Chrome'
 ```
 
 Pass `--text` (or `run_pipeline(..., text=...)`) to supply the exact Windows Search
 query. The string is preserved, including leading/trailing whitespace and line
-endings; explicitly empty or whitespace-only values are rejected. The pipeline
-does not extract or rewrite a query from the original request. Supplying text
-does not force Jev to select Windows Search.
+endings; explicitly empty or whitespace-only values are rejected. This override
+applies only to Windows Search and does not force Jev to select it. Other typing
+actions, and Search without the override, use words selected from the original
+request. No generative model rewrites or supplies missing text.
 
-Each iteration executes one selected control click or the Windows Search
+Each iteration executes one selected control click/text action or the Windows Search
 activation-and-typing sequence. The next iteration discovers
 windows and controls again and selects the next action using the original request
 and previous action context. `--max-iterations` is a positive integer, default 10.
 At the limit, the run returns `iteration_limit` without a further wait or observation.
-An unsupported or unavailable observation, unavailable synthetic action, missing
-search text, a native/API error, or user interruption can stop the run earlier.
+An unsupported or unavailable observation, unavailable synthetic action,
+unresolved text, a disabled text target, a native/API error, or user interruption
+can stop the run earlier.
 
 The dependencies remain pinned to `typesafe-sdk==0.7.1`,
 `python-dotenv==1.2.3`, and `httpx2==2.13.0`. The existing `pyproject.toml` pin is `jev-1.13.0`;
@@ -156,7 +163,7 @@ deadline, including any lazy startup/handshake. Reads reconnect and retry once f
 connection loss, timeout, or an unavailable daemon, with a new deadline; native
 tool refusals are not generally retried. A lost action response stops the run
 without replaying the action, because delivery may already have occurred. After
-a connection loss, only controls from a fresh snapshot may be clicked.
+a connection loss, only controls from a fresh snapshot may be acted on.
 
 For a multiline request, `--request-file request.txt` reads UTF-8 bytes without
 trimming or normalizing line endings. Use `--env-file <path>` to read an existing
@@ -171,10 +178,10 @@ The source modules live directly in `src/` and feed into `src/main.py`:
 
 - `driver.py` discovers and activates windows, reads accessibility state, and dispatches native clicks, hotkeys, and text entry.
 - `cua_mcp.py` owns the request's MCP connection, framing, timeouts and client cleanup.
-- [`jev_questions.py`](src/jev_questions.py) holds the two authored Jev question strings, `QUESTION` and `TIMER`; edit the wording here.
+- [`jev_questions.py`](src/jev_questions.py) holds the authored selection, action, timer, and word-inclusion questions; edit the wording here.
 - `selection.py` batches group questions into Jev calls capped at 400 control candidates, then advances the round's selected candidates together.
 - `synthetic.py` defines synthetic windows, their controls, and duplicate-matching rules.
-- `pipeline.py` repeats window selection and real control clicks or direct Windows Search actions within the iteration limit.
+- `pipeline.py` repeats window selection and real control click/text actions or direct Windows Search actions within the iteration limit.
 - `reporting.py` buffers events and actual Jev HTTP bodies, then saves the report and separate input/output files on a worker at the end.
 - `main.py` provides the CLI, loads configuration, and prints the result.
 
@@ -211,19 +218,23 @@ it is not automatically attributed to daemon access.
 | Status | Meaning | CLI exit |
 | --- | --- | --- |
 | `iteration_limit` | Configured action-cycle bound reached; task completion was not assessed | 2 |
-| `no_action` | Windows Search selected without text, or a custom synthetic control lacks live CUA identifiers | 2 |
+| `no_action` | Text selection empty/noncontiguous, text target disabled, or custom synthetic control lacks live CUA identifiers | 2 |
 | `no_windows` | No first-stage candidate selected; normally unreachable with the Windows Search option | 2 |
 | `no_controls` | A valid read returned no indexed controls, or a synthetic window defines no controls | 2 |
 | `observation_degraded` | A degraded read returned no indexed controls | 2 |
-| `observation_unavailable` | Structured controls or their snapshot identity were unavailable | 2 |
+| `observation_unavailable` | Structured controls/snapshot identity unavailable, repeated unobserved Search query, or targeted typing unconfirmed | 2 |
 | `error` | Driver, configuration, or Jev request/response failure | 1 |
 
 Nonempty degraded observations remain selectable and retain their quality flags.
 Selecting a control and receiving its action result do not establish its success.
 Inspect `action_result.effect`, `route`, and any `delivery`, `evidence`, or `escalation`.
-Effects such as `unverifiable` and `suspected_noop` remain action facts, followed
+For clicks, effects such as `unverifiable` and `suspected_noop` remain action facts, followed
 by fresh observation and next-action selection when another iteration remains;
 native refusals and failures return `error`/exit 1.
+A targeted text action continues only after CUA reports a confirmed effect.
+Otherwise the run stops with `observation_unavailable`, retaining the native facts
+without automatically typing the same text again. This does not assess task
+completion. Windows Search retains its desktop handoff and fresh-observation flow.
 A timeout or unreadable response leaves delivery unknown and is never retried.
 
 ## Debug in VS Code
@@ -279,6 +290,8 @@ serialization, or file writes are added to the action loop.
 Reports contain these milestones:
 
 - `run_started`: the original request and exact text when supplied.
+- `request_words_prepared`: ordered source words and their original character
+  offsets, prepared once before the first loop.
 - `windows_discovered`: the complete observed window list, in discovery order;
   it does not include the synthetic Windows Search option.
 - `jev_request`: the actual JSON body captured by the HTTP client's request hook
@@ -294,13 +307,15 @@ Reports contain these milestones:
   `jev_response_error` with HTTP status and the exception type.
 - `window_selected`, `window_observed`, and `control_selected`: selected identities,
   completed selection rounds, and observation quality. A singleton window needs
-  no selection question; a singleton control receives the selection question, with timing
+  no selection question; a singleton control receives the selection question, with action and timing
   when executable. Windows Search is marked `synthetic: true` in
   `window_selected`; it has no `control_selected` or `window_observed` event.
+- `text_selected`: destination, exact resolved substring or unresolved result,
+  and the word-selection trace. Every Noul probability is retained with its API call.
 - `action_requested` and `action_returned`: native activation and input arguments
   and returned action facts. Windows Search records `hotkey` and `type_text`
-  separately under the same iteration, including the exact supplied text. Missing
-  search text or an unavailable custom synthetic action records `action_skipped`
+  separately under the same iteration, including the exact resolved text. Unresolved
+  text or an unavailable custom synthetic action records `action_skipped`
   with its reason. A native action failure ends with `run_error`.
 - `loop_route`: `continue` when another selection cycle will follow, or the
   terminal status such as `iteration_limit` or `no_action`.
@@ -311,8 +326,8 @@ candidate preparation, selection rounds, foreground activation, UIA reads,
 action preparation/invocation, and settling waits.
 Selection rounds retain iteration tags so repeated round names remain distinct.
 For a timeline, a loop starts at current-state acquisition and ends when the
-final CUA command is sent: `click` for a real control or `type_text` for Windows
-Search. Native return and any settling follow that boundary. The `loop.iteration` span includes return and settling, so its
+final CUA command is sent: the selected control's `click`/`type_text`, or Windows
+Search's `type_text`. Native return and any settling follow that boundary. The `loop.iteration` span includes return and settling, so its
 duration differs from this dispatch-bounded loop duration.
 See [reading run timings](docs/timing.md)
 for event correlation, bottleneck inspection, and measurement limits. Group
@@ -366,24 +381,37 @@ contains at most ten candidates and receives one Jev Choice question using
 order. Regroup survivors in tens for the next round.
 
 Only a singleton window bypasses selection. A singleton control still receives
-the selection question, with its timer when executable. For 1,000 control candidates,
+the selection question, with action and timers when executable. For 1,000 control candidates,
 the round counts are `1000 -> 100 -> 10 -> 1`: three calls, then one, then one,
 for five control calls in total. Group size ten is fixed.
 
-The only authored questions are `QUESTION` and `TIMER` in
+Authored questions `QUESTION`, `ACTION`, `TIMER`, and `TEXT_WORD` live in
 [`src/jev_questions.py`](src/jev_questions.py). `QUESTION` is reused for all window
-and control narrowing rounds and final selections. `TIMER` is included once per
-finalist alongside selection in the final control call, with structured
-candidate/action/app context. The connection check reuses these same questions.
+and control narrowing rounds and final selections. The final control call also
+includes an `ACTION` click-versus-`type_text` Choice
+for every finalist and a separate hypothetical `TIMER` for each action per
+finalist. Consume only the winning control's action and matching timer.
+
+The original request is split once into whitespace-delimited words with original
+character offsets. When text is needed, one further API call asks one Noul per
+word, including all words together and using the selected destination as context.
+Words whose inclusion probability exceeds 0.5 are included. The chosen positions
+must form one nonempty continuous phrase; code copies its exact original substring,
+preserving punctuation and internal whitespace. Empty or scattered selections
+stop the action. A name is not converted into a URL, and text absent from the
+request cannot be generated. All Noul answers and probabilities remain in the
+existing selection/reporting traces.
 
 Every loop request carries the unchanged `original_request`, current `iteration`,
 fresh `current_window` identity and `last_control`. The window is null before
-selection or when missing; the last control is null until control selection.
-Before clicking, set `last_control` to `{window, control}` with its source
-window and descriptive control fields. After CUA returns, `last_action` retains
+selection or when missing; the last control is null until control action dispatch.
+Before dispatch, set `last_control` to `{window, control, action}` with its source
+window, descriptive control fields, and chosen tool. After CUA returns, `last_action` retains
 the tool and filtered native result facts for the next selection. The Windows
 Search route has no selected control; its final `last_action` records `type_text`,
 the exact text, and native result facts.
+Text resolution still sees the previous action/control history; the pending
+control replaces `last_control` only immediately before its native dispatch.
 
 One mutable state dictionary is reused throughout the run. Every iteration
 selects and acts from fresh observations, and all its calls share its iteration
@@ -414,10 +442,11 @@ The 64 group winners combine for round 2; the rounds are `631 -> 64 -> 7 -> 1`,
 using two calls, then one, then one: four control calls in total. No candidate
 is dropped to meet the cap.
 
-Only the last of those control calls adds one `TIMER` per finalist. The
+Only the last of those control calls adds the action Choice and two hypothetical
+`TIMER` questions per finalist. The
 exact choices are `<50ms`, `100ms`, `200ms`, `300ms`, `400ms`, and `>500ms`, mapped
 in code to 50, 100, 200, 300, 400, and 500 ms. All timers share the final
-selection API call; only the winning candidate's interval is consumed. After CUA
+selection API call; only the winning candidate/action's interval is consumed. After CUA
 returns, the loop waits that interval before the next iteration's fresh window
 and control observations. The final permitted action has no following wait.
 Windows Search skips control selection and timers entirely and starts the next
@@ -433,8 +462,9 @@ round's `api_calls` list. See
 [main workflow](docs/main-workflow.md) for the workflow and timing contract.
 
 Returned model identity, question keys, answer type, option labels, probability
-shape, and usage are validated. Confidence and probabilities never rank winners
-across groups or gate advancement. There are no scores, thresholds, or beams.
+shape, and usage are validated. Choice confidence and probabilities never rank
+winners across groups or gate advancement. The word-inclusion Nouls use their
+probabilities for inclusion decisions; they do not alter control elimination.
 
 ## Observation limits
 
@@ -442,15 +472,17 @@ Observation calls use `list_windows({})` and `get_window_state` with
 the selected record's exact `pid`/`window_id`, accessibility enabled and screenshots
 disabled. The adapter validates the MCP result envelope and native structured
 payload, preserving tool errors before accepting an observation.
-For a real control, the selected action is `click` using the selected
+For a real control, the selected action is `click` or `type_text`, using the selected
 window's `pid`/`window_id` and the original `element_token`, or the matching
-`element_index`/`snapshot_id` pair when no token is present. The loop then waits
-and observes again for the next selection when another iteration remains.
+`element_index`/`snapshot_id` pair when no token is present. After a click or
+confirmed targeted text entry, the loop waits and observes again for the next
+selection when another iteration remains. Text entry preserves native readback
+facts and does not add a separate Jev verification call.
 
 Each real control selection comes from one fresh snapshot. The synthetic Windows
 Search branch takes no control snapshot; its synthetic destination metadata does
 not represent observed controls. It sends `hotkey({scope: "desktop", keys:
-["win", "s"]})`, then `type_text({scope: "desktop", text: <exact supplied text>})`
+["win", "s"]})`, then `type_text({scope: "desktop", text: <resolved text>})`
 through the same persistent CUA connection, without checking or confirming focus
 between the two commands.
 `element_index` is not an array offset;

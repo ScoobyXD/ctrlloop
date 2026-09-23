@@ -308,16 +308,25 @@ class CuaDriver:
         The daemon rejects superseded tokens, including changes made by other
         clients. A timeout or unreadable response leaves delivery unknown.
         """
-        allowed = {"pid", "window_id", "element_token", "element_index", "snapshot_id"}
+        self._validate_element_input("click", arguments, set())
+        return self._input_action("click", arguments)
+
+    def _validate_element_input(
+        self, tool: str, arguments: Mapping[str, Any], fields: set[str],
+    ) -> None:
+        """Validate the same native snapshot target for every element action."""
+        allowed = {"pid", "window_id", "element_token", "element_index", "snapshot_id"} | fields
+        label = "Click" if tool == "click" else tool
+        code = f"invalid_{tool}_target"
         if not isinstance(arguments, Mapping) or set(arguments) - allowed:
-            raise DriverError("Click requires native window and snapshot-bound element arguments.",
-                              code="invalid_click_target", tool="click")
+            raise DriverError(f"{label} requires native window and snapshot-bound element arguments.",
+                              code=code, tool=tool)
         if (
             not _integer(arguments.get("pid"), 1, 2**32 - 1)
             or not _integer(arguments.get("window_id"), 1, 2**64 - 1)
         ):
-            raise DriverError("Click requires a usable observed pid/window_id pair.",
-                              code="invalid_click_target", tool="click")
+            raise DriverError(f"{label} requires a usable observed pid/window_id pair.",
+                              code=code, tool=tool)
         if "element_token" in arguments:
             valid = (
                 isinstance(arguments["element_token"], str) and bool(arguments["element_token"].strip())
@@ -330,8 +339,8 @@ class CuaDriver:
                 and bool(arguments["snapshot_id"].strip())
             )
         if not valid:
-            raise DriverError("Click requires an observed element_token or element_index with snapshot_id.",
-                              code="invalid_click_target", tool="click")
+            raise DriverError(f"{label} requires an observed element_token or element_index with snapshot_id.",
+                              code=code, tool=tool)
         if self._recovery_required:
             snapshot = self._recovery_snapshot
             fresh = bool(snapshot) and all(
@@ -349,9 +358,8 @@ class CuaDriver:
             if not fresh:
                 raise DriverError(
                     "Refresh the window state and reselect a control after a CUA connection loss.",
-                    code="stale_element_token", tool="click",
+                    code="stale_element_token", tool=tool,
                 )
-        return self._input_action("click", arguments)
 
     def hotkey(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         """Send one native desktop hotkey without reads, waits, or retries."""
@@ -366,12 +374,23 @@ class CuaDriver:
         return self._input_action("hotkey", arguments)
 
     def type_text(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        """Type the exact supplied string into the current desktop focus once.
+        """Enter exact text at an observed control, or type at desktop focus.
 
-        Focus and readiness are the caller's responsibility. This method does
-        not acquire state, select a field, normalize text, or send special keys.
+        Native element targets share click's snapshot and recovery checks.
+        The native UIA route appends; input-event routes use the focused caret.
+        Desktop focus and readiness remain the caller's responsibility. This
+        method does not clear, acquire state, normalize text, or retry input.
         """
-        self._validate_desktop_input("type_text", arguments, {"text", "delay_ms"})
+        if isinstance(arguments, Mapping) and arguments.get("scope") == "desktop":
+            self._validate_desktop_input("type_text", arguments, {"text", "delay_ms"})
+        else:
+            self._validate_element_input("type_text", arguments, {"text", "delay_ms", "delivery_mode"})
+            if "delivery_mode" in arguments and (
+                not isinstance(arguments["delivery_mode"], str)
+                or arguments["delivery_mode"] not in {"background", "foreground"}
+            ):
+                raise DriverError("type_text delivery_mode must be background or foreground.",
+                                  code="invalid_type_text_arguments", tool="type_text")
         if not isinstance(arguments.get("text"), str) or (
             "delay_ms" in arguments and not _integer(arguments["delay_ms"], 0, 200)
         ):
@@ -383,8 +402,7 @@ class CuaDriver:
     def _validate_desktop_input(
         tool: str, arguments: Mapping[str, Any], fields: set[str],
     ) -> None:
-        # Expose the native desktop form explicitly. Window/element input can
-        # be added through these same native methods when the pipeline uses it.
+        # Desktop input deliberately has no window or element target.
         if (
             not isinstance(arguments, Mapping)
             or set(arguments) - {"scope", "session"} - fields

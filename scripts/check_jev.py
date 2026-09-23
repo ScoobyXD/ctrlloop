@@ -1,4 +1,4 @@
-"""Check TypeSafe access with the production selection and timer questions."""
+"""Check TypeSafe access with production selection, action, and timer questions."""
 
 import os
 from pathlib import Path
@@ -33,7 +33,7 @@ def main() -> int:
         )
         return 1
 
-    # One fictional control yields exactly one selection and one timer question.
+    # One fictional control yields a selection, an action, and two hypothetical timers.
     # No desktop observation or action is performed by this connection check.
     window = {"app_name": "connection_check", "title": "Connection check fixture"}
     state = {
