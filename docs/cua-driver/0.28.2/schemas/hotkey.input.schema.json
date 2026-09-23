@@ -1,0 +1,120 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "delivery_mode": {
+      "description": "Input delivery mode. 'background' (default) never swaps foreground: it routes through UIA Invoke / PostMessage and the window is never raised. For targets whose input stack silently drops posted events (Chromium/Electron content, GTK buttons, VCL/LibreOffice accelerators) the tool returns a structured background_unavailable error rather than fronting. 'foreground' is the explicit escalation: a brief SetForegroundWindow swap + SendInput, restoring the prior foreground afterward. IMPORTANT: 'background' is not a hint to weigh — it is the mandatory first attempt. Do NOT pass 'foreground' preemptively because a target 'looks like' GTK/Chromium/Electron; the DRIVER decides when background is impossible and tells you so via a background_unavailable error (or a verified no-op). Only THEN re-issue the same action with 'foreground'. The lists above are the driver's detectors, not a checklist for you to front on a guess — fronting up-front needlessly steals the user's focus and is a bug, not a shortcut. Matches the macOS delivery_mode surface.",
+      "enum": [
+        "background",
+        "foreground"
+      ],
+      "type": "string"
+    },
+    "element_index": {
+      "description": "Element index from get_window_state. Requires the matching `snapshot_id` alongside it. Prefer `element_token`, which carries both values.",
+      "type": "integer"
+    },
+    "element_token": {
+      "description": "Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. If element_index, snapshot_id, or window_id are also supplied they must agree. Returns an explicit stale error once a newer snapshot supersedes it.",
+      "type": "string"
+    },
+    "keys": {
+      "description": "Modifier(s) and one non-modifier key, e.g. [\"ctrl\", \"c\"].",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 2,
+      "type": "array"
+    },
+    "pid": {
+      "description": "Target process ID.",
+      "type": "integer"
+    },
+    "scope": {
+      "description": "Use desktop with no pid/window_id to send the hotkey to the current foreground application.",
+      "enum": [
+        "window",
+        "desktop"
+      ],
+      "type": "string"
+    },
+    "session": {
+      "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+      "type": "string"
+    },
+    "snapshot_id": {
+      "description": "Snapshot handle from get_window_state. Required when targeting by element_index; stale snapshots fail closed.",
+      "pattern": "^s[0-9a-f]{8}$",
+      "type": "string"
+    },
+    "target": {
+      "anyOf": [
+        {
+          "description": "Exact capture/input target selected independently for each action.\n\n`display_id=\"primary\"` is the portable desktop target in this release.\nPlatforms that cannot address another display reject it explicitly rather\nthan silently changing coordinate spaces.",
+          "oneOf": [
+            {
+              "additionalProperties": true,
+              "properties": {
+                "kind": {
+                  "const": "window",
+                  "type": "string"
+                },
+                "pid": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "window_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kind",
+                "pid",
+                "window_id"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": true,
+              "properties": {
+                "display_id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "desktop",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "display_id"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "window_id": {
+      "description": "Explicit HWND when the pid owns multiple windows.",
+      "type": "integer"
+    },
+    "x": {
+      "description": "Window-local screenshot-pixel X — the element px action form: pixel-click there to focus, then send the combo (so e.g. Ctrl+V pastes into that field). Pass with y. Use for Chromium/Electron surfaces the background combo can't reach.",
+      "type": "number"
+    },
+    "y": {
+      "description": "Window-local screenshot-pixel Y (see x).",
+      "type": "number"
+    }
+  },
+  "required": [
+    "keys"
+  ],
+  "type": "object"
+}

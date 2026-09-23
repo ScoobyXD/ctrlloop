@@ -21,13 +21,13 @@ from typesafe_sdk import RetryPolicy, TypeSafeClient, TypeSafeError
 
 if __package__:
     from .driver import CuaDriver, DriverError
-    from .pipeline import run_pipeline
+    from .pipeline import DEFAULT_MAX_ITERATIONS, run_pipeline
     from .reporting import RunReport
     from .selection import ChoiceSelector, PINNED_MODEL, SelectionError
 else:
     # Direct script execution puts src on the import path.
     from driver import CuaDriver, DriverError
-    from pipeline import run_pipeline
+    from pipeline import DEFAULT_MAX_ITERATIONS, run_pipeline
     from reporting import RunReport
     from selection import ChoiceSelector, PINNED_MODEL, SelectionError
 
@@ -40,16 +40,23 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
     origin_wall_ns = _MODULE_WALL_NS if _include_imports else time_ns()
     origin_label = "main_module_after_time_import" if _include_imports else "main_call"
     project_dir = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description="Select and execute one CUA action, then verify its result with Jev.")
+    parser = argparse.ArgumentParser(description="Repeat Jev window/control selection and CUA actions within an iteration limit.")
     parser.add_argument("request", nargs="?", help="Original user request, preserved in every Jev call")
     parser.add_argument("--request-file", type=Path, help="Read the exact request from a UTF-8 file")
+    parser.add_argument("--text", help="Exact text to type if Windows Search is selected; preserved unchanged")
     parser.add_argument("--env-file", type=Path, default=project_dir / ".env")
     parser.add_argument("--driver", help="Path to the installed cua-driver.exe")
     parser.add_argument("--max-elements", type=int, default=5000)
     parser.add_argument("--max-depth", type=int, default=25)
+    parser.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
+                        help="Maximum observation/action cycles (default: %(default)s); not a task-completion check")
     args = parser.parse_args(argv)
     if (args.request is None) == (args.request_file is None):
         parser.error("provide exactly one request argument or --request-file")
+    if args.max_iterations < 1:
+        parser.error("--max-iterations must be a positive integer")
+    if args.text is not None and not args.text.strip():
+        parser.error("--text must contain non-whitespace text")
     # Keep JSON output usable for non-ASCII UI labels on Windows consoles/pipes.
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -78,12 +85,13 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
         report.record_interval("startup.cli", entered_ns, report_initialization_ns)
         report.record_interval("startup.report_initialization", report_initialization_ns, report_ready_ns)
         print(f"Run report: {report.path}", file=sys.stderr)
+        print(f"Jev input/output JSON: {report.requests_path}", file=sys.stderr)
         with report.span("initialization.request_read"):
             original_request = (
                 args.request_file.read_bytes().decode("utf-8")
                 if args.request_file is not None else args.request
             )
-        report.append("run_started", request=original_request)
+        report.append("run_started", request=original_request, **({"text": args.text} if args.text is not None else {}))
         with report.span("initialization.configuration"):
             if not original_request.strip():
                 raise ValueError("The original request must be nonempty.")
@@ -116,7 +124,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
                     with report.span("pipeline"):
                         result = run_pipeline(
                             original_request, driver, selector,
-                            report=report,
+                            report=report, max_iterations=args.max_iterations, text=args.text,
                         )
                     cleanup_started_ns = perf_counter_ns()
             report.record_interval("client_cleanup", cleanup_started_ns, perf_counter_ns())
@@ -129,7 +137,8 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
         output_finished_ns = perf_counter_ns()
         report.record_interval("result_preparation", output_started_ns, output_finished_ns)
         report.append("run_finished", result=output)
-        exit_code = 0 if result.status == "action_verified" else 2
+        # No question in this workflow establishes that the user's task is done.
+        exit_code = 2
     except (DriverError, SelectionError, ValueError, OSError, TypeSafeError, KeyError) as error:
         # Raw SDK/OS messages may contain file content, request bodies, or credentials.
         if isinstance(error, (DriverError, SelectionError)) or type(error) is ValueError:
@@ -152,11 +161,11 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
                 timing = report.close()
                 if output is not None:
                     output["timing"] = timing
-            except (OSError, ValueError) as error:
+            except (OSError, ValueError, RuntimeError) as error:
                 if output is not None and output.get("action_result") is not None:
-                    print("Could not save the completed run report; returning the native action result.", file=sys.stderr)
+                    print("Could not save all run-report files; returning the native action result.", file=sys.stderr)
                 else:
-                    print("Could not write the final run report.", file=sys.stderr)
+                    print("Could not write all final run-report files.", file=sys.stderr)
                     if output is not None and output["status"] != "error":
                         output = {
                             "status": "error",

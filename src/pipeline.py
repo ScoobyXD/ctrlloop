@@ -3,7 +3,6 @@
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
-from itertools import count
 from time import sleep as system_sleep
 from typing import Any, Protocol
 
@@ -11,12 +10,15 @@ if __package__:
     from .driver import DriverError
     from .reporting import RunReport
     from .selection import Candidate, ChoiceSelector
-    from .synthetic import DEFAULT_REGISTRY, SyntheticRegistry
+    from .synthetic import DEFAULT_REGISTRY, WINDOWS_SEARCH_KEY, SyntheticRegistry
 else:
     from driver import DriverError
     from reporting import RunReport
     from selection import Candidate, ChoiceSelector
-    from synthetic import DEFAULT_REGISTRY, SyntheticRegistry
+    from synthetic import DEFAULT_REGISTRY, WINDOWS_SEARCH_KEY, SyntheticRegistry
+
+
+DEFAULT_MAX_ITERATIONS = 10
 
 
 class Driver(Protocol):
@@ -26,6 +28,8 @@ class Driver(Protocol):
 
     def click(self, arguments: Mapping[str, Any]) -> dict[str, Any]: ...
     def bring_to_front(self, arguments: Mapping[str, Any]) -> dict[str, Any]: ...
+    def hotkey(self, arguments: Mapping[str, Any]) -> dict[str, Any]: ...
+    def type_text(self, arguments: Mapping[str, Any]) -> dict[str, Any]: ...
 
 
 @dataclass
@@ -142,25 +146,59 @@ def _choose_window(state, windows, selector, result, report, synthetic, iteratio
     return window_selection.winner
 
 
-def _activate_window(result, driver, report):
-    with (
-        report.span("foreground_preparation", tool="bring_to_front")
-        if report is not None else nullcontext({})
-    ):
-        arguments = {name: result.window.get(name) for name in ("pid", "window_id")}
-        if report is not None:
-            report.append("action_requested", tool="bring_to_front", arguments=arguments)
+def _is_windows_search(window):
+    return bool(window and window.get("synthetic") and window.get("target") == WINDOWS_SEARCH_KEY)
+
+
+def _invoke_action(result, driver, report, tool, arguments, operation="native_action"):
+    """Dispatch once and retain native action facts through the shared report."""
+    if report is not None:
+        report.append("action_requested", tool=tool, arguments=arguments)
     try:
         with (
-            report.span("foreground_activation", tool="bring_to_front", completion_scope="call_return")
+            report.span(operation, tool=tool, completion_scope="call_return")
             if report is not None else nullcontext({})
         ):
-            foreground_result = driver.bring_to_front(arguments)
+            action_result = getattr(driver, tool)(arguments)
     except DriverError as error:
-        error.context.update({"stage": "bring_to_front", "selection": result.to_dict()})
+        error.context.update(stage=tool, selection=result.to_dict())
         raise
     if report is not None:
-        report.append("action_returned", tool="bring_to_front", action_result=foreground_result)
+        report.append("action_returned", tool=tool, action_result=action_result)
+    return action_result
+
+
+def _activate_window(result, driver, report):
+    tool = "hotkey" if _is_windows_search(result.window) else "bring_to_front"
+    with (
+        report.span("foreground_preparation", tool=tool)
+        if report is not None else nullcontext({})
+    ):
+        arguments = (
+            {"scope": "desktop", "keys": ["win", "s"]}
+            if tool == "hotkey" else
+            {name: result.window.get(name) for name in ("pid", "window_id")}
+        )
+    return _invoke_action(result, driver, report, tool, arguments, "foreground_activation")
+
+
+def _search_windows(state, result, driver, report, text):
+    """Activate Search, then immediately type; no control selection or reads."""
+    state["last_control"] = None
+    result.last_control = None
+    if text is None:
+        result.status = "no_action"
+        result.reason = "Windows Search requires exact text; supply --text or run_pipeline(text=...)."
+        if report is not None:
+            report.append("action_skipped", reason=result.reason)
+        return
+    result.status = "selected"
+    # Prepare the text payload before activation so the next native call is typing.
+    arguments = {"scope": "desktop", "text": text}
+    with report.span("action_dispatch", tool="type_text") if report is not None else nullcontext({}):
+        _activate_window(result, driver, report)
+        result.action_result = _invoke_action(result, driver, report, "type_text", arguments)
+    result.status = "action_returned"
 
 
 def _observe_window(state, result, driver, report):
@@ -215,7 +253,7 @@ def _observe_window(state, result, driver, report):
     return snapshot
 
 
-def _observed_controls(result, snapshot, report, *, stage="controls"):
+def _observed_controls(result, snapshot, report):
     elements = snapshot.get("elements")
     if elements is None:
         result.status = "observation_unavailable"
@@ -229,7 +267,7 @@ def _observed_controls(result, snapshot, report, *, stage="controls"):
         result.status = "observation_unavailable"
         result.reason = "The control observation has no snapshot identity."
         return None
-    with report.span("candidate_preparation", stage=stage) if report is not None else nullcontext({}):
+    with report.span("candidate_preparation", stage="controls") if report is not None else nullcontext({}):
         controls = control_candidates(elements)
     return controls
 
@@ -237,11 +275,20 @@ def _observed_controls(result, snapshot, report, *, stage="controls"):
 def _prepare_window(state, windows, driver, selector, result, report, synthetic, iteration=None):
     result.status = "no_windows"
     result.reason = None
+    result.window = None
     result.control = None
     result.snapshot_id = None
+    result.observation = {}
+    result.action_result = None
     winner = _choose_window(state, windows, selector, result, report, synthetic, iteration)
     if winner is None:
         return None, {}
+    if _is_windows_search(result.window):
+        result.observation = {
+            "source": "synthetic",
+            "coverage": "application-defined destination; no live control snapshot was taken",
+        }
+        return [], {}
     with report.span("synthetic_resolution", stage="controls") if report else nullcontext({}):
         controls = synthetic.controls_for(winner.key)
     if controls is not None:
@@ -265,11 +312,8 @@ def _select_and_act(state, controls, driver, selector, result, report,
         )
     _retain_rounds(result, "controls", control_selection.rounds, iteration)
     if control_selection.winner is None:
-        result.status = "no_control_selected" if controls else "no_controls"
-        result.reason = (
-            "Jev found no suitable control for the requested action."
-            if controls else "The selected synthetic window defines no controls."
-        )
+        result.status = "no_controls"
+        result.reason = "Control selection returned no candidate."
         return None
     # Include selection reporting and argument handoff in dispatch latency;
     # only native_action measures the click invocation through its return.
@@ -278,10 +322,11 @@ def _select_and_act(state, controls, driver, selector, result, report,
         if report is not None and execute_click else nullcontext({})
     ):
         result.control = control_selection.winner.record
+        # A new target must not inherit the previous target's native result.
+        result.action_result = None
         state["last_control"] = {
             "window": state["current_window"],
             "control": _control_context(control_selection.winner.description),
-            "status": "(unverified)",
         }
         result.last_control = state["last_control"]
         if report is not None:
@@ -291,7 +336,7 @@ def _select_and_act(state, controls, driver, selector, result, report,
             with report.span("action_preparation", tool="click") if report is not None else nullcontext({}):
                 if result.window.get("synthetic") or result.control.get("synthetic"):
                     result.status = "no_action"
-                    result.reason = "Synthetic targets have no live CUA click target; Start Menu search and typing are unsupported."
+                    result.reason = "Synthetic controls have no live CUA click target."
                     if report is not None:
                         report.append("action_skipped", reason=result.reason)
                     return None
@@ -301,20 +346,8 @@ def _select_and_act(state, controls, driver, selector, result, report,
                     arguments["element_token"] = token
                 else:
                     arguments.update(element_index=result.control.get("element_index"), snapshot_id=result.snapshot_id)
-                if report is not None:
-                    report.append("action_requested", tool="click", arguments=arguments)
-            try:
-                with (
-                    report.span("native_action", tool="click", completion_scope="call_return")
-                    if report is not None else nullcontext({})
-                ):
-                    result.action_result = driver.click(arguments)
-            except DriverError as error:
-                error.context.update(stage="click", selection=result.to_dict())
-                raise
+            result.action_result = _invoke_action(result, driver, report, "click", arguments)
             result.status = "action_returned"
-            if report is not None:
-                report.append("action_returned", tool="click", action_result=result.action_result)
     return control_selection.settling_ms
 
 
@@ -342,32 +375,6 @@ def _control_context(description):
     return {name: value for name, value in description.items() if name not in {"frame", "actions"}}
 
 
-def _verify_action(state, controls, selector, result, report, iteration):
-    with report.span("action_verification", stage="evidence") if report else nullcontext({}):
-        evidence = selector.select(
-            state, controls, stage="evidence",
-            **({"report": report} if report is not None else {}),
-        )
-    _retain_rounds(result, "evidence", evidence.rounds, iteration)
-    if evidence.winner is None:
-        result.status = "no_evidence"
-        result.reason = "No suitable observed evidence supports the attempted action."
-    elif evidence.verification is not True:
-        result.status = "action_unverified"
-        result.reason = "Jev did not confirm that the action achieved its intended result."
-    else:
-        state["last_control"]["status"] = "(verified)"
-        result.status = "action_verified"
-        result.reason = None
-    if report:
-        report.append(
-            "action_verification", iteration=iteration,
-            verified=result.status == "action_verified", last_control=result.last_control,
-            evidence=evidence.winner.description if evidence.winner is not None else None,
-            reason=result.reason,
-        )
-
-
 def _settle(milliseconds, sleep, report):
     with report.span(
         "settling_wait", requested_ms=milliseconds, kind="after_action",
@@ -376,7 +383,7 @@ def _settle(milliseconds, sleep, report):
         sleep(milliseconds / 1000)
 
 
-def _route(result, trace, route, report):
+def _route(trace, route, report):
     trace["route"] = route
     if report:
         report.append("loop_route", iteration=trace["iteration"], route=route)
@@ -387,73 +394,76 @@ def run_pipeline(
     *, report: RunReport | None = None,
     synthetic: SyntheticRegistry = DEFAULT_REGISTRY,
     sleep: Callable[[float], None] = system_sleep,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    text: str | None = None,
 ) -> PipelineResult:
-    """Select and execute one action, then judge fresh evidence of its success.
+    """Repeat fresh selection and native actions within an explicit limit.
 
-    This version stops after verification; task-completion and new-window routing
-    are deferred. Native delivery errors propagate without retrying an action.
+    Each call retains the original goal and the most recent decision/action.
+    Windows Search uses Win+S followed immediately by the exact supplied text.
+    The iteration limit bounds execution; it does not establish task completion.
+    Native delivery errors propagate without replaying the attempted action.
     """
+    if type(max_iterations) is not int or max_iterations < 1:
+        raise ValueError("max_iterations must be a positive integer.")
+    if text is not None and (not isinstance(text, str) or not text.strip()):
+        raise ValueError("text must be a string containing non-whitespace text.")
     result = PipelineResult(status="no_windows")
     state = _jev_state(original_request, 0, None, None)
-    for iteration in count(1):
+    for iteration in range(1, max_iterations + 1):
         state["iteration"] = iteration
+        # Observation coverage belongs to the next fresh control snapshot.
+        state.pop("observation", None)
         trace = {"iteration": iteration}
         result.iterations.append(trace)
         with report.span("loop.iteration", iteration=iteration) if report else nullcontext({}):
             windows = _discover_windows(driver, report)
-            if iteration == 1:
-                controls, snapshot = _prepare_window(
-                    state,
-                    windows, driver, selector, result, report, synthetic, iteration,
-                )
-                _route(result, trace, "first_pass", report)
-                if controls is None:
-                    return result
-                settling_ms = _select_and_act(
-                    state, controls, driver, selector, result, report, True,
-                    settling_context=None if result.window.get("synthetic") else state["current_window"],
-                    iteration=iteration,
-                )
-                if result.status != "action_returned":
-                    return result
-                state["last_action"] = {
-                    "tool": "click",
-                    "result": {name: result.action_result[name] for name in ("effect", "route", "delivery")
-                               if name in result.action_result},
-                    "requested_wait_ms_so_far": settling_ms,
-                }
-                trace["settling_ms"] = settling_ms
-                # CUA has returned. Only now begin the app settling timer.
-                _settle(settling_ms, sleep, report)
-                continue
-
-            # Discovery refreshes metadata without selecting a different window.
-            # Never read an absent old handle or replay its executable target.
-            current_window = next((
-                window for window in windows
-                if all(window.get(name) == result.window.get(name) for name in ("pid", "window_id"))
-            ), None)
-            if current_window is None:
-                state["current_window"] = None
-                result.control = None
-                result.snapshot_id = None
-                result.observation = {"window_missing": True, "coverage": "current window no longer observed"}
-                controls = []
-            else:
-                result.window = current_window
-                snapshot = _observe_window(state, result, driver, report)
-                controls = _observed_controls(result, snapshot, report, stage="evidence")
-                if controls is None and result.status not in {"no_controls", "observation_degraded"}:
-                    _route(result, trace, "observation_unavailable", report)
-                    return result
+            if result.window is not None:
+                current_window = next((
+                    window for window in windows
+                    if all(window.get(name) == result.window.get(name) for name in ("pid", "window_id"))
+                ), None)
+                state["current_window"] = _app_context(current_window, {}) if current_window else None
+            # Select again from fresh windows; the next step may be in another app.
+            controls, _ = _prepare_window(
+                state, windows, driver, selector, result, report, synthetic, iteration,
+            )
+            if controls is None:
+                _route(trace, result.status, report)
+                return result
             state["observation"] = {
                 name: value for name, value in result.observation.items()
                 if name not in {"element_count", "total_element_count", "returned_element_count",
                                 "filtered_element_count", "observed_control_count"}
             }
-            _verify_action(state, controls or [], selector, result, report, iteration)
-            _route(result, trace, {
-                "action_verified": "verified", "no_evidence": "no_evidence",
-                "action_unverified": "unverified",
-            }[result.status], report)
-            return result
+            if _is_windows_search(result.window):
+                _search_windows(state, result, driver, report, text)
+                tool = "type_text"
+                settling_ms = None
+            else:
+                settling_ms = _select_and_act(
+                    state, controls, driver, selector, result, report, True,
+                    settling_context=None if result.window.get("synthetic") else state["current_window"],
+                    iteration=iteration,
+                )
+                tool = "click"
+            if result.status != "action_returned":
+                _route(trace, result.status, report)
+                return result
+            state["last_action"] = {
+                "tool": tool,
+                **({"text": text} if tool == "type_text" else {}),
+                "result": {name: result.action_result[name] for name in ("effect", "route", "delivery")
+                           if name in result.action_result},
+            }
+            trace["last_action"] = state["last_action"]
+            trace["settling_ms"] = settling_ms
+            if iteration == max_iterations:
+                result.status = "iteration_limit"
+                result.reason = "The configured iteration limit was reached; task completion was not assessed."
+                _route(trace, result.status, report)
+                return result
+            # CUA has returned. Wait only when another observation will follow.
+            if settling_ms is not None:
+                _settle(settling_ms, sleep, report)
+            _route(trace, "continue", report)

@@ -1,5 +1,6 @@
-"""Buffer run observations and HTTP timings; write one report at completion."""
+"""Buffer observations and HTTP bytes; save reports on a worker at completion."""
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -36,8 +37,21 @@ def _body_fields(content: bytes) -> dict[str, Any]:
         return {"body_text": content.decode("utf-8", errors="replace")}
 
 
+def _format_payload_json(body: Any) -> str:
+    """Indent inputs and outputs, with space between top-level sections."""
+    if isinstance(body, dict):
+        ordered = {key: body[key] for key in ("state", "questions") if key in body}
+        ordered.update(body)
+        body = ordered
+    lines = json.dumps(body, ensure_ascii=False, allow_nan=False, indent=2).splitlines()
+    return "\n".join(
+        "\n" + line if index > 1 and line.startswith('  "') else line
+        for index, line in enumerate(lines)
+    ) + "\n"
+
+
 class RunReport:
-    """Collect observations in memory and serialize them once on close.
+    """Collect observations in memory and serialize them on a worker at close.
 
     Reports intentionally include request and observed UI content. HTTP headers,
     URL credentials/query strings, and exception messages are never recorded by
@@ -57,13 +71,19 @@ class RunReport:
         self._first_request_ns: int | None = None
         self._write_ns = 0
         self._write_count = 0
+        self._request_write_ns = 0
+        self._request_file_count = 0
+        self._response_write_ns = 0
+        self._response_file_count = 0
         self._finished_ns: int | None = None
         self._completion_timing: dict[str, Any] = {}
         directory = directory.resolve()
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        self.path = directory / f"run-{stamp}-{uuid4().hex}.json"
+        self.requests_path = directory / f"run-{stamp}-{uuid4().hex}"
+        self.path = self.requests_path / "total_run.json"
         self._events: list[dict[str, Any]] = []
         self._closed = False
+        self._close_error: BaseException | None = None
         self._request_count = 0
 
     def _write(self, text: str) -> None:
@@ -74,22 +94,23 @@ class RunReport:
             self._write_ns += perf_counter_ns() - started_ns
             self._write_count += 1
 
-    def _write_document(self, text: str) -> None:
-        temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
+    def _write_document(self, content: str | bytes, *, path: Path | None = None) -> None:
+        destination = self.path if path is None else path
+        temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
         # Unlike tempfile.mkstemp on Windows, permission failures fail promptly.
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             try:
-                output = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+                output = os.fdopen(descriptor, "wb")
             except BaseException:
                 os.close(descriptor)
                 raise
             with output:
-                output.write(text)
+                output.write(content.encode("utf-8") if isinstance(content, str) else content)
                 output.flush()
                 os.fsync(output.fileno())
             # Close before replacing so Windows can swap the complete document.
-            os.replace(temporary, self.path)
+            os.replace(temporary, destination)
         finally:
             try:
                 temporary.unlink(missing_ok=True)
@@ -281,47 +302,23 @@ class RunReport:
             )
 
     def close(self) -> dict[str, Any]:
-        """Serialize/write once; return timings only knowable after that write."""
+        """Finalize on one worker and wait once, after the action loop has ended."""
         if self._closed:
+            if self._close_error is not None:
+                raise self._close_error
             return self._completion_timing.copy()
         self._closed = True
         started_ns = perf_counter_ns()
         if self._finished_ns is None:
             self._finished_ns = started_ns
         try:
-            responses = {
-                (event.get("iteration"), event["round_id"]): event for event in self._events
-                if event["event"] == "jev_response" and "round_id" in event
-            }
-            advancements = {
-                (event.get("iteration"), event["round_id"]): event for event in self._events
-                if event["event"] == "timing_finished" and event["operation"] == "selection.advancement"
-                and "round_id" in event
-            }
-            events = []
-            for saved in self._events:
-                record = {"timestamp": self._timestamp(saved["_at_ns"])}
-                record.update({key: value for key, value in saved.items() if key != "_at_ns"})
-                if record["event"] == "timing_finished":
-                    for field in ("started", "finished"):
-                        at_ns = self._origin_ns + round(record[f"{field}_elapsed_ms"] * 1_000_000)
-                        record[f"{field}_at"] = self._timestamp(at_ns)
-                    if record["operation"] == "selection.round":
-                        round_key = (record.get("iteration"), record.get("round_id"))
-                        if round_key in responses and round_key in advancements:
-                            start = responses[round_key]["finished_elapsed_ms"]
-                            finish = advancements[round_key]["finished_elapsed_ms"]
-                            record.update(
-                                response_processing_started_elapsed_ms=start,
-                                response_processing_finished_elapsed_ms=finish,
-                                response_processing_duration_ms=finish - start,
-                            )
-                if isinstance(record.get("body"), bytes):
-                    record.update(_body_fields(record.pop("body")))
-                events.append(record)
-            text = json.dumps(events, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._write(text)
+            # No worker, filesystem work, or payload parsing runs during the loop.
+            # The closed buffer belongs exclusively to this worker until it returns.
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="run-report") as worker:
+                worker.submit(self._flush).result()
+        except BaseException as error:
+            self._close_error = error
+            raise
         finally:
             finished_ns = perf_counter_ns()
             self._completion_timing = {
@@ -329,9 +326,125 @@ class RunReport:
                 "report_generation_duration_ms": (finished_ns - started_ns) / 1_000_000,
                 "report_write_duration_ms": self._write_ns / 1_000_000,
                 "report_write_count": self._write_count,
+                "jev_requests_directory": str(self.requests_path),
+                "jev_request_file_count": self._request_file_count,
+                "jev_request_write_duration_ms": self._request_write_ns / 1_000_000,
+                "jev_response_file_count": self._response_file_count,
+                "jev_response_write_duration_ms": self._response_write_ns / 1_000_000,
                 "through_report_duration_ms": self._elapsed_ms(finished_ns),
             }
         return self._completion_timing.copy()
+
+    def _flush(self) -> None:
+        """Save chronological, readable Jev inputs and outputs beside the report."""
+        responses = {
+            event["parent_span_id"]: event for event in self._events
+            if event["event"] == "jev_response" and event.get("parent_span_id") is not None
+        }
+        advancements = {
+            event["parent_span_id"]: event for event in self._events
+            if event["event"] == "timing_finished" and event["operation"] == "selection.advancement"
+            and event.get("parent_span_id") is not None
+        }
+        batches: dict[int, list[dict[str, Any]]] = {}
+        for event in self._events:
+            if event["event"] == "timing_finished" and event["operation"] == "selection.batch":
+                batches.setdefault(event["parent_span_id"], []).append(event)
+        events = []
+        payloads = []
+        directions = {"jev_request": "input", "jev_response": "output"}
+        payload_count = sum(
+            event["event"] in directions and isinstance(event.get("body"), bytes)
+            for event in self._events
+        )
+        file_digits = max(4, len(str(payload_count)))
+        for saved in sorted(self._events, key=lambda event: event["_at_ns"]):
+            record = {"timestamp": self._timestamp(saved["_at_ns"])}
+            record.update({key: value for key, value in saved.items() if key != "_at_ns"})
+            if record["event"] == "timing_finished":
+                for field in ("started", "finished"):
+                    at_ns = self._origin_ns + round(record[f"{field}_elapsed_ms"] * 1_000_000)
+                    record[f"{field}_at"] = self._timestamp(at_ns)
+                span_id = record["span_id"]
+                if record["operation"] == "selection.batch" and span_id in responses:
+                    start = responses[span_id]["finished_elapsed_ms"]
+                    finish = record["finished_elapsed_ms"]
+                    record.update(
+                        response_processing_started_elapsed_ms=start,
+                        response_processing_finished_elapsed_ms=finish,
+                        response_processing_duration_ms=finish - start,
+                    )
+                elif record["operation"] == "selection.round":
+                    if span_id in batches:
+                        # Batch processing intervals are disjoint. A span from
+                        # the first response to advancement would count later
+                        # HTTP calls as local response processing.
+                        durations = [
+                            batch["finished_elapsed_ms"]
+                            - responses[batch["span_id"]]["finished_elapsed_ms"]
+                            for batch in batches[span_id] if batch["span_id"] in responses
+                        ]
+                        if durations:
+                            record["response_processing_duration_ms"] = math.fsum(durations) + (
+                                advancements[span_id]["duration_ms"] if span_id in advancements else 0
+                            )
+                    elif span_id in responses and span_id in advancements:
+                        # Preserve the contiguous interval for unbatched events
+                        # retained by callers using the earlier span structure.
+                        start = responses[span_id]["finished_elapsed_ms"]
+                        finish = advancements[span_id]["finished_elapsed_ms"]
+                        record.update(
+                            response_processing_started_elapsed_ms=start,
+                            response_processing_finished_elapsed_ms=finish,
+                            response_processing_duration_ms=finish - start,
+                        )
+            if record["event"] in directions and isinstance(record.get("body"), bytes):
+                # Inputs and outputs share one sequence; request_id still pairs
+                # the two events even when other calls occur between them.
+                direction = directions[record["event"]]
+                parts = [f"{len(payloads) + 1:0{file_digits}d}", f"jev_{direction}"]
+                iteration = record.get("iteration")
+                if type(iteration) is int and iteration > 0:
+                    parts.append(f"loop_{iteration}")
+                stage = {"windows": "window", "controls": "control"}.get(record.get("stage"))
+                round_number = record.get("round")
+                if stage is not None and type(round_number) is int and round_number > 0:
+                    parts.append(f"{stage}_round_{round_number}")
+                batch, batch_count = record.get("batch"), record.get("batch_count")
+                if type(batch) is int and batch > 0 and type(batch_count) is int and batch_count > 1:
+                    parts.append(f"batch_{batch}")
+                path = self.requests_path / ("_".join(parts) + ".json")
+                file_field = "request_file" if direction == "input" else "response_file"
+                record[file_field] = path.relative_to(self.path.parent).as_posix()
+                payloads.append((path, record, record["body"]))
+            if isinstance(record.get("body"), bytes):
+                record.update(_body_fields(record.pop("body")))
+            events.append(record)
+        text = json.dumps(events, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep the full report available even if a separate payload file fails.
+        self._write(text)
+        for path, record, raw_body in payloads:
+            is_request = record["event"] == "jev_request"
+            # Use the same readable layout for both directions, retaining all
+            # captured fields. Non-JSON bodies keep their original bytes.
+            content = (
+                _format_payload_json(record["body"]) if "body" in record
+                else raw_body
+            )
+            started_ns = perf_counter_ns()
+            try:
+                self._write_document(content, path=path)
+                if is_request:
+                    self._request_file_count += 1
+                else:
+                    self._response_file_count += 1
+            finally:
+                duration_ns = perf_counter_ns() - started_ns
+                if is_request:
+                    self._request_write_ns += duration_ns
+                else:
+                    self._response_write_ns += duration_ns
 
     def __enter__(self) -> Self:
         return self

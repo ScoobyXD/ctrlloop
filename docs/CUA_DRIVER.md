@@ -3,8 +3,9 @@
 CUA Driver **0.28.2** is installed on this machine. The official `cua-driver-serve` scheduled task is enabled with `RunLevel=Highest` and `LogonType=Interactive`, and was started and checked successfully. Installation and documentation were completed in the existing `main` checkout.
 
 The installation provides window discovery, native Windows accessibility reads,
-and native input tools. ctrlloop now connects Jev's existing selected control to
-one optional CUA click through the same CLI adapter.
+and native input tools. ctrlloop connects Jev's selected controls to native clicks
+and its synthetic Windows Search destination to desktop Win+S followed directly
+by text entry, through one persistent MCP adapter.
 
 ## Exact interface reference
 
@@ -44,7 +45,7 @@ The published guide says installation does not need administrator access. The ve
 The ctrlloop adapter passes `CUA_DRIVER_RS_TELEMETRY_ENABLED=0` to every CUA CLI
 child process. This overrides an inherited enable value and CUA's saved setting
 without changing the parent environment. It covers window discovery,
-foreground activation, accessibility reads, and clicks through the same adapter.
+foreground activation, accessibility reads, clicks, hotkeys, and text entry through the same adapter.
 
 This also avoids a Windows 0.28.2 latency bug: the CLI's background telemetry
 worker can inherit captured output handles, making the caller wait for that
@@ -126,7 +127,7 @@ error or interruption; the daemon stays running. A new request receives a new
 client. Python callers should scope `CuaDriver()` with a context manager.
 
 No periodic health polling is used. EOF and request failures/timeouts trigger
-connection disposal. Reads reconnect and retry once. A lost click or activation
+connection disposal. Reads reconnect and retry once. A lost click, activation, hotkey, or text-entry
 response stops without replaying the action. A fresh snapshot is required before
 using controls after connection loss. MCP's native structured result/error
 envelopes replace parsing one-shot CLI stdout in the application adapter; the
@@ -136,6 +137,7 @@ From the ctrlloop repository, with its dependencies and `TYPESAFE_API_KEY` confi
 
 ```powershell
 uv run --locked python src/main.py 'Click the Test button in my test window.'
+uv run --locked python src/main.py 'Open Chrome using Windows Search.' --text 'Chrome'
 ```
 
 Every run executes the loop. Each selected real window is brought forward using
@@ -146,14 +148,28 @@ applies to windows that are not minimized.
 The pipeline dispatches the
 selected record's `pid`, `window_id`, and `element_token` (or the matching index
 and snapshot pair), records the native `action_result`, waits the selected
-settling interval, and captures fresh state. Jev then judges completion and the
-next step. The loop has no iteration cap and does not retry a failed action.
-Synthetic Start Menu/Search selections
-return `no_action`; opening Start and typing are deferred.
+settling interval, and captures fresh state. Jev then selects the next action.
+The loop defaults to `--max-iterations 10`, returns `iteration_limit` at that
+bound, and does not assess completion or retry failed actions.
+
+If the synthetic Windows Search window wins, its activation stage instead sends
+`hotkey({scope: "desktop", keys: ["win", "s"]})` and directly follows it with
+`type_text({scope: "desktop", text: <exact supplied text>})`. There is no
+intervening observation, confirmation, sleep, control search, or Jev call. Both
+commands use the same MCP client and iteration; the next iteration observes the
+real search results without a settling wait. Real Start/Search windows remain
+available to normal window and control selection. The adapter retains each
+native result, and uncertain input is never replayed.
+
+Supply the exact query with `--text` or `run_pipeline(..., text=...)`; the app
+does not extract it from the request. Valid strings are preserved verbatim,
+while explicitly empty or whitespace-only strings are rejected. If Windows
+Search wins with no supplied text, the pipeline returns `no_action` before
+sending Win+S or typing.
 
 The `action_returned` event records driver facts, including an `unverifiable` or
 `suspected_noop` effect. It does not prove the application goal; the loop observes
-again to judge that. `completed`/exit 0 means Jev judged completion from observed state.
+again to select the next action. `iteration_limit`/exit 2 does not establish completion.
 Native failures retain their diagnostic payload and return `error`/exit 1.
 See [full CLI status and report details](../README.md#run).
 
@@ -165,6 +181,7 @@ UIAccess helper is an internal worker, not a public alternative endpoint.
 
 ## Verification artifacts
 
+- [Native Windows-key patch, build, and rollback](cua-driver/windows-key-fix.md)
 - [Runtime verification record](cua-driver/0.28.2/runtime-verification.json)
 - [Native tree from Windows Program Manager](cua-driver/0.28.2/examples/get_window_state.tree.md)
 - [Corresponding structured result](cua-driver/0.28.2/examples/get_window_state.output.json)

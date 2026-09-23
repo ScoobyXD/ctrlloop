@@ -15,6 +15,9 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 
+_ACTION_TOOLS = frozenset({"click", "bring_to_front", "hotkey", "type_text"})
+
+
 class DriverError(Exception):
     """A driver transport, refusal, or contract error with a safe summary."""
 
@@ -140,7 +143,7 @@ def _reject_json_constant(value: str) -> None:
 
 
 class CuaDriver:
-    """Discover and activate windows, capture state, and dispatch native clicks.
+    """Observe windows and dispatch native clicks, desktop hotkeys, and text.
 
     Optional/nullable observation fields are preserved, including missing
     elements or snapshot identity. The pipeline decides whether that observation
@@ -196,8 +199,8 @@ class CuaDriver:
             self._transport.close()
 
     def _call(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        if tool not in {"list_windows", "get_window_state", "click", "bring_to_front"}:
-            raise DriverError("Only window reads, bring_to_front, and a single click are available.")
+        if tool not in _ACTION_TOOLS | {"list_windows", "get_window_state"}:
+            raise DriverError("This CUA tool is not available through the adapter.")
         if self._closed:
             raise DriverError("This request's CUA client is closed.", code="driver_closed", tool=tool)
         for attempt in range(2):
@@ -209,7 +212,7 @@ class CuaDriver:
                     self._recovery_required = True
                     self._recovery_snapshot = None
                     self._transport.close()
-                # Reads are safe to repeat once. Never replay a click/activation
+                # Reads are safe to repeat once. Never replay an input/activation
                 # after a lost response: it may already have been delivered.
                 if reconnect and attempt == 0 and tool in {"list_windows", "get_window_state"}:
                     continue
@@ -245,13 +248,13 @@ class CuaDriver:
         if result.get("isError"):
             diagnostic = _action_diagnostic(payload) if isinstance(payload, dict) else ""
             error = _failure(tool, None, diagnostic or text)
-            if tool in {"click", "bring_to_front"} and isinstance(payload, dict):
+            if tool in _ACTION_TOOLS and isinstance(payload, dict):
                 error.context["action_result"] = payload
             raise error
         if not isinstance(payload, dict):
             raise DriverError(f"CUA Driver {tool} did not return an object.",
                               code="invalid_driver_response", tool=tool)
-        if tool in {"click", "bring_to_front"}:
+        if tool in _ACTION_TOOLS:
             # Action facts use a different native contract from observations.
             # In particular, an effect of "unverifiable" is a legitimate result.
             if (
@@ -348,7 +351,51 @@ class CuaDriver:
                     "Refresh the window state and reselect a control after a CUA connection loss.",
                     code="stale_element_token", tool="click",
                 )
-        payload = self._call("click", arguments)
+        return self._input_action("click", arguments)
+
+    def hotkey(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Send one native desktop hotkey without reads, waits, or retries."""
+        self._validate_desktop_input("hotkey", arguments, {"keys"})
+        keys = arguments.get("keys")
+        if (
+            not isinstance(keys, list) or len(keys) < 2
+            or not all(isinstance(key, str) and key.strip() for key in keys)
+        ):
+            raise DriverError("hotkey requires a native keys array with at least two key names.",
+                              code="invalid_hotkey_arguments", tool="hotkey")
+        return self._input_action("hotkey", arguments)
+
+    def type_text(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Type the exact supplied string into the current desktop focus once.
+
+        Focus and readiness are the caller's responsibility. This method does
+        not acquire state, select a field, normalize text, or send special keys.
+        """
+        self._validate_desktop_input("type_text", arguments, {"text", "delay_ms"})
+        if not isinstance(arguments.get("text"), str) or (
+            "delay_ms" in arguments and not _integer(arguments["delay_ms"], 0, 200)
+        ):
+            raise DriverError("type_text requires text and an optional delay_ms integer from 0 to 200.",
+                              code="invalid_type_text_arguments", tool="type_text")
+        return self._input_action("type_text", arguments)
+
+    @staticmethod
+    def _validate_desktop_input(
+        tool: str, arguments: Mapping[str, Any], fields: set[str],
+    ) -> None:
+        # Expose the native desktop form explicitly. Window/element input can
+        # be added through these same native methods when the pipeline uses it.
+        if (
+            not isinstance(arguments, Mapping)
+            or set(arguments) - {"scope", "session"} - fields
+            or arguments.get("scope") != "desktop"
+            or ("session" in arguments and not isinstance(arguments["session"], str))
+        ):
+            raise DriverError(f"{tool} requires scope desktop without a window or element target.",
+                              code="invalid_desktop_input", tool=tool)
+
+    def _input_action(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        payload = self._call(tool, arguments)
         # These are the public 0.28.2 ActionResult facts, not OS dispatch names.
         effect, route = payload.get("effect"), payload.get("route")
         if (
@@ -357,8 +404,8 @@ class CuaDriver:
             or not isinstance(route, str)
             or route not in {"accessibility", "synthetic_events", "global_input", "system_api", "dom", "trusted_input"}
         ):
-            error = DriverError("CUA click returned no recognized action facts; delivery is unknown.",
-                                code="invalid_action_result", tool="click")
+            error = DriverError(f"CUA {tool} returned no recognized action facts; delivery is unknown.",
+                                code="invalid_action_result", tool=tool)
             error.context["action_result"] = payload
             raise error
         return payload

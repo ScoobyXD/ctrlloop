@@ -1,0 +1,12 @@
+diff --git a/libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs b/libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs
+index 1a1d2e5..ab259d2 100644
+--- a/libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs
++++ b/libs/cua-driver/rust/crates/platform-windows/src/input/keyboard.rs
+@@ -750,6 +750,7 @@ fn is_extended(vk: VIRTUAL_KEY) -> bool {
+             | VK_RIGHT
+             | VK_RCONTROL
+             | VK_RMENU
++            | VK_LWIN
+             | VK_RWIN
+             | VK_NUMLOCK
+             | VK_SNAPSHOT

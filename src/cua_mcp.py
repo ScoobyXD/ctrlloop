@@ -27,6 +27,10 @@ _PROTOCOL_VERSION = "2025-06-18"
 # CUA 0.28.2 installation advertises 2025-06-18 in its initialization response.
 _SUPPORTED_PROTOCOLS = {_PROTOCOL_VERSION, "2025-03-26", "2024-11-05"}
 _CLOSE_TIMEOUT = 1.0
+# Windows CUA 0.28.2 otherwise waits for a distance/FPS-dependent cursor glide
+# before clicking. A positive duration bounds that animation wait; zero selects
+# the driver's slower speed-based mode rather than disabling animation.
+_CURSOR_GLIDE_MS = 1
 
 
 def _reject_constant(value: str) -> None:
@@ -154,6 +158,25 @@ class McpTransport:
                 code="invalid_driver_response",
             )
         self._write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        # Configure once per connection, including reconnects, before any reads
+        # or actions. Empty session selects this transport's implicit lifecycle
+        # cursor in CUA 0.28.2, matching calls that omit session. This is not a
+        # persistent/global setting and does not move or hide the cursor.
+        result = self._request("tools/call", {
+            "name": "set_agent_cursor_motion",
+            "arguments": {"session": "", "glide_duration_ms": _CURSOR_GLIDE_MS},
+        }, deadline)
+        payload = result.get("structuredContent") if isinstance(result, dict) else None
+        motion = payload.get("motion") if isinstance(payload, dict) else None
+        if (
+            not isinstance(result, dict) or result.get("isError", False) is not False
+            or not isinstance(motion, dict)
+            or motion.get("glide_duration_ms") != _CURSOR_GLIDE_MS
+        ):
+            raise DriverError(
+                f"CUA did not confirm the session's {_CURSOR_GLIDE_MS} ms cursor glide configuration.",
+                code="cursor_configuration_failed",
+            )
 
     def _write(self, message: dict[str, Any]) -> None:
         self._process.stdin.write(json.dumps(message, ensure_ascii=False, allow_nan=False) + "\n")

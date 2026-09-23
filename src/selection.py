@@ -1,15 +1,19 @@
-"""Groups-of-ten Choice elimination for windows, controls and action evidence."""
+"""Groups-of-ten Choice elimination for windows and controls."""
 
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
-import json
 import logging
 import math
 from typing import Any, TYPE_CHECKING
 
 from typesafe_sdk import Choice, TypeSafeError
+
+if __package__:
+    from .jev_questions import QUESTION, TIMER
+else:
+    from jev_questions import QUESTION, TIMER
 
 if TYPE_CHECKING:
     from src.reporting import RunReport
@@ -17,7 +21,7 @@ if TYPE_CHECKING:
 
 PINNED_MODEL = "jev-1.13.0"
 GROUP_SIZE = 10
-NONE_KEY = "none"
+CONTROL_CANDIDATES_PER_CALL = 400
 SETTLING_MS = {
     "<50ms": 50,
     "100ms": 100,
@@ -26,22 +30,6 @@ SETTLING_MS = {
     "400ms": 400,
     ">500ms": 500,
 }
-QUESTION = (
-    "Which of these candidates is best suited to help fulfill the user’s original "
-    "request, based on the provided candidate information?"
-)
-EVIDENCE_QUESTION = (
-    "Which of these freshly observed candidates provides the clearest evidence that "
-    "the action recorded in `last_action`, targeting the unverified `last_control`, "
-    "achieved its intended result? "
-    # Temporarily disabled with the synthetic none criteria below.
-    # "Choose none if no candidate provides such evidence. "
-    "A past selection or action-delivery result alone is not proof."
-)
-EVIDENCE_CONFIRMATION_QUESTION = (
-    "Based on these evidence candidates and the action we attempted, did the action "
-    "achieve its intended result?"
-)
 logger = logging.getLogger(__name__)
 
 
@@ -61,7 +49,6 @@ class Selection:
     winner: Candidate | None
     rounds: list[dict[str, Any]] = field(default_factory=list)
     settling_ms: int | None = None
-    verification: bool | None = None
 
 
 def _probability(value: Any) -> bool:
@@ -104,9 +91,9 @@ class ChoiceSelector:
             safe_status = status if type(status) is int else "unavailable"
             if status in (413, 422):
                 raise SelectionError(
-                    f"Jev rejected the complete round (HTTP {safe_status}); verify "
-                    "the service request limits and question format. The round "
-                    "was not split into smaller calls."
+                    f"Jev rejected the request batch (HTTP {safe_status}); verify "
+                    "the service request limits and question format. The batch "
+                    "was not retried in smaller calls."
                 ) from None
             raise SelectionError(
                 f"TypeSafe request failed: {type(error).__name__} (HTTP {safe_status})."
@@ -204,6 +191,8 @@ class ChoiceSelector:
         """Select with the original request or the caller's shared loop state."""
         with report.span("selection", stage=stage) if report else nullcontext({}):
             with report.span("selection.validation") if report else nullcontext({}):
+                if stage not in {"windows", "controls"}:
+                    raise ValueError("Selection stage must be windows or controls.")
                 request_text = (
                     original_request.get("original_request")
                     if isinstance(original_request, dict) else original_request
@@ -215,14 +204,10 @@ class ChoiceSelector:
                     raise ValueError("Candidate keys must be nonempty strings.")
                 if len({candidate.key for candidate in current}) != len(current):
                     raise ValueError("Candidate keys must be unique within a selection.")
-                control_or_evidence = stage in {"controls", "evidence"}
-                if control_or_evidence and any(candidate.key == NONE_KEY for candidate in current):
-                    raise ValueError("The none option key is reserved for control and evidence selection.")
             rounds: list[dict[str, Any]] = []
             settling_ms = None
-            verification = False if stage == "evidence" else None
             include_settling = stage == "controls" and settling_context is not None
-            while current and (len(current) > 1 or control_or_evidence):
+            while current and (len(current) > 1 or stage == "controls"):
                 round_number = len(rounds) + 1
                 round_id = f"{stage}_r{round_number}"
                 with report.span(
@@ -234,27 +219,12 @@ class ChoiceSelector:
                         questions = {}
                         group_keys = []
                         final_round = len(current) <= GROUP_SIZE
-                        app_context = (
-                            json.dumps(settling_context, ensure_ascii=False, separators=(",", ":"))
-                            if final_round and include_settling else None
-                        )
                         for group_index, group in enumerate(groups):
                             key = f"{round_id}_g{group_index}"
                             group_keys.append(key)
                             criteria = {candidate.key: candidate.description for candidate in group}
-                            # Temporary experiment: each group must choose a supplied candidate.
-                            # if control_or_evidence:
-                            #     criteria[NONE_KEY] = (
-                            #         "None of these candidates provides evidence that the attempted action succeeded."
-                            #         if stage == "evidence" else
-                            #         "None of these candidates is suitable for the next action toward the user's request."
-                            #     )
-                            question = EVIDENCE_QUESTION if stage == "evidence" else QUESTION
                             questions[key] = Choice(
-                                instructions=(
-                                    f"{question} Observed app/browser context: {app_context}."
-                                    if final_round and include_settling else question
-                                ),
+                                instructions=QUESTION,
                                 criteria=criteria,
                             )
                         timing_keys = {}
@@ -262,51 +232,54 @@ class ChoiceSelector:
                             for candidate_index, candidate in enumerate(current):
                                 key = f"{round_id}_settling_{candidate_index}"
                                 timing_keys[candidate.key] = key
-                                description = json.dumps(
-                                    candidate.description, ensure_ascii=False, separators=(",", ":"),
-                                )
                                 questions[key] = Choice(
-                                    instructions=(
-                                        f"Assume CUA executes a click on candidate {candidate.key} "
-                                        f"described by {description}, independently of which candidate "
-                                        f"wins selection. After CUA finishes delivering this candidate "
-                                        f"action in the observed app/browser {app_context} and its call "
-                                        f"returns, how much additional time should this browser/app "
-                                        f"need for the resulting state to become ready for the next step? "
-                                        f"Estimate additional app settling time, excluding CUA execution "
-                                        f"duration. The >500ms answer schedules a first observation at "
-                                        f"500ms; it does not assert that the app has finished."
-                                    ),
+                                    instructions={
+                                        "question": TIMER,
+                                        "candidate": {candidate.key: candidate.description},
+                                        "action": "click",
+                                        "app_context": settling_context,
+                                        "timing_scope": "after_cua_return",
+                                    },
                                     criteria={label: None for label in SETTLING_MS},
                                 )
-                        confirmation_key = None
-                        if final_round and stage == "evidence":
-                            confirmation_key = f"{round_id}_confirmation"
-                            questions[confirmation_key] = Choice(
-                                instructions={
-                                    "question": EVIDENCE_CONFIRMATION_QUESTION,
-                                    "evidence_candidates": {
-                                        candidate.key: candidate.description for candidate in current
-                                    },
-                                    "assessment": (
-                                        "Use these fresh observations with last_control and last_action "
-                                        "from the shared state. An action return alone is not proof of "
-                                        "success; missing or partial observations are not proof either. "
-                                        "Answer independently of the sibling selection question."
-                                    ),
-                                },
-                                criteria={"yes": None, "no": None},
+                        groups_per_call = (
+                            CONTROL_CANDIDATES_PER_CALL // GROUP_SIZE
+                            if stage == "controls" else len(groups)
+                        )
+                        batches = [
+                            group_keys[start : start + groups_per_call]
+                            for start in range(0, len(group_keys), groups_per_call)
+                        ]
+                    chosen = {}
+                    api_calls = []
+                    for batch_index, batch_keys in enumerate(batches, start=1):
+                        batch_candidate_count = sum(len(questions[key].criteria) for key in batch_keys)
+                        # Finalist timers stay in the final round's single batch.
+                        batch_questions = {
+                            key: questions[key] for key in (*batch_keys, *timing_keys.values())
+                        }
+                        with report.span(
+                            "selection.batch", batch=batch_index, batch_count=len(batches),
+                            batch_candidate_count=batch_candidate_count,
+                        ) if report else nullcontext({}) as batch_timing:
+                            batch_choices, api_call = self.judge(
+                                original_request, batch_questions, report=report,
                             )
-                    # Group questions, conditional timings and final evidence
-                    # confirmation share one request and never need sibling answers.
-                    chosen, api_call = self.judge(original_request, questions, report=report)
+                            api_call.update(
+                                batch=batch_index, batch_count=len(batches),
+                                candidate_count=batch_candidate_count,
+                            )
+                            if report:
+                                api_call["batch_span_id"] = batch_timing["span_id"]
+                            chosen.update(batch_choices)
+                            api_calls.append(api_call)
+                    # Advance only after every batch in this round succeeds.
                     with report.span("selection.advancement") if report else nullcontext({}) as advancement_timing:
                         winners = []
                         group_traces = []
                         for key, group in zip(group_keys, groups, strict=True):
                             winner_key = chosen[key]
-                            if not control_or_evidence or winner_key != NONE_KEY:
-                                winners.append(next(candidate for candidate in group if candidate.key == winner_key))
+                            winners.append(next(candidate for candidate in group if candidate.key == winner_key))
                             group_traces.append({
                                 "question_key": key,
                                 "options": list(questions[key].criteria),
@@ -317,7 +290,7 @@ class ChoiceSelector:
                             "group_count": len(groups),
                             "winner_count": len(winners),
                             "groups": group_traces,
-                            "api_call": api_call,
+                            "api_calls": api_calls,
                             "round": round_number,
                             "round_id": round_id,
                         }
@@ -332,13 +305,6 @@ class ChoiceSelector:
                             }
                             if winners:
                                 settling_ms = round_trace["settling"][winners[0].key]["milliseconds"]
-                        if confirmation_key is not None:
-                            verification = bool(winners) and chosen[confirmation_key] == "yes"
-                            round_trace["verification"] = {
-                                "question_key": confirmation_key,
-                                "choice": chosen[confirmation_key],
-                                "verified": verification,
-                            }
                         current = winners
                     if report:
                         round_trace.update(
@@ -351,5 +317,4 @@ class ChoiceSelector:
                         break
             return Selection(
                 winner=current[0] if current else None, rounds=rounds, settling_ms=settling_ms,
-                verification=verification,
             )

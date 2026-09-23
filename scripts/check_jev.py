@@ -1,13 +1,18 @@
-"""Check direct TypeSafe access with one small batch of questions."""
+"""Check TypeSafe access with the production selection and timer questions."""
 
 import os
 from pathlib import Path
-import re
 import sys
 import tomllib
 
 from dotenv import load_dotenv
-from typesafe_sdk import Noul, RetryPolicy, TypeSafeClient, TypeSafeError
+from typesafe_sdk import RetryPolicy, TypeSafeClient, TypeSafeError
+
+if not __package__:
+    # Direct script execution puts scripts, rather than the project root, on sys.path.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.selection import Candidate, ChoiceSelector, PINNED_MODEL, SelectionError
 
 
 def main() -> int:
@@ -15,8 +20,8 @@ def main() -> int:
     load_dotenv(project_dir / ".env", override=False, interpolate=False)
     config = tomllib.loads((project_dir / "pyproject.toml").read_text(encoding="utf-8"))
     model = config["tool"]["ctrlloop"]["jev-model"]
-    if not re.fullmatch(r"jev-\d+\.\d+\.\d+", model):
-        print("pyproject.toml must pin an exact Jev version, such as jev-1.13.0.", file=sys.stderr)
+    if model != PINNED_MODEL:
+        print(f"pyproject.toml must pin {PINNED_MODEL}.", file=sys.stderr)
         return 1
 
     api_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
@@ -28,10 +33,19 @@ def main() -> int:
         )
         return 1
 
-    questions = {
-        "asks_for_help": Noul(instructions="Is the writer asking for help?"),
-        "expresses_urgency": Noul(instructions="Does the writer express urgency?"),
+    # One fictional control yields exactly one selection and one timer question.
+    # No desktop observation or action is performed by this connection check.
+    window = {"app_name": "connection_check", "title": "Connection check fixture"}
+    state = {
+        "original_request": "Click the Test button in the connection check fixture.",
+        "iteration": 1,
+        "current_window": window,
+        "last_control": None,
     }
+    candidate = Candidate(
+        "test_button", {"role": "Button", "label": "Test", "actions": ["click"]},
+        {"role": "Button", "label": "Test", "synthetic": True},
+    )
     try:
         with TypeSafeClient(
             api_key=api_key,
@@ -40,29 +54,24 @@ def main() -> int:
             timeout=30.0,
             retry=RetryPolicy(max_retries=0),
         ) as client:
-            response = client.system_one(
-                state="Please help me sign in. It is urgent.",
-                questions=questions,
+            selection = ChoiceSelector(client, model=model).select(
+                state, [candidate], stage="controls", settling_context=window,
             )
+    except SelectionError as error:
+        # Production validation reports only safe structural/request diagnostics.
+        print(f"TypeSafe check failed: {error}", file=sys.stderr)
+        return 1
     except TypeSafeError as error:
         # Report only the error class/status, never credentials or raw HTTP content.
         status = getattr(error, "status", None)
         print(f"TypeSafe check failed: {type(error).__name__} (HTTP {status}).", file=sys.stderr)
         return 1
 
-    print(f"Requested model: {model}; response model: {response.model}")
-    if response.model != model:
-        print("Check failed: the response model does not match the pin.", file=sys.stderr)
-        return 1
-    if set(response.answers) != set(questions) or set(response.nouls) != set(questions):
-        print("Check failed: expected one Noul answer per question.", file=sys.stderr)
-        return 1
-    for name, answer in response.nouls.items():
-        if not 0 <= answer.noul <= 1:
-            print("Check failed: probability outside [0, 1].", file=sys.stderr)
-            return 1
-        print(f"{name}: {answer.noul:.4f}")
-    print(f"Tokens: {response.usage.input_tokens} input, {response.usage.output_tokens} output")
+    trace = selection.rounds[0]["api_calls"][0]
+    print(f"Requested model: {model}; response model: {trace['response_model']}")
+    for name, answer in trace["answers"].items():
+        print(f"{name}: {answer['choice']}")
+    print(f"Tokens: {trace['input_tokens']} input, {trace['output_tokens']} output")
     print("Connection check passed.")
     return 0
 

@@ -1,220 +1,151 @@
 # Main workflow
 
-> **Temporary experiment:** The synthetic `none` options and the evidence prompt's
-> "Choose none" sentence are commented out in `src/selection.py`. Every nonempty
-> group now advances one supplied candidate, with at most ten options per group.
-> Singleton control/evidence rounds still run, including settling questions and
-> the final yes/no verification. References to `none` below describe the baseline
-> behavior to restore after the experiment.
+This is the authoritative description of the Jev-driven control loop in
+`src/pipeline.py`, its selector, reporter, and CLI. Each iteration discovers
+windows and selects a window. A real window goes through control reading,
+selection, clicking, and settling. The synthetic Windows Search destination
+instead sends Win+S and immediately types the supplied exact query. The next decision
+uses the original request, the previous action, and the current observation.
+[Reading run timings](timing.md) maps these operations to report fields.
 
-This is the authoritative explanation of the basic Jev-driven control loop in
-`src/pipeline.py`, its selector, reporter, and CLI. [Reading run timings](timing.md)
-maps the workflow to report fields. Every run selects a control, delivers its CUA
-click, waits for settling, and uses a fresh observation to verify that action's
-intended result. It stops after verification. Overall task completion and
-selection of the next window or action are outside this increment. Selecting a
-real window also brings it to the foreground.
+The workflow uses exactly two question definitions in
+[`src/jev_questions.py`](../src/jev_questions.py):
 
-The two central requirements are:
+- `QUESTION` selects the next candidate at every window and control round,
+  including the final round.
+- `TIMER` estimates the additional settling interval for a possible control click.
+  It is included once per finalist in the final control-selection request.
 
-- **Each selection round makes exactly one Jev API call.**
-- **Collect timestamps and report data in memory during the run, then generate
-  and write the report once at the end.**
+These are two question types, reused as needed. A round with 40 groups still
+contains 40 instances of the selection question, all sent in one API call.
+There is no evidence-selection stage, action-confirmation question, or automatic
+completion judgment. Reaching the iteration limit does not assert that the
+user's request has been fulfilled.
 
 ## Vocabulary
 
 | Term | Meaning |
 | --- | --- |
-| Candidate | One observed or synthetic window/control option. During verification, a fresh control is an evidence candidate, not an action target. |
-| Group | Up to 10 candidates considered together. Control and evidence questions add a `none` option; it is not an observed candidate. |
-| Group question | One question selecting a suitable control/window or the strongest evidence in that group. |
-| Round | Evaluate all current groups together and advance each group's selected candidate. A group that chooses `none` advances no candidate. |
-| API call | One request to Jev containing all group questions for that round. |
-| Stage | A larger part of the workflow, such as window selection, control acquisition, control selection, or evidence selection. |
-| Iteration / pass | One observation pass: pass 1 selects and executes a control; pass 2 verifies its result using fresh controls. Each pass may contain several selection rounds. |
+| Candidate | One observed or synthetic window/control option. |
+| Group | Up to 10 candidates considered together. |
+| Group question | One instance of `QUESTION` selecting a candidate from a group. |
+| Round | Evaluate all groups, then advance each group's selected candidate after every batch succeeds. |
+| API call | One request with a batch of group questions (up to 400 control candidates), plus any final control timers. |
+| Stage | Window discovery/selection, activation, control acquisition/selection, or action dispatch. |
+| Iteration | One decision cycle with fresh window discovery, selection, observation, and action when available. All calls in the cycle share its iteration number. |
+| Loop boundary for a timeline | Starts at current-state acquisition and ends when the last CUA command is sent: a control click or Windows Search text entry. Native return and any settling appear afterward, before the next loop starts. |
 
-Use these terms consistently in documentation, reports, and explanations. For
-example, say "40 groups, each with one question, sent in one API call." Do not
-describe this as 40 API calls or as 40 questions about an individual candidate.
+The report's `loop.iteration` span encloses the complete decision cycle, including
+native return and any settling wait. Its duration therefore differs from the
+user-facing timeline's dispatch-bounded loop duration. A terminal cycle without
+an action is a stopped cycle, not a completed click.
 
-## First pass
+## Each iteration
 
-1. Receive the user's original request. Preserve its meaning and pass the original
-   request unchanged to Jev during selection.
-2. Discover the available windows and construct their candidate descriptions.
-3. Select a window using the rounds described below.
-4. Bring the selected real window to the foreground.
-5. Read that window's Windows accessibility tree and construct control candidates
-   from the returned observation. Preserve the observation's identities so that
-   the selected control maps back to the correct native target.
-6. Narrow controls using the same rounds described below. Add one
-   conditional settling-time question for each finalist to the final control
-   selection request.
-7. If no suitable control remains, stop without clicking. Otherwise record the
-   selected control in `last_control` with status `(unverified)`, then execute its
-   click and wait for CUA to return.
-8. Wait the winning candidate's selected settling time, then continue with the
-   second-pass verification below. At the end, generate and write the report once
-   from the records collected in memory.
+1. Keep the user's exact original request in state and set this iteration number.
+2. Discover windows and build their candidate descriptions. Refresh the previous
+   current window if still observed; otherwise clear it.
+3. Select the next window with `QUESTION`. This happens again every iteration,
+   allowing the next action to move to another window.
+4. For Windows Search, send desktop Win+S, then immediately send desktop
+   `type_text` with the exact supplied string, and skip to the next iteration
+   (or return `iteration_limit` at the configured bound). No control read,
+   control selection, timer, observation, confirmation, or sleep intervenes.
+   Without supplied text, return `no_action` before either native command.
+   For a real window, bring it forward and read its accessibility tree.
+   Preserve the observation identities needed to execute the selected control.
+5. Build control candidates once and narrow them with `QUESTION`. Include one
+   conditional `TIMER` per finalist only in the final control round.
+6. Record the selected control and source window as the latest attempted action.
+   Execute its CUA click and retain the native result.
+7. At the iteration limit, return `iteration_limit` without another wait or
+   observation. Otherwise, wait the winning control's timer interval after CUA
+   returns, then begin the next iteration.
 
-Window/control selection uses the original user request and observed candidate
-descriptions. This workflow has no changed/done/another-window routing questions.
+Empty, unavailable, or failed observations/actions and missing search text can stop earlier.
+Old executable targets are not reused for a new iteration. There are no separate
+routing, verification, retry-action, or extra-wait questions.
 
-Start Menu offers the synthetic Search field; neither has a native execution
-target. Search is judged against `none`; selecting it
-returns `no_action`. Opening Start and typing are deferred.
+The synthetic Windows Search route has one window candidate and no control
+candidates. It uses the existing activation stage for
+`hotkey({scope: "desktop", keys: ["win", "s"]})`, followed directly by
+`type_text({scope: "desktop", text: <exact supplied text>})`. Both commands belong
+to the same iteration. This route makes zero control-selection rounds and zero
+timer requests, and adds no settling wait after typing. The next normal
+iteration reads fresh state and can select real search results. Real Start and
+Search windows remain observed window candidates; the synthetic route does not
+replace them.
 
 ## Shared Jev state
 
-Every pipeline request uses the same four shared context fields, including window,
-control, and evidence selection:
+Every window and control request carries the same run context:
 
 | Field | Meaning |
 | --- | --- |
-| `original_request` | The user's exact original text, without rewriting or shortening. |
-| `iteration` | The current observation pass: 1 for selection/action, 2 for verification. It stays the same across all calls within a pass. |
-| `current_window` | Set when window selection finishes; app/title metadata refreshes if a later window observation changes it. `null` before the first window selection or when the current window is no longer observed. |
-| `last_control` | `null` before control selection. Before dispatching a click, set `{window, control, status}` using the source window, selected control description, and status `(unverified)`. Change only the status to `(verified)` when fresh evidence confirms the action's intended result. The descriptive record remains after observation clears the old executable target. |
+| `original_request` | The user's exact original text, without rewriting, trimming, or shortening. |
+| `iteration` | Current decision cycle, starting at 1; it does not count completed clicks. |
+| `current_window` | Observed app/title metadata, refreshed from discovery and changed when a new window is selected; `null` before selection or when the old window is absent. |
+| `last_control` | `null` until action selection, then `{window, control}` with source window and descriptive control fields. |
+| `last_action` | Previous tool and filtered native delivery/result facts, available after an action attempt. Windows Search text entry also retains the exact supplied text. |
 
-Create one mutable state dictionary per run and update these fields at those
-events. All selection rounds reuse that object. Verification adds only
-`last_action` delivery/wait facts and `observation` coverage information. Build
-control candidates once per observation. Changing the current window's metadata
-must not rewrite the source window retained in `last_control`.
+One mutable dictionary is reused within the run. Each request serializes a
+complete snapshot; this is not a server-side patch protocol. Round traces and
+report events retain historical snapshots so later updates cannot change earlier
+requests. Refreshing the current window must not rewrite the source window
+retained with the previous control.
 
-Each HTTP request still serializes its complete state and questions for Jev;
-reusing the local dictionary is not a server-side state or patch protocol. Request
-traces and report entries retain independent historical snapshots so later field
-updates cannot alter what an earlier call actually sent.
+Candidates live in group questions. Shared state contains no full previous/current
+control list, accumulating action history, or local snapshot diff. Native target
+identities remain local. The selector also supports a plain request string for
+direct callers; the pipeline uses the existing shared dictionary.
 
-Control and evidence candidates live in their group questions. Shared state never
-contains a full previous or current control list, and no local snapshot diff is
-needed. The existing selector also accepts a plain request string for direct
-callers, but the application loop always supplies this context. No separate state
-API or data model is introduced.
+## Selection rounds and API batches
 
-## Second pass: verify the previous action
+1. Divide candidates into groups of up to 10, preserving observed order.
+2. Give every group one `QUESTION` with only its candidates as criteria. There is
+   no synthetic `none` response option.
+3. For controls, send consecutive batches of at most **400 candidates** (40 groups)
+   per Jev API call. Keep all window groups in one call. Final control timers share
+   the final round's single batch.
+4. Retain each selected option, confidence, and probability distribution.
+5. After every batch succeeds, combine one winner per group in group order;
+   regroup until one winner remains.
 
-After the selected wait, rediscover windows to refresh the current window's
-identity, then capture its fresh accessibility observation. Use its controls as
-evidence candidates for the intended result of the
-previous action, identified by `last_control` and `last_action`. The evidence
-stage uses the same groups and rounds as control selection, with a `none` option
-in every group. Choosing an evidence control never clicks it.
+An initial singleton window bypasses Jev. A singleton control still receives the
+selection question and, for a real window, its timer. Every round uses the same
+`QUESTION` wording; observed window context is already in shared state.
 
-Narrow the evidence to a final group of at most ten candidates. In that final
-round, batch the group-selection question with this independent yes/no question:
+| Control round | Candidates entering | Groups / selection questions | API calls | Winners leaving |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 392 | 40 | 1 | 40 |
+| 2 | 40 | 4 | 1 | 4 |
+| 3 | 4 | 1 | 1 | 1 |
 
-> Based on these evidence candidates and the action we attempted, did the action achieve its intended result?
+This uses three control calls in total. The final call adds four timers, for five questions
+in that request. Window selection with 17 candidates adds two calls: 17 become
+two winners, then one. The next iteration begins new window/control rounds.
 
-The confirmation question includes all final evidence candidates. It cannot
-depend on the winner of its group question, since questions within one call run
-independently. Record both answers and their probabilities. There is no extra
-confirmation API call after the final evidence round.
+For 631 controls, round 1 sends the first 400 candidates in 40 groups and the
+remaining 231 in 24 groups, using two sequential API calls. All 64 winners enter
+round 2 together, then seven enter the final round: four control calls in total.
+For 647 controls, the first round sends 400 and 247 candidates in 40 and 25 groups.
+The rounds are `647 -> 65 -> 7 -> 1`, also using four control calls in total.
+For 1,000 controls, the first round sends 400, 400, and 200 candidates. The rounds
+are `1000 -> 100 -> 10 -> 1`, using three calls, then one, then one: five control
+calls in total. Larger rounds require further batches, each capped at 400 candidates.
 
-| Result | Outcome |
-| --- | --- |
-| Current window disappeared, or its fresh control list is empty | Stop with `no_evidence`, without a Jev evidence request. An unavailable structured observation retains `observation_unavailable`. |
-| All groups choose `none`, or the final group chooses `none` | Stop with `no_evidence`; keep `(unverified)`. A simultaneous yes from the confirmation question does not override no selected evidence. |
-| Evidence selected, confirmation is no | Stop with `action_unverified`; keep `(unverified)`. |
-| Evidence selected, confirmation is yes | Set `last_control.status` to `(verified)` and stop with `action_verified`. |
+Questions within one call are independent. Later rounds depend on all earlier
+group winners and start only after every batch response is validated. If any
+batch fails, selection stops before advancing or acting on partial results.
+Candidates are not silently removed.
 
-This verifies one action's intended result, not completion of the user's whole
-task. There are no completion, window-switch, wait/error, additional-wait, or
-automatic action-retry calls. Missing or partial observations remain limitations
-of the evidence; neither a control selection nor a CUA return proves success.
-Native failures and unknown delivery retain the existing error handling.
+## Final control selection and timer
 
-## Selection rounds: one API call per round
-
-Apply the same grouping procedure to windows, controls, and evidence candidates:
-
-1. Divide the current candidates into groups of up to 10, preserving their order.
-2. Create exactly one group question for every group. Window questions offer only
-   that group's candidates. Control and evidence questions also offer `none`, so
-   a full group has ten observed candidates and eleven response options.
-3. Put **all group questions for the round into one request** and call Jev once.
-4. Read the selected option and complete probability distribution for every group.
-5. Advance each selected candidate, preserving group order. `none` advances no
-   candidate. If all groups reject their candidates, stop the stage.
-6. If a round began with more than ten candidates, regroup its surviving winners
-   for the next round. Control and evidence stages still need their final round
-   when pruning leaves only one candidate: it must be judged against `none`.
-   Finish after the final group, with its timing or verification questions.
-
-Only window selection can accept an initial singleton without a Jev selection
-question. Control and evidence singletons require a group question against
-`none`. The final control round adds one settling-time question per real finalist;
-the final evidence round adds one confirmation question for the whole finalist
-set. A round covers all current candidates; do not turn subsets into extra
-"rounds" to bypass the one-call rule.
-
-For window/control selection, the question means:
-
-> Which of these candidates best matches the user's original request?
-
-For evidence selection, ask which candidate most strongly supports that the
-previous action achieved its intended result. `none` means no candidate in this
-group is suitable for that stage; it is not a fabricated window/control.
-
-Final control-selection questions explicitly include the observed
-app/browser identity so the original request is interpreted in its actual window
-context. Keep shared state and candidate descriptions minimal while retaining
-the information needed to choose. Keep the Jev model pinned to `jev-1.13.0`.
-
-All groups within a round are independent. Their questions belong in the same
-API call. The next round depends on the previous round's winners and therefore
-starts after that response has been processed.
-
-Do not split a round into multiple calls, either sequentially or concurrently.
-If a complete round cannot fit the service's request limits, surface that
-limitation explicitly instead of silently splitting the round or dropping
-candidates. See [Restrictions and limits](#restrictions-and-limits) for the
-provider limits and the application's own bounds.
-
-### Example: 392 control candidates
-
-| Round | Candidates entering | Groups | Group questions in the single API call | Winners leaving |
-| --- | ---: | --- | ---: | ---: |
-| 1 | 392 | 39 groups of 10, plus one group of 2 | 40 | 40 |
-| 2 | 40 | 4 groups of 10 | 4 | 4 |
-| 3 | 4 | 1 group of 4 | 1 | 1 |
-
-Assuming every group advances a candidate, that is **three control-selection
-rounds and three API calls**. Groups selecting `none` can reduce later counts or
-stop selection earlier.
-For the example run with 17 window candidates, window selection adds two rounds
-and two calls: 17 candidates become 2 winners, then 1 winner. The complete
-selection therefore uses **five API calls** across both stages.
-
-The last control request also contains four timing questions, one
-for each finalist. That request has five questions in total and is still one API
-call. The later evidence stage has its own rounds and API calls, with one
-confirmation question added only to its final round. Evidence rounds are distinct
-from window/control-selection rounds.
-
-## Final control selection and settling time
-
-Only the **final** control-selection request includes a separate conditional
-Choice timing question for **every finalist**, alongside the question choosing
-the winning control. Intermediate narrowing rounds do not ask timing questions.
-Each timing question identifies its candidate action and the observed app/browser
-context explicitly. Its meaning is:
-
-> After CUA finishes delivering this candidate action in [observed app/browser],
-> how much additional time should this browser/app need for the resulting state
-> to become ready for the next step?
-
-Use identity actually present in the window/snapshot, such as the observed app
-name and window title; do not guess a browser from the user's request. Keep the
-original user request available as context. The premise is that **this particular
-candidate's action is executed**. A timing answer cannot depend on the selection
-answer in the same batch, because all questions are evaluated independently.
-This follows TypeSafe's [speculative fan-out](https://docs.typesafe.ai/patterns/fan-out)
-pattern. Retain all timing answers and their full probabilities, then use only
-the winning candidate's timing.
-
-Timing uses Choice, not Score. These are the exact options and code mappings:
+Each finalist receives the same `TIMER` wording plus structured context identifying
+its candidate, observed description, CUA click, and app/window. Its timer cannot
+rely on the selection answer from the same batch. Retain all responses but consume
+only the winning candidate's interval. This follows the existing
+[speculative fan-out pattern](https://docs.typesafe.ai/patterns/fan-out).
 
 | Choice option | Scheduled wait (milliseconds) |
 | --- | ---: |
@@ -225,236 +156,96 @@ Timing uses Choice, not Score. These are the exact options and code mappings:
 | `400ms` | 400 |
 | `>500ms` | 500 |
 
-The endpoint mapping is deliberate: `>500ms` schedules the observation after
-500 ms and does not assert that the app is ready. This increment has no
-additional-wait branch. Code performs this mapping and all elapsed-time
-arithmetic; Jev does not calculate a delay or date.
+The last option schedules observation after 500 ms; it does not guarantee
+readiness. Jev chooses an option; code maps it to time. The timer starts **after
+the CUA call returns**, excludes CUA execution, and runs only before another
+iteration. No wait follows the last permitted action.
 
-The ordering is strictly sequential:
-
-```text
-Final control selection + every finalist's conditional timing (one Jev call)
-Choose winning control and its timing
-Record last_control with status (unverified)
-START native action duration
-    Call CUA and wait for its action result
-END native action duration
-START additional app/browser settling wait
-    Sleep the selected 50 / 100 / 200 / 300 / 400 / 500 ms
-END settling wait
-Capture fresh state
-Narrow fresh evidence in rounds, with none in each group
-Final evidence round + action confirmation (one Jev call)
-Mark last_control (verified) only when evidence is selected and confirmation is yes
-Stop and report the per-action result
-```
-
-The settling timer starts **after the CUA call returns**, never at dispatch.
-It does not include CUA execution duration. Its value estimates additional app
-settling time, not how long CUA needs to deliver the action. A new snapshot is
-captured only after the wait; concurrent action/snapshot handling is unnecessary.
-
-## Running the loop
-
-One persistent MCP client belongs to each user request and is shared across
-its observation/action loop. The client is opened lazily and closed on completion,
-error or interruption; the existing daemon remains running. There are no health
-polls. Reads may reconnect and retry once after connection loss, a timeout, or an
-unavailable daemon; uncertain clicks and foreground activations are never
-replayed. Python callers own this lifetime with `with CuaDriver() as driver` or
-an explicit `driver.close()`; the CLI closes the driver in its cleanup path.
-
-From the repository root, with the configured TypeSafe credentials and CUA daemon:
+## Running and stopping
 
 ```powershell
-uv run --locked python src/main.py 'Click the Test button in my test window.'
+uv run --locked python src/main.py 'Click the Test button in my test window.' --max-iterations 1
+uv run --locked python src/main.py 'Open Chrome using Windows Search.' --text 'Chrome'
 ```
 
-The same existing Python API is `run_pipeline(request, driver, selector)`.
-It always executes the loop; callers can supply `sleep=` for deterministic
-testing. See the [README](../README.md#run) for setup and
-client construction, and [report timing](timing.md) for report hooks.
+The Python API is `run_pipeline(request, driver, selector, max_iterations=10, text=None)`.
+`--max-iterations` and the Python argument must be positive integers, default 10.
+`--text` and the Python `text` argument supply the exact query for the Windows
+Search route; they do not force its selection. Explicitly empty or whitespace-only
+strings are rejected. Valid text is retained verbatim, without extraction from
+the request, rewriting, trimming, or line-ending normalization. Selecting Windows
+Search without text returns `no_action` with a reason identifying missing `--text`.
+Callers can supply `sleep=` for deterministic tests. The connection check in
+`scripts/check_jev.py` uses the production selector with one fictional control:
+one selection and one timer in one call, with production response validation
+and no desktop action.
 
-The current scope is one action and its verification, recorded as passes 1 and 2.
-It stops after `action_verified` (CLI exit 0), `action_unverified` or `no_evidence`
-(exit 2). Initial control rejection returns `no_control_selected` (exit 2), while
-an empty control observation retains `no_controls`. Existing observation,
-synthetic-target, and native error outcomes remain available. This is a workflow
-boundary, not a configurable maximum-iteration setting, and `action_verified`
-does not assert overall task completion.
+| Status | Meaning | CLI exit |
+| --- | --- | ---: |
+| `iteration_limit` | Configured action-cycle bound reached; overall completion unknown. | 2 |
+| `no_action` | Windows Search selected without text, or a custom synthetic control lacks a live CUA target. | 2 |
+| `no_windows` | No window candidates; normally unreachable with Windows Search enabled. | 2 |
+| `no_controls` | Valid observation/synthetic definition has no indexed controls. | 2 |
+| `observation_degraded` | Degraded read has no indexed controls. | 2 |
+| `observation_unavailable` | Structured controls or snapshot identity unavailable. | 2 |
+| `error` | Driver, configuration, or Jev request/response failure. | 1 |
 
-Accessibility coverage and model judgments remain limited by their observed
-evidence. Tests use fake Jev/CUA and a fake clock/sleeper; they do not demonstrate
-success on arbitrary live desktop tasks.
+One persistent CUA MCP client belongs to each run. It opens lazily and closes on
+return, failure, or interruption; the daemon stays running. Reads may reconnect
+and retry once after connection loss, timeout, or unavailable daemon. Uncertain
+clicks, foreground activations, hotkeys, and text entry are never replayed. CUA results describe
+delivery, not screen readiness or completion.
 
 ## Restrictions and limits
 
-The following are application choices, configured bounds, and implementation
-gaps. They are separate from Jev's provider limits.
-
-| Application restriction | Current behavior | Where it is controlled |
-| --- | --- | --- |
-| Accessibility observation size | Request at most **5,000 elements**, with maximum depth **25**, by default. A bounded observation does not establish full UI coverage. | CLI `--max-elements` and `--max-depth`; also `CuaDriver` constructor arguments. Both must be positive integers. |
-| Candidate description shortening | App/title and control label/value/value-description text is shortened to **240 characters**. Include at most **two explicitly indexed ancestors**, with labels shortened to **120 characters**. Original request and source records remain intact. | `_text`, `window_candidates`, and `control_candidates` in `src/pipeline.py`; no CLI setting. |
-| Jev HTTP timeout and retries | **30-second timeout configuration**, with **zero automatic retries**. This is HTTP timeout configuration, not a total run deadline. | Client construction in `src/main.py`; no CLI setting. |
-| HTTP connection lifetime | One HTTP client is reused throughout a CLI run, then closed. Separate CLI runs start a new client. The installed HTTP library defaults to **five seconds of idle connection retention**, so the same client can need a new connection after a longer idle period. | Client lifetime in `src/main.py`; inherited `httpx2` connection-pool defaults; no CLI setting. |
-| CUA request timeout and read retry | **60-second deadline per transport attempt**, including lazy MCP startup/handshake when needed. Window discovery and state reads reconnect and retry once after connection loss, timeout, or an unavailable daemon. The retry gets a fresh deadline, so a complete read can exceed 60 seconds. Clicks and foreground activations are never replayed automatically. | `CuaDriver(timeout=...)` and its persistent `McpTransport`; no CLI setting. |
-| Selection grouping and batching | Up to **ten candidates per group**; control/evidence questions also include `none` for at most eleven options. Exactly **one API call per selection round** contains all group questions plus any final-round timing/confirmation questions. | `GROUP_SIZE` and selection flow in `src/selection.py`; required by the workflow. |
-| Settling-time choices | Only **50, 100, 200, 300, 400, or 500 ms** can be scheduled after the click. `<50ms` maps to 50 and `>500ms` maps to 500. This increment does not add another wait after verification fails. | `SETTLING_MS` in `src/selection.py`; no CLI setting. |
-| Model pin | Require **`jev-1.13.0`**, including the model identity returned by the service. | `PINNED_MODEL` and selector validation; CLI verifies the project configuration matches. This is an explicit project requirement. |
-| Available actions | Clicks and foreground activation are wired. Typing, scrolling, keyboard shortcuts, and Start Menu execution are not implemented. Synthetic Start Menu/Search targets return `no_action`. | Existing pipeline/driver integration; these are capability gaps, not Jev limits. |
-| Continuation and recovery | Stop after verifying one action. No overall-completion/window-switch routing, additional waits, automatic action retry, or coordinate fallback; no general planner, durable memory, advanced loading detection, or recovery framework. | Current pipeline scope. |
-
-The application also validates identities and response structure before using
-them. These checks are safeguards, not confidence thresholds:
-
-| Validation | Current behavior |
+| Restriction | Current behavior |
 | --- | --- |
-| Observation and target identity | Control selection needs structured indexed controls and a snapshot identity. Clear old targets before reading again. Native clicks require the observed window identity and either an element token or an element index with its snapshot ID. After connection loss, a fresh snapshot must establish the click target. Stale-target failures are surfaced without retry. |
-| Jev answer structure | Require exactly the requested question keys, Choice answers, known option labels, and matching probability labels. Probabilities and confidence must be finite numbers from 0 to 1; each question's probability total must be **0.97–1.03 inclusive**. Token usage must contain nonnegative integer counts. Invalid responses stop the run. |
-| Confidence/probability gating | **None.** Structurally valid answers are accepted without a minimum confidence or winning-probability threshold; the application uses Jev's returned choice. |
+| Accessibility size | Default 5,000 elements and depth 25; positive `--max-elements` and `--max-depth` overrides. Coverage may be partial. |
+| Description size | App/title/control text capped at 240 characters; up to two indexed ancestors with 120-character labels. Original request and source records remain intact. |
+| Jev timeout/retries | 30-second HTTP timeout configuration, zero automatic retries; not a total run deadline. |
+| CUA timeout/retries | 60-second deadline per transport attempt including lazy startup; reads may reconnect/retry once, actions are not replayed. |
+| Batching | Up to 10 candidates per group; at most 400 control candidates per call; window rounds use one call; timers only in final control call. |
+| Settling | One 50–500 ms scheduled wait after a control click when another iteration follows; no settling wait on the Windows Search route. |
+| Iterations | Positive bound, default 10; no automatic completion judgment. |
+| Model | Exact pin `jev-1.13.0`, validated on every response. |
+| Action scope | Observed control clicks and direct Windows Search activation/text entry; no coordinate fallback, automatic action retry, or general recovery planner. |
+| Response validation | Exact question/option labels; Choice answers; finite probabilities/confidence in [0, 1]; totals 0.97–1.03; nonnegative integer token counts. |
+| Confidence gating | None; returned choices advance directly without ranking across groups or thresholds. |
 
-There is **no local token cap, request-byte cap, configurable maximum iteration
-count, or total runtime cap**. The workflow currently stops after one action's
-verification and offers only the one settling wait described above. The former
-**48,000-byte packing heuristic was removed**. The application neither estimates
-tokens from bytes nor splits a selection round to fit a locally invented limit.
+Controls require structured indexed observations and snapshot identities. Clicks
+use an observed element token or an element index with its snapshot ID. Old
+targets are cleared before new observation; stale failures are not replayed.
 
-Jev itself limits a request to **64k tokens for shared state plus all questions**
-and **32k tokens for shared state plus the longest question**. Those are service
-limits, not restrictions added by this application; a request can fail either
-check. They apply to control and evidence selection alike.
-See the [TypeSafe model documentation](https://docs.typesafe.ai/models).
+There is no local token cap, byte-packing heuristic, or total runtime cap.
+Provider limits apply to shared state plus questions; see
+[TypeSafe model documentation](https://docs.typesafe.ai/models). Observation and
+text bounds and the 400-candidate cap do not guarantee a batch fits those limits.
 
-Verification distributes fresh control descriptions across evidence group
-questions; shared state contains neither a previous nor current full control
-list. The observation-size and text-shortening bounds above still do **not**
-guarantee that every round fits Jev's limits. There is no local token-budget check
-or arbitrary byte cutoff before sending it.
+## Timing and reporting
 
-## Timing boundaries
+Capture monotonic boundaries for startup, discovery, candidate preparation, each
+selection stage/round, foreground activation, control acquisition, native action,
+settling, and cleanup. UTC timestamps add wall-clock context. Nested spans overlap;
+do not add parent and child durations. The report identifies its timing origin.
 
-Use one high-resolution monotonic clock, such as `perf_counter_ns()`, for elapsed
-time. Capture the actual start and finish of each operation and calculate the
-difference. Report durations in milliseconds. UTC timestamps provide date/time
-context; they are not the clock used to calculate durations.
+API duration begins immediately before transport receives the prepared request
+and ends when the complete response body arrives. It includes transport, network,
+and service work; it excludes request construction and response decoding. It is
+client-observed duration, not isolated inference time. All questions in a batch
+share that call's duration. Each round retains an `api_calls` list, including
+single-call rounds, with separate answers, usage, and timing references per call.
 
-### Jev API call duration
+Each cycle retains iteration, selections, native results, rounds, and route.
+Windows Search records both `hotkey` and `type_text` action events and timings
+under that iteration. The final action and exact query remain in `last_action`;
+there are no control-selection rounds or fake control records for this route.
+Correlate repeated round names with `(iteration, round_id)` and span/request IDs.
+Retain the original request, question text, all probabilities, timer answers,
+consumed timer, requested wait, and measured durations. No evidence rounds or
+confirmation traces are generated.
 
-This is the primary measurement of how long we wait for a Jev API call:
-
-```text
-Build groups and questions
-Prepare and encode the complete HTTP request
-    START API TIMER: immediately before handing the prepared request to transport
-    Send request -> Jev processes request -> receive complete response body
-    STOP API TIMER: immediately after the full response body has been received
-Decode and validate the response; advance group winners
-```
-
-This duration includes client transport work, connection setup when needed,
-network travel, service waiting/processing, and response transfer. It excludes
-constructing groups, encoding the request, decoding/validating the response after
-receipt, and generating or writing the report. Receiving response headers alone
-does not end the timer.
-
-Do not perform report formatting, full-history copying, or file I/O between these
-boundaries. Capture the end timestamp before processing the received body for
-reporting. Any necessary in-memory recording must remain lightweight; timing
-instrumentation is not assumed to have literally zero cost.
-
-This is **client-observed API call duration**, not isolated model inference time.
-Only server-provided timing could separate Jev's internal processing from network
-and other service overhead. If such timing becomes available, label it separately.
-Do not infer it by subtracting unrelated stage durations.
-
-All group questions in a round share this one API call duration. There is no
-measured duration for each individual group question. Do not divide the call time
-by the number of questions and present that as per-question latency.
-
-### Other durations to record
-
-| Measurement | Start | Finish |
-| --- | --- | --- |
-| Startup and initialization | Earliest recorded application boundary | Configuration, request, driver, and API client are ready |
-| Window discovery | Before calling the window-discovery adapter | Discovery call returns |
-| Candidate preparation | Before constructing candidates from the observation | Candidate descriptions are ready |
-| Window selection | Before the first window round | Final window winner is available |
-| Foreground activation | Before calling the activation adapter | Activation call returns |
-| Control acquisition | Before calling the accessibility-observation adapter | Observation call returns |
-| Control selection | Before the first control round | Final control winner is available |
-| Evidence selection | Before the first evidence round | Final evidence selection and action confirmation are available, or no evidence remains |
-| Each selection round | Before forming that round's groups/questions | Its single API response has been processed and winners are ready |
-| Request preparation | Before building/encoding the round's API request | Complete request is ready for transport |
-| Jev API call | Immediately before transport dispatch | Complete response body received |
-| Response processing | After response receipt, before decoding/validation | Validated choices and advancing winners are ready |
-| Action preparation | Before mapping the selected control to native arguments | Arguments are ready for dispatch |
-| Native action | Immediately before invoking the action adapter | Adapter returns the action result |
-| Settling wait | After the native action returns | The selected sleep returns, before fresh observation |
-| Driver cleanup | Before closing this request's persistent MCP client | Client cleanup finishes; the shared daemon remains running |
-| Total operational run | Earliest recorded application boundary | Operational result and normal client cleanup are complete, before report generation |
-| Report generation and writing | After the operational run, before constructing the final JSON | The single final report write completes |
-
-The report must state its timing origin. The current earliest application boundary
-is after importing the clock in the Python entry module; it excludes process
-launch, interpreter initialization, and work before that boundary. An invocation
-of an already-imported function must identify its different origin.
-
-Record time to first Jev API call from that same origin to the first actual
-transport-dispatch boundary. Record the total operational run directly from its
-start and finish; do not reconstruct it by adding nested durations.
-
-A round includes its request preparation, API call, and response processing. A
-selection stage includes its rounds. These durations overlap: do not add parents
-and children together. Optional SDK-call timings, if retained, must be labeled
-as SDK time and must not replace the API measurement defined above.
-
-Native action timing ends when the adapter returns. It does not measure when the
-screen finishes changing or when the target application is ready for another
-action. Stages that do not occur should be marked as skipped or absent, not as
-completed work with a fabricated zero duration.
-
-## Collect during the run; create the report at the end
-
-During execution, retain timestamps and the data needed for the report in memory.
-Preserve event data against later mutation without repeatedly copying or parsing
-the accumulated history. Retain actual request/response payloads efficiently so
-they can be included in the final report.
-
-There must be no per-event report-file writes, repeated serialization of the
-entire history, JSON round-trips of the entire history, or per-event flush/fsync
-and file replacement. This applies inside HTTP hooks as well as stage timers.
-
-After the operational end timestamp is captured, construct the report from the
-collected records, serialize it, and write it once. Reuse the existing report
-format and correlation identities rather than adding a parallel reporting API
-or near-identical data model.
-
-The completed report must make it easy to see:
-
-- The original request, pinned model, final window/control selection, and action
-  result where an action ran.
-- Total operational duration, time to first API call, and each stage's duration.
-- Every round's candidate count, group count, whole-round duration, and single
-  API call duration.
-- Every group's candidates, exact question, returned probabilities, selected
-  winner, and separately reported confidence where available.
-- Every control finalist's timing question and answer, the consumed winning
-  timing, iteration number, route, and actual settling-wait duration.
-- Evidence rounds, including `none` probabilities, the final confirmation question
-  and answer, and the `action_verification` result with `last_control` status.
-- The recorded start/finish boundaries connecting these durations and events.
-
-Selection round names can repeat in later passes. Correlate them using
-`(iteration, round_id)` and span/request identities, never `round_id` alone.
-
-Report generation and writing happen after the operational run and must be
-measured separately. Their complete duration is only known after the file write
-finishes; it can be returned through the existing final result/stdout. Do not
-rewrite the report to insert the duration of its own completed write. A complete
-through-report duration can likewise be reported there with its boundary stated.
-
-An abrupt process termination can lose the in-memory records. This is a tradeoff
-of end-of-run reporting, not a reason to reintroduce synchronous disk writes into
-the measured workflow. This document does not request additional failure-handling
-or recovery mechanisms.
+Collect data in memory, then construct and write the report once after the
+operational result and cleanup. Do not copy/serialize accumulated history per
+event. Measure report generation/writing separately and return completed write
+duration on stdout rather than rewriting the report. Abrupt termination can lose
+in-memory records. See [reading run timings](timing.md) for exact boundaries.

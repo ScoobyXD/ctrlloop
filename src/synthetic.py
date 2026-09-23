@@ -69,48 +69,22 @@ class SyntheticRegistry:
         )
 
 
-START_MENU_KEY = "start_menu"
-START_MENU_SEARCH_KEY = "start_menu_search"
-START_MENU_APP = "StartMenuExperienceHost.exe"
+WINDOWS_SEARCH_KEY = "windows_search"
 
 
-def _matches_start(window: Mapping[str, Any]) -> bool:
-    return (
-        window.get("app_name", "").casefold() == START_MENU_APP.casefold()
-        and window.get("title") == "Start"
-    )
-
-
-START_MENU = SyntheticWindow(
+WINDOWS_SEARCH = SyntheticWindow(
     window=Candidate(
-        START_MENU_KEY,
+        WINDOWS_SEARCH_KEY,
         {
-            "title": "Start Menu",
-            "purpose": "Search Windows for apps, settings, and documents, including apps that are not open.",
+            "title": "Windows Search",
+            "purpose": "Open Windows Search and type the supplied text to find apps, settings, and documents. Select a real Search window to use existing results.",
         },
         {
-            "app_name": START_MENU_APP,
-            "title": "Start Menu",
-            "target": "windows_start_menu",
+            "title": "Windows Search",
+            "target": WINDOWS_SEARCH_KEY,
         },
     ),
-    controls=(Candidate(
-        START_MENU_SEARCH_KEY,
-        {
-            "role": "Edit",
-            "label": "Search",
-            "input_type": "text",
-            "purpose": "Type a query to search Windows for apps, settings, and documents.",
-        },
-        {
-            "role": "Edit",
-            "label": "Search",
-            "input_type": "text",
-            "actions": ["type_text"],
-            "target": "windows_start_menu_search",
-        },
-    ),),
-    matches_observed=_matches_start,
+    controls=(),
 )
 
-DEFAULT_REGISTRY = SyntheticRegistry((START_MENU,))
+DEFAULT_REGISTRY = SyntheticRegistry((WINDOWS_SEARCH,))
