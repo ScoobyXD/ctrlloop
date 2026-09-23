@@ -58,6 +58,10 @@ def _failure(tool: str, exit_code: int | None, diagnostic: str) -> DriverError:
         code, reason = "stale_element_token", "CUA rejected the stale snapshot target; no retry was attempted."
     elif "snapshot_id_required" in text:
         code, reason = "snapshot_id_required", "CUA requires the observed snapshot identity for this target."
+    elif "direct_accessibility_unsupported" in text:
+        code, reason = "direct_accessibility_unsupported", "The selected target or gesture does not support direct Windows accessibility activation; synthetic clicking is disabled."
+    elif "direct_accessibility_failed" in text:
+        code, reason = "direct_accessibility_failed", "Windows accessibility activation failed; no synthetic click fallback was attempted."
     elif "background_unavailable" in text:
         code, reason = "background_unavailable", "CUA refused background delivery; no escalation was attempted."
     elif "window_minimized" in text:
@@ -159,6 +163,7 @@ class CuaDriver:
         max_depth: int = 25,
         *,
         transport: Any = None,
+        socket: str | None = None,
     ) -> None:
         if executable is not None and (not isinstance(executable, str) or not executable):
             raise ValueError("executable must be a nonempty string")
@@ -166,6 +171,8 @@ class CuaDriver:
             raise ValueError("timeout must be a positive finite number")
         if not _integer(max_elements, 1) or not _integer(max_depth, 1):
             raise ValueError("max_elements and max_depth must be positive integers")
+        if socket is not None and (not isinstance(socket, str) or not socket.strip()):
+            raise ValueError("socket must be a nonempty string")
         self.executable = executable or _default_executable()
         self.timeout = timeout
         self.max_elements = max_elements
@@ -177,7 +184,9 @@ class CuaDriver:
                 from .cua_mcp import McpTransport
             else:
                 from cua_mcp import McpTransport
-            transport = McpTransport(self.executable, self.timeout)
+            transport = McpTransport(
+                self.executable, self.timeout, **({"socket": socket} if socket is not None else {}),
+            )
         self._transport = transport
         self._closed = False
         self._recovery_required = False
@@ -302,14 +311,24 @@ class CuaDriver:
         return payload
 
     def click(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        """Dispatch native element-target arguments once; never retry or observe.
+        """Activate the native snapshot target through Windows accessibility.
 
         The caller must use the selected control from its pre-action snapshot.
         The daemon rejects superseded tokens, including changes made by other
         clients. A timeout or unreadable response leaves delivery unknown.
+        Unsupported targets fail without synthetic clicking. Successful dispatch
+        is not proof of an application effect; the native effect stays intact.
         """
         self._validate_element_input("click", arguments, set())
-        return self._input_action("click", arguments)
+        payload = self._input_action("click", {**arguments, "route": "accessibility"})
+        if payload["route"] != "accessibility":
+            error = DriverError(
+                "CUA reported a click route other than Windows accessibility; inspect the application before further action.",
+                code="direct_accessibility_failed", tool="click",
+            )
+            error.context["action_result"] = payload
+            raise error
+        return payload
 
     def _validate_element_input(
         self, tool: str, arguments: Mapping[str, Any], fields: set[str],

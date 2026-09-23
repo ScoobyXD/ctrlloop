@@ -1,0 +1,211 @@
+{
+  "date": "2026-09-23",
+  "branch": "codex/3-direct-accessibility-only",
+  "upstream_commit": "fc188250b4ca8549b8e61f937fdb1fb560770e86",
+  "driver_version": "0.28.2",
+  "live_binary_sha256": "95F7DCBA263146FA0EFF551CEC945DAC74EA4DAB0CFAF69A3407BD70EB13BAEA",
+  "final_binary_sha256": "8DAAC87AE75FFDC39E92459147083B05A50EFE8E4ACCF67B23F0CF375679F5E4",
+  "final_delta": "Click schema descriptions only; activation implementation unchanged. Final release recompiled and descriptions inspected.",
+  "isolated_pipe": "\\\\.\\pipe\\ctrlloop-direct-accessibility",
+  "runtime_pid": 54108,
+  "runtime_session_id": 1,
+  "runtime_stopped": true,
+  "shared_runtime_pid_unchanged": 41472,
+  "shared_binary_sha256_unchanged": "26939A4382ECD63619C83BEEAA43FC76F9D4C823CC5CF0159A2FCBC6930BFB3C",
+  "build_seconds": {
+    "initial_release": 121,
+    "final_release": 41.36,
+    "final_idempotent_rebuild": 0.58
+  },
+  "old_daemon_gate": {
+    "read_succeeded": true,
+    "click_error_code": "direct_accessibility_unsupported",
+    "click_requests_sent": 0
+  },
+  "offscreen_target": {
+    "frame": {
+      "h": 18,
+      "w": 133,
+      "x": 263,
+      "y": 28323
+    },
+    "window_bounds": {
+      "height": 566,
+      "width": 731,
+      "x": 238,
+      "y": -1400
+    }
+  },
+  "operations": [
+    {
+      "operation": "UIA Invoke on page button",
+      "timestamp": "2026-09-23T17:00:56.616681+00:00",
+      "elapsed_ms": 9.53,
+      "action_result": {
+        "delivery": {
+          "mode": "background"
+        },
+        "effect": "unverifiable",
+        "route": "accessibility"
+      },
+      "observed_effect": "Fresh UIA text changed from Activation count 0 to Activation count 1.",
+      "foreground_before": 263232,
+      "foreground_after": 263232
+    },
+    {
+      "operation": "UIA Toggle on page checkbox",
+      "timestamp": "2026-09-23T17:01:06.803008+00:00",
+      "elapsed_ms": 9.92,
+      "action_result": {
+        "delivery": {
+          "mode": "background"
+        },
+        "effect": "unverifiable",
+        "route": "accessibility"
+      },
+      "observed_effect": "Fresh UIA checkbox selected=true and text Checkbox enabled.",
+      "foreground_before": 263232,
+      "foreground_after": 263232
+    },
+    {
+      "operation": "Static text without activation pattern",
+      "timestamp": "2026-09-23T17:01:25.874678+00:00",
+      "elapsed_ms": 3.9,
+      "action_result": {
+        "code": "direct_accessibility_unsupported",
+        "effect": "refused",
+        "message": "The element exposes no supported direct accessibility activation; synthetic mouse fallback is disabled."
+      },
+      "observed_effect": "Refused; no supported pattern.",
+      "foreground_before": 331622,
+      "foreground_after": 331622
+    },
+    {
+      "operation": "UIA Invoke on offscreen link in occluded Chrome window",
+      "timestamp": "2026-09-23T17:05:54.286432+00:00",
+      "elapsed_ms": 50.71,
+      "action_result": {
+        "delivery": {
+          "mode": "background"
+        },
+        "effect": "unverifiable",
+        "route": "accessibility"
+      },
+      "observed_effect": "Fresh native URL 127.0.0.1:8769/activated.html; subsequent native title Offscreen activation succeeded. Browser remained below covering window in before/after z-order.",
+      "foreground_before": 38996008,
+      "foreground_after": 38996008
+    },
+    {
+      "operation": "UIA ExpandCollapse on Chrome menu",
+      "timestamp": "2026-09-23T17:08:30.503799+00:00",
+      "elapsed_ms": 4332.38,
+      "action_result": {
+        "delivery": {
+          "mode": "background"
+        },
+        "effect": "unverifiable",
+        "route": "accessibility"
+      },
+      "observed_effect": "Fresh native tree exposed menu items including New tab and Settings.",
+      "foreground_before": 263232,
+      "foreground_after": 263232
+    },
+    {
+      "operation": "UIA Invoke on New tab menu item",
+      "timestamp": "2026-09-23T17:08:59.005299+00:00",
+      "elapsed_ms": 1495.67,
+      "action_result": {
+        "code": "direct_accessibility_failed",
+        "effect": "unverifiable",
+        "message": "Direct accessibility Invoke failed: 0x80040200; effect unknown, no fallback attempted."
+      },
+      "observed_effect": "Provider returned 0x80040200; driver reported failure without fallback. Fresh snapshot still had only the original tab.",
+      "foreground_before": 263232,
+      "foreground_after": 263232
+    },
+    {
+      "operation": "Coordinate click",
+      "timestamp": "2026-09-23T17:06:12.962872+00:00",
+      "elapsed_ms": 1.32,
+      "action_result": {
+        "code": "direct_accessibility_unsupported",
+        "effect": "refused",
+        "message": "Only direct Windows accessibility activation of a snapshot element is supported; synthetic mouse gestures are disabled."
+      },
+      "observed_effect": "Refused before native activation or mouse input.",
+      "foreground_before": 38996008,
+      "foreground_after": 38996008
+    },
+    {
+      "operation": "Double click",
+      "timestamp": "2026-09-23T17:06:12.971556+00:00",
+      "elapsed_ms": 0.92,
+      "action_result": {
+        "code": "direct_accessibility_unsupported",
+        "effect": "refused",
+        "message": "This mouse gesture has no supported direct accessibility action; synthetic mouse clicking is disabled."
+      },
+      "observed_effect": "Refused before native activation or mouse input.",
+      "foreground_before": 38996008,
+      "foreground_after": 38996008
+    },
+    {
+      "operation": "Right click",
+      "timestamp": "2026-09-23T17:06:12.975551+00:00",
+      "elapsed_ms": 1.08,
+      "action_result": {
+        "code": "direct_accessibility_unsupported",
+        "effect": "refused",
+        "message": "This mouse gesture has no supported direct accessibility action; synthetic mouse clicking is disabled."
+      },
+      "observed_effect": "Refused before native activation or mouse input.",
+      "foreground_before": 38996008,
+      "foreground_after": 38996008
+    },
+    {
+      "operation": "Foreground click",
+      "timestamp": "2026-09-23T17:07:11.743173+00:00",
+      "elapsed_ms": 1.93,
+      "action_result": {
+        "code": "direct_accessibility_unsupported",
+        "effect": "refused",
+        "message": "Only direct Windows accessibility activation of a snapshot element is supported; synthetic mouse gestures are disabled."
+      },
+      "observed_effect": "Refused before native activation or mouse input.",
+      "foreground_before": 38996008,
+      "foreground_after": 38996008
+    },
+    {
+      "operation": "Modifier click",
+      "timestamp": "2026-09-23T17:07:11.750170+00:00",
+      "elapsed_ms": 1.2,
+      "action_result": {
+        "code": "direct_accessibility_unsupported",
+        "effect": "refused",
+        "message": "Only direct Windows accessibility activation of a snapshot element is supported; synthetic mouse gestures are disabled."
+      },
+      "observed_effect": "Refused before native activation or mouse input.",
+      "foreground_before": 38996008,
+      "foreground_after": 38996008
+    },
+    {
+      "operation": "Repeated click",
+      "timestamp": "2026-09-23T17:07:11.758174+00:00",
+      "elapsed_ms": 1.42,
+      "action_result": {
+        "code": "direct_accessibility_unsupported",
+        "effect": "refused",
+        "message": "Only direct Windows accessibility activation of a snapshot element is supported; synthetic mouse gestures are disabled."
+      },
+      "observed_effect": "Refused before native activation or mouse input.",
+      "foreground_before": 38996008,
+      "foreground_after": 38996008
+    }
+  ],
+  "limitations": [
+    "Foreground/z-order sampled before and after actions only; no claim about transient focus changes or all applications.",
+    "MSAA default action and SelectionItem-only activation compiled/source-reviewed but not exercised live.",
+    "CNN loaded title/DOM but blank native page with no Tech candidate; CNN Tech navigation was not attempted or verified.",
+    "No Jev API calls or automated tests were run. Live requests used selected native snapshot tokens."
+  ]
+}

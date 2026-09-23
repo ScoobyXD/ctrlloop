@@ -22,11 +22,17 @@ taking the control snapshot, regardless of its minimized state.
 Activation failures stop the run; native results are retained in the report.
 
 Selection retains identities in Python. Click and targeted text execution use the control's
-existing snapshot-bound target and CUA's default background delivery. The loop
+existing snapshot-bound target. Clicks require direct Windows accessibility
+activation; synthetic mouse clicking is disabled. The patched driver uses UIA
+Invoke, Toggle, SelectionItem.Select, ExpandCollapse.Expand, or an MSAA default
+action when supported. Unsupported targets fail without a mouse or browser click
+fallback. Accessibility providers can change focus, and dispatch alone does not
+prove the requested effect. See [direct accessibility behavior and setup](docs/cua-driver/direct-accessibility-only.md).
+The loop
 uses the same generic question for every window and control selection round;
 every group selects a supplied candidate. It does not add automatic click escalation,
 coordinate fallback, additional waits, or action retries. Targeted text entry
-uses CUA's existing `type_text` operation. Its pinned Windows UIA path appends to
+uses CUA's existing `type_text` operation and default background delivery. Its pinned Windows UIA path appends to
 the existing value; it does not implement replacement or caret insertion.
 
 The synthetic Windows Search opener is available when fresh discovery has no
@@ -139,25 +145,41 @@ stderr; results are JSON on stdout. Reports include the request and observed
 UI metadata described below. Authentication headers and API keys are not recorded.
 
 CUA Driver 0.28.2 must already be installed with its daemon running on the
-interactive Windows desktop. The adapter finds `cua-driver` on PATH or in its
+interactive Windows desktop. Clicks require the [ctrlloop direct-accessibility patch](docs/cua-driver/direct-accessibility-only.md)
+in that daemon. Before the first click on each connection, the adapter checks the
+daemon's advertised `click` schema for `route: "accessibility"` as its only route
+and default, then sends that route explicitly. An unpatched daemon is rejected
+before click dispatch. Reads, text entry, and hotkeys remain available.
+The adapter finds `cua-driver` on PATH or in its
 default Windows install directory; `--driver <path>` overrides the executable.
+`--driver-socket <named-pipe>` selects an already-running isolated daemon;
+omitting it retains `\\.\pipe\cua-driver`. Choosing a different executable alone
+does not change which daemon handles the actions.
 Each user request owns one persistent MCP client connected explicitly to the
 existing daemon. The client starts lazily on the first CUA call, is reused across
 every loop iteration, and closes on completion, error, or interruption. A later
 request gets its own client even if its wording is identical. It does not start
 or stop the daemon. See [driver setup](docs/CUA_DRIVER.md).
+
+After starting the patched daemon on the dedicated pipe described in the
+[isolated runtime instructions](docs/cua-driver/direct-accessibility-only.md), run:
+
+```powershell
+uv run --locked python src/main.py 'Click the Test button in my test window.' `
+    --driver .\.local\cua-driver\bin\cua-driver.exe `
+    --driver-socket '\\.\pipe\ctrlloop-direct-accessibility'
+```
+
 The CUA MCP client process receives `CUA_DRIVER_RS_TELEMETRY_ENABLED=0`, so the
 adapter keeps telemetry off even if the saved setting or parent environment
 enables it. This avoids the Windows telemetry worker delaying client shutdown.
 
 At connection startup (and reconnect), the client sets its session cursor's
-`glide_duration_ms` to **10 ms** with CUA's `set_agent_cursor_motion`. The cursor
-stays visible. Windows CUA 0.28.2 otherwise uses a distance-dependent animation
-and waits for the renderer before clicking, which can make later clicks take
-seconds even when the first click is fast. The setting affects this connection
-only; 10 ms bounds the glide wait, not the complete native action. Setting it
-to zero would restore the slower default. Setup shares the first call's timeout
-and must be acknowledged before the requested call is sent.
+`glide_duration_ms` to **1 ms** with CUA's `set_agent_cursor_motion`. The cursor
+stays visible. The setting affects this connection only and does not bound the
+complete native action. Setting it to zero would restore CUA's distance-dependent
+animation. Setup shares the first call's timeout and must be acknowledged before
+the requested call is sent.
 
 There are no background health checks. EOF, transport errors and bounded request
 timeouts detect a lost connection. Each transport attempt has a 60-second default
@@ -233,6 +255,9 @@ Inspect `action_result.effect`, `route`, and any `delivery`, `evidence`, or `esc
 For clicks, effects such as `unverifiable` and `suspected_noop` remain action facts, followed
 by fresh observation and next-action selection when another iteration remains;
 native refusals and failures return `error`/exit 1.
+`direct_accessibility_unsupported` means the daemon lacks the required contract,
+or the target/gesture has no supported direct activation. `direct_accessibility_failed`
+means direct activation failed or the driver returned a prohibited route.
 A targeted text action continues only after CUA reports a confirmed effect.
 Otherwise the run stops with `observation_unavailable`, retaining the native facts
 without automatically typing the same text again. This does not assess task
@@ -491,6 +516,10 @@ window's `pid`/`window_id` and the original `element_token`, or the matching
 confirmed targeted text entry, the loop waits and observes again for the next
 selection when another iteration remains. Text entry preserves native readback
 facts and does not add a separate Jev verification call.
+The patched click operation accepts a single left activation of a snapshot target.
+Coordinate, desktop, foreground-delivery, modified, multi-click, right-click, and
+middle-click requests are unsupported. It does not send posted mouse messages,
+SendInput mouse clicks, browser mouse events, or JavaScript DOM clicks.
 
 Each real control selection comes from one fresh snapshot. The synthetic Windows
 Search branch takes no control snapshot; its synthetic destination metadata does
@@ -516,13 +545,14 @@ new candidates from its fresh observation.
 Exported report handles are historical evidence, not permanent UI identifiers or
 authorization to replay an action. See the [versioned cache contract](docs/cua-driver/0.28.2/README.md#7-click-execution-contract).
 
-A host smoke test with the production adapter used a disposable, nonactivating
+A historical host smoke test, before the direct-only patch, used a disposable, nonactivating
 WinForms Test button. Separate `list_windows`, `get_window_state`, and `click`
 calls produced exactly one button callback and no post-action driver reads;
 the fixture then exited. CUA returned `effect: "unverifiable"`,
-`route: "accessibility"`, and background delivery. This confirms the isolated
-click path. The sandbox separately returned `pipe_access_denied`; host execution
-could reach the existing daemon.
+`route: "accessibility"`, and background delivery. That result confirmed this
+one button's click path; it did not establish direct-only behavior for Chromium
+or other controls. See the [direct-only validation record](docs/cua-driver/direct-accessibility-only.md)
+for the current change. The shared installed runtime was not changed by this work.
 
 Implementation references: [TypeSafe Python usage](https://docs.typesafe.ai/sdk/python/usage),
 [Choice](https://docs.typesafe.ai/primitives/choice),

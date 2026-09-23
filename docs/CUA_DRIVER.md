@@ -7,6 +7,12 @@ and native input tools. ctrlloop connects Jev's selected controls to native clic
 and its synthetic Windows Search destination to desktop Win+S followed directly
 by text entry, through one persistent MCP adapter.
 
+ctrlloop now requires [direct Windows accessibility activation for clicks](cua-driver/direct-accessibility-only.md).
+The connected daemon must contain that patch; its `0.28.2` version string alone
+is insufficient. The shared installation described below remains unchanged by
+this work. The versioned contract and original verification samples document
+that earlier runtime.
+
 ## Exact interface reference
 
 Read the [versioned Windows input/output contract](cua-driver/0.28.2/README.md). It includes:
@@ -125,6 +131,26 @@ Each original user request now uses one persistent MCP client, connected with
 operations and loop iterations share that client. It closes on normal completion,
 error or interruption; the daemon stays running. A new request receives a new
 client. Python callers should scope `CuaDriver()` with a context manager.
+The `--driver-socket` CLI option, or `CuaDriver(socket=...)` in Python, selects a
+different already-running daemon pipe. The default remains `\\.\pipe\cua-driver`.
+`--driver` selects the client executable; both options are needed to use an
+isolated patched build without replacing the shared runtime:
+
+```powershell
+uv run --locked python src/main.py 'Click the Test button in my test window.' `
+    --driver .\.local\cua-driver\bin\cua-driver.exe `
+    --driver-socket '\\.\pipe\ctrlloop-direct-accessibility'
+```
+
+Start that dedicated daemon first using the [isolated runtime instructions](cua-driver/direct-accessibility-only.md).
+
+Before the first click on each connection, the adapter reads `tools/list` and
+requires the daemon's `click` schema to advertise `route: "accessibility"` as
+the sole route and default. Each click sends it explicitly and only accepts an
+accessibility result. A daemon without this contract returns
+`direct_accessibility_unsupported` before any click is sent. This check does not
+disable observations, text entry, or hotkeys. Use the [patched build and isolated
+runtime instructions](cua-driver/direct-accessibility-only.md) to enable clicks.
 
 No periodic health polling is used. EOF and request failures/timeouts trigger
 connection disposal. Reads reconnect and retry once. A lost click, activation, hotkey, or text-entry
@@ -152,6 +178,17 @@ settling interval, and captures fresh state. Jev then selects the next action.
 The loop defaults to `--max-iterations 10`, returns `iteration_limit` at that
 bound, and does not assess completion or retry failed actions.
 
+Click dispatch is limited to a single left activation of that snapshot target,
+using UIA Invoke, Toggle, SelectionItem.Select, ExpandCollapse.Expand, or an MSAA
+default action. Targets without a supported action and coordinate, desktop,
+foreground-delivery, modified, multi-click, right-click, or middle-click gestures
+return a clear unsupported result. Activation failures return
+`direct_accessibility_failed`. There is no fallback to posted mouse messages,
+SendInput mouse clicks, browser mouse events, or JavaScript DOM clicks.
+An accessibility provider may raise or focus its window; direct activation does
+not guarantee background preservation. The pipeline's existing explicit
+`bring_to_front` step also remains in place.
+
 If the synthetic Windows Search window wins, its activation stage instead sends
 `hotkey({scope: "desktop", keys: ["win", "s"]})` and directly follows it with
 `type_text({scope: "desktop", text: <exact supplied text>})`. There is no
@@ -176,14 +213,16 @@ again to select the next action. `iteration_limit`/exit 2 does not establish com
 Native failures retain their diagnostic payload and return `error`/exit 1.
 See [full CLI status and report details](../README.md#run).
 
-The standard daemon supports routine native clicks. A shell denied access to
-`\\.\pipe\cua-driver` cannot test them from that execution context; this is
-separate from whether the installed daemon has click support. Do not restart or
+The standard unpatched daemon can send synthetic mouse input for element-target
+clicks, so ctrlloop refuses to use it for clicking. A shell denied access to
+`\\.\pipe\cua-driver` also cannot reach it from that execution context; this is
+a separate transport restriction. Do not restart or
 reconfigure the working daemon to resolve a client access restriction. The
 UIAccess helper is an internal worker, not a public alternative endpoint.
 
 ## Verification artifacts
 
+- [Direct accessibility patch, isolated runtime, and validation](cua-driver/direct-accessibility-only.md)
 - [Native Windows-key patch, build, and rollback](cua-driver/windows-key-fix.md)
 - [Runtime verification record](cua-driver/0.28.2/runtime-verification.json)
 - [Native tree from Windows Program Manager](cua-driver/0.28.2/examples/get_window_state.tree.md)
@@ -192,11 +231,13 @@ UIAccess helper is an internal worker, not a public alternative endpoint.
 
 Samples preserve real data structures but replace process/window identifiers and omit unrelated windows/processes. They are documentation examples, not live reusable targets. The verification record describes the redactions and actual observed counts.
 
-The single-click host smoke test used the production adapter with a disposable,
+The historical single-click host smoke test, before the direct-only patch, used a disposable,
 nonactivating WinForms Test button. One discovery, one snapshot, and one click
 ran as separate CLI calls; the button received exactly one callback, there were
 zero post-action driver reads, and the fixture exited. The native result was
 `{"effect":"unverifiable","route":"accessibility","delivery":{"mode":"background"}}`.
+That result established the one button's effect, not a direct-only guarantee for
+every click target. Current patch validation is recorded separately above.
 Its local result is in the ignored `reports/isolated-click-result.json`; it is not
 a replayable target. The sandbox's separate read failed with `pipe_access_denied`,
 while authorized host execution reached the daemon.

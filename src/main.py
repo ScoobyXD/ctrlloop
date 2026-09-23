@@ -45,7 +45,8 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
     parser.add_argument("--request-file", type=Path, help="Read the exact request from a UTF-8 file")
     parser.add_argument("--text", help="Exact Windows Search text override; otherwise select words from the request")
     parser.add_argument("--env-file", type=Path, default=project_dir / ".env")
-    parser.add_argument("--driver", help="Path to the installed cua-driver.exe")
+    parser.add_argument("--driver", help="Path to cua-driver.exe")
+    parser.add_argument("--driver-socket", help=r"Named pipe of an already-running CUA daemon (default: \\.\pipe\cua-driver)")
     parser.add_argument("--max-elements", type=int, default=5000)
     parser.add_argument("--max-depth", type=int, default=25)
     parser.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
@@ -105,7 +106,8 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
                 raise ValueError("TYPESAFE_API_KEY is missing; set it in the environment or --env-file.")
         with report.span("initialization.driver"):
             driver = CuaDriver(
-                executable=args.driver, max_elements=args.max_elements, max_depth=args.max_depth
+                executable=args.driver, max_elements=args.max_elements, max_depth=args.max_depth,
+                socket=args.driver_socket,
             )
         try:
             http_initialization_ns = perf_counter_ns()

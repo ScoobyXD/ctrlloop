@@ -76,15 +76,20 @@ class McpTransport:
 
     def __init__(
         self, executable: str, timeout: float, *, process_factory: Callable | None = None,
+        socket: str = r"\\.\pipe\cua-driver",
     ) -> None:
+        if not isinstance(socket, str) or not socket.strip():
+            raise ValueError("socket must be a nonempty string")
         self.executable = executable
         self.timeout = timeout
+        self.socket = socket
         self._process_factory = process_factory or subprocess.Popen
         self._process: Any = None
         self._responses: queue.Queue | None = None
         self._reader: threading.Thread | None = None
         self._sequence = 0
         self._lock = threading.Lock()
+        self._accessibility_click_supported = False
 
     def call(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         """Return the native CallToolResult without flattening its error envelope."""
@@ -93,6 +98,8 @@ class McpTransport:
             try:
                 if self._process is None:
                     self._connect(deadline)
+                if tool == "click" and not self._accessibility_click_supported:
+                    self._require_accessibility_click(deadline)
                 result = self._request(
                     "tools/call", {"name": tool, "arguments": dict(arguments)}, deadline
                 )
@@ -120,7 +127,7 @@ class McpTransport:
     def _connect(self, deadline: float) -> None:
         try:
             self._process = self._process_factory(
-                [self.executable, "mcp", "--socket", r"\\.\pipe\cua-driver"],
+                [self.executable, "mcp", "--socket", self.socket],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, encoding="utf-8", bufsize=1, shell=False,
                 env={**os.environ, "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0"},
@@ -177,6 +184,32 @@ class McpTransport:
                 f"CUA did not confirm the session's {_CURSOR_GLIDE_MS} ms cursor glide configuration.",
                 code="cursor_configuration_failed",
             )
+
+    def _require_accessibility_click(self, deadline: float) -> None:
+        """Check the connected daemon's native contract before any click.
+
+        A matching executable version does not identify the daemon behind the
+        pipe. Older Windows CUA releases can send mouse input for element tokens,
+        so absence of the direct-only route contract must stop before dispatch.
+        Reads, text entry and hotkeys do not depend on this click capability.
+        """
+        result = self._request("tools/list", {}, deadline)
+        definitions = result.get("tools") if isinstance(result, dict) else None
+        clicks = [item for item in definitions
+                  if isinstance(item, dict) and item.get("name") == "click"] if isinstance(definitions, list) else []
+        schema = clicks[0].get("inputSchema") if len(clicks) == 1 else None
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        route = properties.get("route") if isinstance(properties, dict) else None
+        if (
+            not isinstance(route, dict) or route.get("type") != "string"
+            or route.get("enum") != ["accessibility"]
+            or route.get("default") != "accessibility"
+        ):
+            raise DriverError(
+                "The connected CUA daemon does not advertise direct-only Windows accessibility clicks. Run the ctrlloop patched driver; no click was sent.",
+                code="direct_accessibility_unsupported", tool="click",
+            )
+        self._accessibility_click_supported = True
 
     def _write(self, message: dict[str, Any]) -> None:
         self._process.stdin.write(json.dumps(message, ensure_ascii=False, allow_nan=False) + "\n")
@@ -247,6 +280,7 @@ class McpTransport:
     def _discard(self) -> None:
         process, reader = self._process, self._reader
         self._process = self._responses = self._reader = None
+        self._accessibility_click_supported = False
         if process is None:
             return
         try:
