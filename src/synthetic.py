@@ -70,17 +70,51 @@ class SyntheticRegistry:
 
 
 WINDOWS_SEARCH_KEY = "windows_search"
+WINDOWS_SEARCH_SETTLING_MS = 1000
 
 
-def is_visible_windows_search(window: Mapping[str, Any]) -> bool:
-    """Recognize the live Search destination without replacing its native record."""
+def is_native_windows_search(window: Mapping[str, Any]) -> bool:
+    """Recognize the native Search destination independently of visibility."""
     return (
         not window.get("synthetic")
         and str(window.get("app_name", "")).casefold() == "searchhost.exe"
         and str(window.get("title", "")).casefold() == "search"
+    )
+
+
+def is_visible_windows_search(window: Mapping[str, Any]) -> bool:
+    """Recognize the visible Search destination without replacing its native record."""
+    return (
+        is_native_windows_search(window)
         and window.get("is_on_screen") is True
         and window.get("minimized") is not True
     )
+
+
+def windows_search_app_results(elements: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep observed English Search app results, preserving their native records."""
+    by_index = {element["element_index"]: element for element in elements}
+    suffix = ", App, Press right to view options"
+    results = []
+    for element in elements:
+        parent = by_index.get(element.get("parent_index"))
+        if (
+            element.get("role") != "ListItem"
+            or element.get("enabled") is not True
+            or "invoke" not in (element.get("actions") or ())
+            or parent is None
+            or parent.get("role") != "List"
+            or parent.get("label") != "Results"
+        ):
+            continue
+        label = element.get("label")
+        if not isinstance(label, str) or not label.strip().endswith(suffix):
+            continue
+        # The category is a terminal suffix; app names may themselves contain commas.
+        app_name = label.strip().removesuffix(suffix).removeprefix("Apps Group,").strip()
+        if app_name:
+            results.append(element)
+    return results
 
 
 WINDOWS_SEARCH = SyntheticWindow(
@@ -88,7 +122,7 @@ WINDOWS_SEARCH = SyntheticWindow(
         WINDOWS_SEARCH_KEY,
         {
             "title": "Windows Search",
-            "purpose": "Open Windows Search and type the supplied text to find apps, settings, and documents. Select a real Search window to use existing results.",
+            "purpose": "Open Windows Search and type the supplied text to find installed apps. Select a real Search window to use existing results.",
         },
         {
             "title": "Windows Search",

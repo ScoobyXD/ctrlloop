@@ -10,12 +10,18 @@ if __package__:
     from .driver import DriverError
     from .reporting import RunReport
     from .selection import Candidate, ChoiceSelector, SelectionError
-    from .synthetic import DEFAULT_REGISTRY, WINDOWS_SEARCH_KEY, SyntheticRegistry, is_visible_windows_search
+    from .synthetic import (
+        DEFAULT_REGISTRY, WINDOWS_SEARCH_KEY, WINDOWS_SEARCH_SETTLING_MS,
+        SyntheticRegistry, is_native_windows_search, is_visible_windows_search, windows_search_app_results,
+    )
 else:
     from driver import DriverError
     from reporting import RunReport
     from selection import Candidate, ChoiceSelector, SelectionError
-    from synthetic import DEFAULT_REGISTRY, WINDOWS_SEARCH_KEY, SyntheticRegistry, is_visible_windows_search
+    from synthetic import (
+        DEFAULT_REGISTRY, WINDOWS_SEARCH_KEY, WINDOWS_SEARCH_SETTLING_MS,
+        SyntheticRegistry, is_native_windows_search, is_visible_windows_search, windows_search_app_results,
+    )
 
 
 DEFAULT_MAX_ITERATIONS = 10
@@ -306,6 +312,26 @@ def _observed_controls(result, snapshot, report):
         return None
     with report.span("candidate_preparation", stage="controls") if report is not None else nullcontext({}):
         controls = control_candidates(elements)
+        if is_native_windows_search(result.window):
+            eligible_indices = {
+                element["element_index"] for element in windows_search_app_results(elements)
+            }
+            # Build descriptions from the full observation to retain ancestry
+            # and stable candidate keys, then offer only installed-app rows.
+            controls = [
+                candidate for candidate in controls
+                if candidate.record["element_index"] in eligible_indices
+            ]
+            result.observation["eligible_control_count"] = len(controls)
+            if report is not None:
+                report.append(
+                    "controls_filtered", policy="windows_search_installed_apps",
+                    observed_control_count=len(elements), eligible_control_count=len(controls),
+                )
+            if not controls:
+                result.status = "no_controls"
+                result.reason = "No eligible installed-app result was observed in Windows Search."
+                return None
     return controls
 
 
@@ -477,6 +503,8 @@ def run_pipeline(
     selected; its native identity is then retained for the rest of the run.
     The iteration limit bounds execution; it does not establish task completion.
     Native delivery errors propagate without replaying the attempted action.
+    Windows Search waits one second after query typing before the next read,
+    and its real window offers only observed installed-app results to Jev.
     Nonempty text supplies the first typing operation verbatim on either route.
     It survives clicks and is consumed once typing is dispatched. Missing, empty,
     or consumed text stops the next typing operation with no_action; no text is
@@ -514,11 +542,11 @@ def run_pipeline(
             state["observation"] = {
                 name: value for name, value in result.observation.items()
                 if name not in {"element_count", "total_element_count", "returned_element_count",
-                                "filtered_element_count", "observed_control_count"}
+                                "filtered_element_count", "observed_control_count", "eligible_control_count"}
             }
             if _is_windows_search(result.window):
                 _search_windows(state, result, driver, report, pending_text)
-                settling_ms = None
+                settling_ms = WINDOWS_SEARCH_SETTLING_MS if result.status == "action_returned" else None
             else:
                 settling_ms = _select_and_act(
                     state, controls, driver, selector, result, report,

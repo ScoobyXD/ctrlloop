@@ -2,6 +2,13 @@
 
 [Minimal editable Hermes plugin: setup and exact input/output contract](docs/hermes-plugin.md).
 
+[Background execution requirement](docs/background-execution.md): the agent must
+work while the user keeps using their desktop, including when a separate agent
+workspace viewer is minimized. This is a pending capability; the current loop
+still activates windows and can send foreground input.
+See the [Windows background-agent research](docs/research/windows-background/README.md)
+for the sourced architecture comparison and local feasibility assessment.
+
 The Python pipeline offers discovered desktop windows plus a synthetic
 **Windows Search** option. Jev selects a destination; once it chooses a real window,
 the pipeline retains that window's native identity for the rest of the run. Each iteration
@@ -14,8 +21,9 @@ prepared query. A nonempty `--text` supplies the exact string for the first typi
 operation, including Search. If typing is selected without pending prepared text,
 the run returns `no_action`; Windows Search skips activation too.
 The Win+S-to-typing handoff has no intervening observation,
-confirmation, sleep, control selection, or Jev call. The next iteration observes
-the real search results.
+confirmation, sleep, control selection, or Jev call. After typing returns, the
+loop waits a fixed 1,000 ms before the next observation when another iteration
+is allowed. The final permitted action has no following wait.
 It repeats within an explicit iteration limit; task completion is not assessed.
 The result is JSON containing selected records, observations, action facts,
 iteration history, and selection rounds. The
@@ -50,6 +58,18 @@ window is retained just like any other real window.
 If the opener is selected after the prepared text was consumed, the run stops
 with `no_action` without sending Win+S or typing again. Prepared text belongs to
 one run; a new run can supply another string. Driver errors remain errors.
+
+For an observed Windows Search window, control selection is restricted to
+installed-app results before Jev sees the candidates. Eligible controls are
+enabled, invokable `ListItem` controls whose direct indexed parent is a `List`
+named `Results` and whose native English label ends with
+`, App, Press right to view options`. Search boxes, Store and web
+results, run commands, duplicate buttons, and the separate `Open` action are
+excluded. The original snapshot identities are retained. If no eligible app
+results remain, the run returns `no_controls` without a control-selection call
+or control action. This filter adds no Jev question or repeated readiness polling.
+It recognizes native `SearchHost.exe` / `Search` identity independently of prior
+visibility flags, so it also applies after a Search window is restored.
 
 The Windows Search window record has `synthetic: true` and no invented PID,
 window handle, control, geometry, or snapshot identity. It has no control
@@ -240,7 +260,7 @@ The source modules live directly in `src/` and feed into `src/main.py`:
 - `cua_mcp.py` owns the request's MCP connection, framing, timeouts and client cleanup.
 - [`jev_questions.py`](src/jev_questions.py) holds the authored selection, action, and timer questions.
 - `selection.py` forms groups of at most 50 candidates within the request budget, packs whole questions into HTTP bodies of at most 90,000 bytes, sends a round's calls in parallel, then advances its selected candidates together.
-- `synthetic.py` defines synthetic windows, their controls, and duplicate-matching rules.
+- `synthetic.py` defines synthetic windows, their controls, duplicate-matching rules, and the `windows_search_app_results` filter for observed Search controls.
 - `pipeline.py` retains the first selected real window, refreshes its controls for each click/text action, and supports direct Windows Search actions before a real window is selected.
 - `reporting.py` buffers events and actual Jev HTTP bodies, then saves the report and separate input/output files on a worker at the end.
 - `main.py` provides the CLI, loads configuration, and prints the result.
@@ -280,7 +300,7 @@ it is not automatically attributed to daemon access.
 | `iteration_limit` | Configured action-cycle bound reached; task completion was not assessed | 2 |
 | `no_action` | Prepared text missing, empty, or already used; text target disabled; or custom synthetic control lacks live CUA identifiers | 2 |
 | `no_windows` | No first-stage candidate selected; normally unreachable with the Windows Search option | 2 |
-| `no_controls` | A valid read returned no indexed controls, or a synthetic window defines no controls | 2 |
+| `no_controls` | A valid read returned no indexed controls, no eligible installed-app results remain in Windows Search, or a synthetic window defines no controls | 2 |
 | `observation_degraded` | A degraded read returned no indexed controls | 2 |
 | `observation_unavailable` | Structured controls/snapshot identity unavailable or targeted typing with `partial` or `suspected_noop` effect | 2 |
 | `error` | Driver, configuration, or Jev request/response failure | 1 |
@@ -380,6 +400,11 @@ Reports contain these milestones:
   `window_selected`; it has no `control_selected` or `window_observed` event.
   Reusing a real window emits a fresh `window_observed` but no new
   `window_selected`; that iteration has no window-selection rounds.
+- `controls_filtered`: Windows Search filtering with
+  `policy: "windows_search_installed_apps"`, `observed_control_count`, and
+  `eligible_control_count`. Observation counts describe the full returned
+  control snapshot; Jev's control-round candidate counts describe only eligible
+  installed-app results. An empty eligible set returns `no_controls`.
 - `action_requested` and `action_returned`: native activation and input arguments
   and returned action facts. Windows Search records `hotkey` and `type_text`
   separately under the same iteration, including the exact prepared text. Missing
@@ -524,8 +549,10 @@ before sizing the final round; they may occupy different parallel calls. Only
 the winning candidate/action's interval is consumed. After CUA
 returns, the loop waits that interval before the next iteration's fresh control
 observation in the retained window. The final permitted action has no following wait.
-Windows Search skips control selection and timers entirely and starts the next
-iteration after typing returns, without a settling wait.
+The synthetic Windows Search opener skips control selection and Jev timers.
+After typing returns, it uses a fixed 1,000 ms settling wait when another
+iteration follows; no wait follows the final permitted action. Observed Search
+windows use the installed-app filter above before ordinary control selection.
 See the
 [main workflow](docs/main-workflow.md) for details.
 

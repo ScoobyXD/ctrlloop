@@ -6,7 +6,8 @@ until the first real window is chosen, then retain its native identity for the
 run. Each iteration reads fresh controls in that window, followed by
 selection, a click or targeted text entry, and settling. The synthetic Windows
 Search destination requires a prepared query, then sends Win+S and immediately
-types it. The next decision
+types it. When another iteration follows, it waits a fixed 1,000 ms before
+observing again. The next decision
 uses the original request, the previous action, and the current observation.
 [Reading run timings](timing.md) maps these operations to report fields.
 
@@ -96,9 +97,10 @@ It remains pending through click-only iterations until the first typing dispatch
    not retained, so selecting Windows Search permits discovery again next time.
 4. For Windows Search, require pending prepared text; otherwise return `no_action`
    before activation. Send desktop Win+S, then immediately send
-   desktop `type_text` with the prepared string, and skip to the next iteration
-   (or return `iteration_limit` at the configured bound). No control read,
-   control selection, timer, observation, confirmation, or sleep intervenes.
+   desktop `type_text` with the prepared string. No control read, control
+   selection, timer, observation, confirmation, or sleep intervenes between
+   those commands. After typing returns, wait a fixed 1,000 ms before the next
+   iteration, or return `iteration_limit` without waiting at the configured bound.
    After typing consumes the prepared string, another selection of this opener
    returns `no_action` without replaying either command.
    For a real window, bring it forward and read its accessibility tree on every
@@ -106,7 +108,10 @@ It remains pending through click-only iterations until the first typing dispatch
    identities needed to execute the selected control. If the retained window
    becomes unavailable, propagate the existing driver error; do not automatically
    select a replacement window.
-5. Build control candidates once and narrow them with `QUESTION`. Only in the
+5. Build control candidates once. For an observed native Search window, retain
+   only eligible installed-app results using the filter below; an empty eligible
+   set returns `no_controls` before control selection or a control action. Narrow the remaining
+   candidates with `QUESTION`. Only in the
    final control round, include an action Choice and a hypothetical timer for
    each of `click` and `type_text` per finalist. Consume the winning candidate's
    action and its matching timer.
@@ -122,7 +127,8 @@ It remains pending through click-only iterations until the first typing dispatch
    validation. Native errors fail without replaying typing.
 7. At the iteration limit, return `iteration_limit` without another wait or
    observation. Otherwise, wait the winning control/action's timer interval after CUA
-   returns, then begin the next iteration.
+   returns, or the fixed 1,000 ms for synthetic Windows Search typing, then begin
+   the next iteration.
 
 Empty, unavailable, or failed observations/actions and missing prepared text can stop earlier.
 Old control targets are not reused for a new iteration; the window identity is.
@@ -133,14 +139,27 @@ candidates. It uses the existing activation stage for
 `hotkey({scope: "desktop", keys: ["win", "s"]})`, followed directly by
 `type_text({scope: "desktop", text: <prepared text>})`. Both commands belong
 to the same iteration. This route makes zero control-selection rounds and zero
-timer requests, and adds no settling wait after typing. Without pending prepared
-text, it returns `no_action` before Win+S. The next normal
+Jev timer requests. After typing returns, it schedules a fixed 1,000 ms settling
+wait only when another iteration follows. Without pending prepared text, it
+returns `no_action` before Win+S. The next normal
 iteration reads fresh state and can select real search results. Real Start and
 Search windows remain observed window candidates; the synthetic route does not
 replace them. A real Search window, once selected, is retained; if a result click
 closes it, the next activation/read can fail instead of switching to the opened
 application. Prepared text is available for only one typing operation in the run;
 a new run can supply another string.
+
+Observed native Search windows use `windows_search_app_results` from
+`src/synthetic.py` before control selection. The filter recognizes
+`SearchHost.exe` / `Search` independently of prior visibility flags, including
+windows restored before the fresh read. It keeps enabled, invokable `ListItem`
+controls whose direct indexed parent is a `List` named `Results`, with a native
+English label ending in `, App, Press right to view options` and a nonempty app
+name. It excludes Search boxes, Store/web results, run commands, duplicate
+buttons, and the separate `Open` action. Descriptions retain ancestry from the
+full observation, and native records and snapshot identities remain unchanged.
+No eligible app results returns `no_controls`; there is no extra Jev question,
+readiness polling, or automatic fallback to another control category.
 
 ## Shared Jev state
 
@@ -336,7 +355,7 @@ and no desktop action.
 | `iteration_limit` | Configured action-cycle bound reached; overall completion unknown. | 2 |
 | `no_action` | Prepared text missing, empty, or already used; text target disabled; or custom synthetic control lacks a live CUA target. | 2 |
 | `no_windows` | No window candidates; normally unreachable with Windows Search enabled. | 2 |
-| `no_controls` | Valid observation/synthetic definition has no indexed controls. | 2 |
+| `no_controls` | Valid observation/synthetic definition has no indexed controls, or Windows Search has no eligible installed-app results. | 2 |
 | `observation_degraded` | Degraded read has no indexed controls. | 2 |
 | `observation_unavailable` | Structured controls/snapshot identity unavailable or targeted typing with `partial` or `suspected_noop` effect. | 2 |
 | `error` | Driver, configuration, or Jev request/response failure. | 1 |
@@ -357,9 +376,10 @@ delivery, not screen readiness or completion.
 | CUA timeout/retries | 60-second deadline per transport attempt including lazy startup; reads may reconnect/retry once, actions are not replayed. |
 | Batching | Up to 50 window/control candidates per group, reduced when the complete single-group body would exceed 90,000 bytes. All rounds pack whole questions into bodies within that budget and dispatch parallel batches; action/timers included before sizing the final control round. |
 | Window reuse | Retain the first selected real window for the run, with fresh control snapshots each iteration. Synthetic Windows Search permits another discovery/selection. No automatic replacement of a closed real window. |
+| Search candidates | Observed native Search windows offer only enabled, invokable installed-app ListItems directly under the Results List, matched by the native English App label suffix. Empty eligible sets return `no_controls`. |
 | Prepared text | Used verbatim for the first typing dispatch, retained through clicks. Missing, empty, or already consumed text returns `no_action` when typing is selected. |
 | Text delivery | Explicit native mode overrides the observed browser foreground default for targeted typing; unknown/non-browser targets retain the native default. No automatic mode retry. |
-| Settling | One 50–500 ms scheduled wait after a control click or confirmed/unverifiable targeted text action when another iteration follows; none on the Windows Search route. |
+| Settling | One 50–500 ms scheduled wait after a control click or confirmed/unverifiable targeted text action; a fixed 1,000 ms after synthetic Windows Search typing. Waits run only when another iteration follows. |
 | Iterations | Positive bound, default 10; no automatic completion judgment. |
 | Model | Exact pin `jev-1.13.0`, validated on every response. |
 | Action scope | Observed control clicks/targeted text entry and direct Windows Search activation/text entry; no coordinate fallback, automatic action retry, or general recovery planner. |
@@ -400,6 +420,12 @@ Each cycle retains iteration, selections, native results, rounds, and route.
 Windows Search records both `hotkey` and `type_text` action events and timings
 under that iteration. The final action and exact query remain in `last_action`;
 there are no control-selection rounds or fake control records for this route.
+Its fixed wait uses the existing settling span and is absent after the
+final permitted action. For observed native Search windows, `controls_filtered`
+records `policy: "windows_search_installed_apps"`, `observed_control_count`, and
+`eligible_control_count`. Full observation counts remain intact; Jev's control
+rounds count only eligible app results. An empty eligible set produces no control
+round or action.
 Correlate repeated round names with `(iteration, round_id)` and span/request IDs.
 Retain the original request, question text, all probabilities, action/timer answers,
 prepared text, consumed timer, requested wait, and
