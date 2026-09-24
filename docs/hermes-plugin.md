@@ -1,15 +1,19 @@
 # Minimal Hermes plugin
 
-This integration registers one task-level tool, `ctrlloop_run`. Hermes supplies
-the user's task text; the existing ctrlloop CLI runs in its own Python process
-and Jev selects the UI actions. The tool immediately returns a **launch receipt**.
+This integration registers one task-level tool, `ctrlloop_run`. Hermes interprets
+the user's intent and conversation context, chooses the tool for desktop/app
+interaction, and supplies a concise English command as `request`. It may prepare
+one optional `text` string in that same initial call. The existing ctrlloop CLI runs in its own Python process
+and Jev selects the UI actions. Prepared text serves the first typing operation,
+including a real control such as Chrome's address bar. The tool immediately returns a **launch receipt**.
 It does not establish that initialization, any UI action, or the task succeeded.
 
 There is no generated-text request/reply connection, `ctx.llm` use, conversation
 injection, result retrieval/summary, Stop forwarding, cancellation, process
-supervision, or automatic file cleanup. No built-in Hermes computer-use, browser,
-screenshot tools, or skills are replaced or disabled. Avoid overlapping desktop
-runs: this initial adapter does not enforce mutual exclusion.
+supervision, or automatic file cleanup. The user's Hermes configuration disables
+the competing built-in desktop and browser-control tools; the plugin itself does
+not replace them. Avoid overlapping desktop runs: this adapter does not enforce
+mutual exclusion.
 
 ## Source and installation
 
@@ -48,18 +52,19 @@ configuration schema, or tool override permission are declared.
 
 Enablement requires `plugins.enabled` to include `ctrlloop`; any matching
 `plugins.disabled` entry would prevent loading. The desktop normally uses
-`platform_toolsets.cli`; this setup explicitly adds `ctrlloop` alongside
-`hermes-cli`, preserving all existing tools. There is no new platform or profile.
-Hermes's explicit `HERMES_TUI_TOOLSETS`, coding focus mode, or disabled-toolset
-settings can override normal tool availability. This setup does not change them.
+`platform_toolsets.cli`; this setup uses an explicit list containing `ctrlloop`
+and the existing non-control toolsets. The `hermes-cli` bundle was expanded so
+it cannot restore competing controls in delegated agents. There is no new
+platform or profile. Existing coding context remains `auto`; selecting a new
+tool preset or explicitly re-enabling controls changes this configuration.
 
 The relevant configuration entries are:
 
 ```yaml
 platform_toolsets:
-  cli:
-    - hermes-cli
-    - ctrlloop
+  cli: [clarify, code_execution, cronjob, ctrlloop, delegation, file, image_gen, kanban, memory, session_search, skills, terminal, todo, tts, vision, web]
+agent:
+  disabled_toolsets: [computer_use, browser_tools, browser-cdp]
 plugins:
   enabled:
     - ctrlloop
@@ -80,6 +85,29 @@ supports `hermes plugins enable ctrlloop --no-allow-tool-override` when invoked
 with this existing effective home. Do not run plugin install/update/remove on
 the source junction; this is an editable source registration, not a cloned
 plugin managed by Hermes's installer.
+
+## Computer-use tool selection
+
+The saved default-profile configuration removes Hermes's built-in `computer_use`
+and all `browser_*` tools, including CDP, console execution, dialogs, screenshots,
+clicking and typing. `ctrlloop_run` remains enabled. Global exclusions apply to
+normal tool resolution and tool discovery; the explicit desktop enabled list
+also prevents these tools from returning through inherited child toolsets.
+
+`browser_tools` is Hermes's supported legacy exclusion for the core browser
+controls; `browser-cdp` also removes `browser_cdp` and `browser_dialog`. Using
+these instead of excluding the whole `browser` toolset preserves the separate
+`web_search` setting. Ordinary terminal and code-execution tools remain enabled;
+this is a control-tool configuration, not an OS-level sandbox against scripts.
+No competing MCP controller is configured, and `ctrlloop` is the only explicitly
+enabled user plugin.
+
+The previous config was backed up beside `config.yaml` as
+`config.yaml.before-ctrlloop-only-20260924T013713851995Z.bak`. Only
+`agent.disabled_toolsets` and `platform_toolsets.cli` changed; authentication,
+history and other settings were preserved. Finish active work, fully restart
+Hermes, and begin a new conversation to apply the tool selection and discard
+previous tool guidance. Existing sessions may still hold their old tool lists.
 
 ## Development loop
 
@@ -110,14 +138,18 @@ Exact registered function schema (also in [the adapter](../plugins/hermes/__init
 ```json
 {
   "name": "ctrlloop_run",
-  "description": "Launch a computer-use task in the local ctrlloop program; Jev selects the UI actions. Pass the user's original task text unchanged. Returns only a process launch receipt, not execution success or task completion. No result retrieval or Stop forwarding is connected. Do not launch another task or perform other computer-use actions while it may still be running.",
+  "description": "Use for desktop or app interaction. Launch receipt only; no completion reporting or Stop. Do not overlap other computer-use actions.",
   "parameters": {
     "type": "object",
     "properties": {
       "request": {
         "type": "string",
         "minLength": 1,
-        "description": "The original user task text, passed verbatim to ctrlloop. No conversation history is added."
+        "description": "Turn the user's intent and conversation context into a concise English computer-use command."
+      },
+      "text": {
+        "type": "string",
+        "description": "Prepare the exact text for the first typing step (search, URL, or message). Required for typing; used once."
       }
     },
     "required": ["request"],
@@ -128,23 +160,93 @@ Exact registered function schema (also in [the adapter](../plugins/hermes/__init
 
 | Input | Type | Required/default | Treatment |
 | --- | --- | --- | --- |
-| `request` | string | Required; no default | Must contain non-whitespace text and encode as UTF-8; accepted text is passed unchanged, including leading/trailing whitespace and CRLF/LF |
-| Other argument fields | none permitted | Rejected | No per-call driver, text, timeout, iteration, or path options |
+| `request` | string | Required; no default | Hermes's concise English command derived from user intent/context; must contain non-whitespace text and encode as UTF-8; accepted command is forwarded unchanged |
+| `text` | string | Optional for click-only tasks; required for typing | Nonempty string used verbatim once; missing, empty, or consumed text stops typing with `no_action`; whitespace-only strings are valid; `null` and other non-string values are rejected |
+| Other argument fields | none permitted | Rejected | No per-call driver, timeout, iteration, or path options |
 | Hermes handler `args` | Python dict | Supplied by Hermes | The decoded argument object above |
 | Hermes handler `**kwargs` | Hermes execution context | Optional | Ignored; current Hermes can supply `task_id`, `session_id`, `user_task` |
 
 The callable signature is `run(args: dict, **kwargs) -> str`. Hermes wraps the
 registered raw schema in its existing function-tool envelope. The adapter
-receives only the request the Hermes model supplies. It cannot guarantee the
-model copied the user's message exactly; its description instructs it to do so.
-It never reads the full conversation, system prompt, attachments, or Hermes
-context fields. The same accepted request text reaches the existing Jev calls.
+receives only the command and optional typing text the Hermes model supplies.
+Hermes interprets the conversation before calling the tool; the adapter never
+reads the full conversation, system prompt, attachments, or Hermes context
+fields. Its descriptions guide the existing model's tool choice and argument
+generation, without a separate intent classifier or generation call. The saved
+configuration removes competing desktop/browser tools; other non-control tools
+remain available.
+
+The accepted command reaches the existing Jev calls unchanged. The engine's
+existing `original_request` name refers to this command, not necessarily the
+user's raw message. The adapter does not separately store the raw message.
 
 Example arguments:
 
 ```json
-{"request": "Open Chrome using Windows Search."}
+{"request": "Open Chrome using Windows Search.", "text": "Chrome"}
 ```
+
+```json
+{"request": "In my browser on x.com, open the History tab, then open Liked posts.", "text": "x.com"}
+```
+
+Hermes can turn a conversational request such as "can you get me to x.com in
+my browser and then open History and Liked posts?" into the second example.
+Typing text can be a search query, URL, or drafted message and need not appear
+verbatim in the command. Both arguments are prepared in the same initial call;
+no additional model call or later generated-text callback is added.
+
+## Experimental prepared-text behavior
+
+A nonempty `text` stays pending through click-only iterations. The first actual
+typing dispatch uses it, whether Jev selected a real control or the synthetic
+Windows Search route. There is no word extraction, text-selection round, Noul
+question, or probability filter. The supplied value is not sent as
+extra control-selection context; Jev still selects the control and action from
+the supplied command and existing state. No new capability check is added.
+
+After that typing dispatch, later typing stops with `no_action` because the
+prepared text has been consumed. The value is never automatically replayed, even after an
+unverified effect; existing partial/no-op and native-error stopping behavior
+remains. If the run stops before typing, the value is unused. This experiment
+does not associate text with a particular field: the caller must supply the
+string appropriate for the **first** typing operation. This MVP supplies one
+typing operation per run; it cannot generate more text during the loop.
+
+Omitted `text` and `text: ""` permit clicks but stop at typing with `no_action`.
+Windows Search stops before Win+S when text is unavailable. The reason is
+`No prepared text is available for this typing operation (missing, empty, or already used).`
+Nonempty whitespace-only strings are literal input. Unicode, leading and
+trailing spaces, tabs, LF, CRLF, and lone CR are preserved through the adapter,
+CLI and pipeline to the existing CUA `type_text` payload. Native target/app
+behavior still determines the result: this does not clear/select existing field
+contents or submit Enter. An address bar with existing text may receive an
+insertion rather than a replacement URL. The existing `run_pipeline(..., text=...)`
+argument and `--text` now share these semantics; `--text-file` reads UTF-8 bytes
+without newline conversion and is mutually exclusive with `--text`.
+
+## Try it in Hermes
+
+Finish active Hermes work and preserve drafts, fully exit Hermes, then open
+`C:\Users\Jonat\hermes-dev\Hermes Dev.lnk`. A full restart loads the changed
+adapter/schema; no rebuild or reinstall is needed. Ensure an earlier ctrlloop
+child is no longer running before launching another desktop run. Start a new
+Hermes conversation so previously loaded control tools/guidance are not reused.
+
+Copy this prompt into Hermes:
+
+```text
+Can you get me to x.com in my browser and then open History and Liked posts?
+```
+
+Hermes should recognize the desktop task and form arguments like the second
+JSON example above; exact wording and tool choice are model decisions. Check
+the tool-call arguments to see what Hermes supplied. The receipt's directory holds
+the exact `request.txt` and `text.txt`; `stderr.log` points to the run report.
+For a New Tab click followed by address-bar typing, `action_requested` for
+`type_text` should contain `text: "x.com"` and that iteration should have no
+`text_r1` source-word round. The receipt alone does not establish this happened
+or that navigation/task completion succeeded.
 
 ## Process and file boundary
 
@@ -158,16 +260,19 @@ C:\Users\Jonat\ctrlloop\.venv\Scripts\python.exe
   C:\Users\Jonat\ctrlloop\.local\hermes\launch-<suffix>\request.txt
 ```
 
-This is a four-element argument list passed directly to `subprocess.Popen`, with
+With nonempty prepared text, append `--text-file` and the absolute path to
+`<directory>\text.txt`. This is a four-element argument list without prepared
+text, or six elements with it, passed directly to `subprocess.Popen`, with
 `shell=False` (default), `cwd=C:\Users\Jonat\ctrlloop`, stdin `DEVNULL`, stdout
 and stderr redirected to the files below, and Windows `CREATE_NO_WINDOW`.
 There is no terminal window, shell quoting, stdin protocol, IPC server, or
-request text on the command line. The child inherits the process environment;
+request/prepared text on the command line. The child inherits the process environment;
 the adapter adds or overrides no environment variables and does not read secrets.
 
 | Local file | Format / contents | Lifecycle |
 | --- | --- | --- |
 | `<directory>\request.txt` | UTF-8 bytes, no BOM; exactly `request.encode("utf-8")` | Written before process creation; no newline conversion |
+| `<directory>\text.txt` | UTF-8 bytes, no BOM; exactly `text.encode("utf-8")` | Written only for nonempty prepared text before process creation; no newline conversion |
 | `<directory>\stdout.json` | Unmodified child stdout bytes; normally the existing final JSON object plus newline | Opened before launch; can be empty while running or on early failure; not parsed by the adapter |
 | `<directory>\stderr.log` | Unmodified child stderr bytes; UTF-8 diagnostics, selection logging and report locations | Opened before launch; may grow during execution |
 | `reports\run-<UTC timestamp>-<UUID hex>\total_run.json` | Existing chronological JSON array of report events | Produced by the CLI, not the adapter |
@@ -175,14 +280,14 @@ the adapter adds or overrides no environment variables and does not read secrets
 
 Files persist, including partially created launch folders after a launch error.
 The adapter performs no cleanup. `/.local/` and `reports/` were already ignored
-by Git. Reports and launch files can contain the original request and UI text.
+by Git. Reports and launch files can contain the supplied command, prepared text and UI text.
 
 Existing CLI defaults inherited by this invocation:
 
 | Existing input | Type / current default |
 | --- | --- |
 | Positional request | Not supplied; `--request-file` is used instead |
-| `--text` | Optional string, `None`; existing Windows Search override remains unset |
+| `--text` / `--text-file` | Optional mutually exclusive first-typing inputs; adapter uses `--text-file` only when tool `text` is nonempty; missing/empty/consumed text stops typing |
 | `--delivery-mode` | Optional `foreground` / `background`, `None`; existing browser/native behavior |
 | `--env-file` | Path, `C:\Users\Jonat\ctrlloop\.env` |
 | `--driver` | Optional string, `None`; resolves PATH `cua-driver`, then `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin\cua-driver.exe`, then literal `cua-driver` |
@@ -214,7 +319,7 @@ On process creation:
 | --- | --- | --- |
 | `status` | string, always `"launched"` | Required on launch receipt; `Popen` returned, nothing more |
 | `pid` | integer | Required on launch receipt; Windows child PID, not a durable task ID |
-| `directory` | string | Required on launch receipt; absolute folder containing the three launch files |
+| `directory` | string | Required on launch receipt; absolute folder containing the three launch files plus optional `text.txt` |
 | `error` | string | The only field on failure before a launch receipt; no `status`, `pid`, or `directory` |
 
 Example failure: `{"error": "request must be a nonempty string."}`.
@@ -222,8 +327,9 @@ Exact adapter error cases:
 
 | Condition | `error` value |
 | --- | --- |
-| Non-dict arguments, missing request, or extra fields | `Provide exactly one field: request (a nonempty string).` |
+| Non-dict arguments, missing request, or extra fields | `Provide request (a nonempty string) and optionally text (a string).` |
 | Non-string, empty, or whitespace-only request | `request must be a nonempty string.` |
+| Non-string `text`, including `null` | `text must be a string when provided.` |
 | Non-Windows host | `This ctrlloop launcher requires Windows.` |
 | Missing interpreter or entry point | `ctrlloop requires .venv/Scripts/python.exe and src/main.py in its source checkout.` |
 | UTF-8 encoding, file, or process launch error | `ctrlloop launch failed (<exception class name>). Check the local checkout and file permissions.` |
@@ -269,7 +375,7 @@ no JSON stdout. Unexpected exceptions/interruption can leave stdout empty.
 The adapter does not inspect exit codes. Existing iteration limits, retained
 window behavior, Jev question wording, and CUA action behavior are unchanged.
 
-## Verification performed on 2026-09-23
+## Initial adapter verification on 2026-09-23
 
 - Hermes's real user-directory scanner found the junction; its config readers
   confirmed `ctrlloop` is enabled and not disabled.
@@ -284,3 +390,58 @@ No valid computer-use request was dispatched, no Jev call was made, and no
 desktop action or child launch was exercised. Live activation in the
 already-running Hermes desktop requires the next full restart after active
 work and drafts are preserved. Hermes was left running without a restart.
+
+## Historical prepared-text MVP verification on 2026-09-23
+
+This records the initial MVP before the word/Noul fallback was removed. Its
+fallback results below describe that earlier implementation, not current behavior.
+
+- Syntax/import and schema registration checks passed. The JSON schema in this
+  document matches the adapter's registered schema exactly. Invalid `text`
+  types and extra keys return adapter errors; the launch receipt is unchanged.
+- An intercepted adapter launch preserved request/text UTF-8 bytes, including
+  Unicode, whitespace, CRLF, lone CR, and LF. Whitespace-only text was forwarded;
+  omitted/empty text produced no text-file argument. `Popen` was substituted,
+  so no child was launched. Sandbox ACLs prevented reading/writing inside
+  `tempfile.mkdtemp` directories during that check, so ordinary directory
+  creation was substituted too; production launch-directory logic is unchanged.
+- CLI `--help` and mutual exclusion of `--text` / `--text-file` passed. A manual
+  CLI invocation with network/driver/pipeline objects substituted in memory
+  forwarded exact request/text file contents into the existing pipeline call.
+- A manual in-memory pipeline example dispatched click, prepared typing, then
+  ordinary typing: source-word selection occurred only in iteration 3. Omitted
+  and empty text selected words in iterations 2 and 3. Whitespace-only input
+  remained exact. Windows Search used prepared text with no text-selection call.
+- `git diff --check` passed. No automated test suite was added or run, no live
+  Jev request or desktop action was sent, and Hermes was not restarted. A real
+  Hermes/desktop run remains the trial described above.
+
+## Control-tool configuration verification on 2026-09-23 (Pacific)
+
+Fresh Hermes schema resolution from the saved config retained `ctrlloop_run`
+and returned no `computer_use` or `browser_*` tools. The inherited child list,
+checked without the parent's disabled list, also retained `ctrlloop_run` with
+zero competing control tools; no additional child-request toolset could restore
+them. `web` remains enabled. Availability probes in the verification process
+reported web-search credentials unavailable; credentials were not modified.
+No tool was dispatched and no desktop action or Hermes restart was performed.
+
+## Prepared-only cleanup and live rerun on 2026-09-23 (Pacific)
+
+Removed request tokenization, `TEXT_WORD`, `select_text`, the Noul parser and
+70% inclusion filter. Existing window/control/action/timer questions and model
+pin are unchanged. Syntax/import/schema checks and a manual in-memory example
+confirmed click preservation, exact one-time text delivery, and `no_action`
+when text is missing, empty or consumed. No automated test suite was added or run.
+
+The supplied `run-20260924T013947123434Z-c986b8ef73c64de8ae2c9ceda086717c`
+report did receive `https://x.com`. Loop 1 inserted it before an existing
+ChatGPT URL; loop 2 observed the combined value and stopped in the old Noul
+fallback. This was an insertion/submission issue, not missing prepared text.
+
+The same saved request/text were rerun through ctrlloop after removal:
+`run-20260924T014645845415Z-e35f374e7e46475392f75098523b7705`. It made five
+Jev calls in 5,584.7555 ms operational time, with zero word-selection stages.
+It inserted text once, then stopped with the prepared-text-unavailable reason
+on loop 2. The readback showed another URL prefix; it did not navigate to X.
+Address replacement/submission remains unresolved; no driver behavior was changed.

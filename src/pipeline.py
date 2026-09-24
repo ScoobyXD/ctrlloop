@@ -3,7 +3,6 @@
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
-import re
 from time import sleep as system_sleep
 from typing import Any, Protocol
 
@@ -130,28 +129,11 @@ def _retain_rounds(result, stage, rounds, iteration):
         )
 
 
-def _request_words(original_request):
-    """Keep source positions to assemble included words in request order."""
-    return [
-        Candidate(f"word_{index}", {"text": match.group()},
-                  {"start": match.start(), "end": match.end()})
-        for index, match in enumerate(re.finditer(r"\S+", original_request))
-    ]
-
-
-def _resolve_text(state, words, target, selector, result, report, iteration):
-    with report.span("text_selection", stage="text") if report else nullcontext({}):
-        selection = selector.select_text(state, words, target=target, report=report)
-    _retain_rounds(result, "text", selection.rounds, iteration)
-    text = selection.winner.record["text"] if selection.winner else None
-    if report:
-        report.append("text_selected", target=target, text=text, selections=selection.rounds)
-    if text is None:
-        result.status = "no_action"
-        result.reason = selection.rounds[-1].get("reason", "No usable request text was selected.")
-        if report:
-            report.append("action_skipped", reason=result.reason)
-    return text
+def _skip_missing_text(result, report):
+    result.status = "no_action"
+    result.reason = "No prepared text is available for this typing operation (missing, empty, or already used)."
+    if report is not None:
+        report.append("action_skipped", reason=result.reason)
 
 
 def _remember_action(state, result, tool, text=None):
@@ -228,17 +210,12 @@ def _activate_window(result, driver, report):
     return _invoke_action(result, driver, report, tool, arguments, "foreground_activation")
 
 
-def _search_windows(state, result, driver, report, text, selector, words, iteration):
-    """Resolve text before activation, then send Win+S and text consecutively."""
+def _search_windows(state, result, driver, report, text):
+    """Require prepared text, then send Win+S and text consecutively."""
     previous_control = state.get("last_control")
     if text is None:
-        text = _resolve_text(
-            state, words,
-            {"destination": "Windows Search", "purpose": "Search for the requested application, file, or setting."},
-            selector, result, report, iteration,
-        )
-        if text is None:
-            return
+        _skip_missing_text(result, report)
+        return
     last_action = state.get("last_action", {})
     if previous_control is None and last_action.get("tool") == "type_text" and last_action.get("text") == text:
         result.status = "observation_unavailable"
@@ -372,7 +349,7 @@ def _prepare_window(state, driver, selector, result, report, synthetic, iteratio
 
 
 def _select_and_act(state, controls, driver, selector, result, report,
-                    words, settling_context=None, iteration=None, delivery_mode=None):
+                    settling_context=None, iteration=None, delivery_mode=None, text=None):
     with report.span("control_selection", stage="controls") if report is not None else nullcontext({}):
         control_selection = selector.select(
             state, controls, stage="controls",
@@ -403,7 +380,6 @@ def _select_and_act(state, controls, driver, selector, result, report,
         if report is not None:
             report.append("action_skipped", reason=result.reason)
         return None
-    text = None
     if tool == "type_text":
         if result.control.get("enabled") is False:
             result.status = "no_action"
@@ -411,10 +387,8 @@ def _select_and_act(state, controls, driver, selector, result, report,
             if report:
                 report.append("action_skipped", reason=result.reason)
             return None
-        text = _resolve_text(
-            state, words, control_selection.winner.description, selector, result, report, iteration,
-        )
         if text is None:
+            _skip_missing_text(result, report)
             return None
     # No new snapshot between choosing a target and dispatch: its token must
     # still refer to the observation from which the decision was made.
@@ -498,11 +472,15 @@ def run_pipeline(
     """Select one real window and repeat fresh control selection and actions.
 
     Each call retains the original goal and the most recent decision/action.
-    Windows Search resolves text before sending Win+S followed immediately by text.
+    Windows Search requires prepared text before sending Win+S and typing it.
     Synthetic destinations require fresh window discovery until a real window is
     selected; its native identity is then retained for the rest of the run.
     The iteration limit bounds execution; it does not establish task completion.
     Native delivery errors propagate without replaying the attempted action.
+    Nonempty text supplies the first typing operation verbatim on either route.
+    It survives clicks and is consumed once typing is dispatched. Missing, empty,
+    or consumed text stops the next typing operation with no_action; no text is
+    inferred from request words. Whitespace-only text is preserved.
     delivery_mode overrides targeted typing with CUA's foreground/background enum.
     By default, known browser app identities use foreground; other apps retain the
     native default. Desktop Windows Search typing and clicks are unaffected.
@@ -511,20 +489,15 @@ def run_pipeline(
         raise ValueError("max_iterations must be a positive integer.")
     if not isinstance(original_request, str) or not original_request.strip():
         raise ValueError("The original request must be nonempty.")
-    if text is not None and (not isinstance(text, str) or not text.strip()):
-        raise ValueError("text must be a string containing non-whitespace text.")
+    if text is not None and not isinstance(text, str):
+        raise ValueError("text must be a string or None.")
     if delivery_mode is not None and (
         not isinstance(delivery_mode, str) or delivery_mode not in {"foreground", "background"}
     ):
         raise ValueError("delivery_mode must be foreground or background.")
     result = PipelineResult(status="no_windows")
+    pending_text = text or None
     state = _jev_state(original_request, 0, None, None)
-    with report.span("request_word_preparation") if report else nullcontext({}):
-        words = _request_words(original_request)
-    if report:
-        report.append("request_words_prepared", words=[
-            {"key": word.key, **word.description, **word.record} for word in words
-        ])
     for iteration in range(1, max_iterations + 1):
         state["iteration"] = iteration
         # Observation coverage belongs to the next fresh control snapshot.
@@ -544,16 +517,19 @@ def run_pipeline(
                                 "filtered_element_count", "observed_control_count"}
             }
             if _is_windows_search(result.window):
-                _search_windows(state, result, driver, report, text, selector, words, iteration)
+                _search_windows(state, result, driver, report, pending_text)
                 settling_ms = None
             else:
                 settling_ms = _select_and_act(
-                    state, controls, driver, selector, result, report, words,
+                    state, controls, driver, selector, result, report,
                     settling_context=None if result.window.get("synthetic") else state["current_window"],
-                    iteration=iteration, delivery_mode=delivery_mode,
+                    iteration=iteration, delivery_mode=delivery_mode, text=pending_text,
                 )
             if result.action_result is not None:
                 trace["last_action"] = state["last_action"]
+                if state["last_action"]["tool"] == "type_text":
+                    # Delivery errors abort the run; never replay prepared text.
+                    pending_text = None
             trace["settling_ms"] = settling_ms
             if result.status != "action_returned":
                 _route(trace, result.status, report)

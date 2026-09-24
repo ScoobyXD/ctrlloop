@@ -43,7 +43,9 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
     parser = argparse.ArgumentParser(description="Select a window, then repeat Jev control selection and CUA actions within an iteration limit.")
     parser.add_argument("request", nargs="?", help="Original user request, preserved in every Jev call")
     parser.add_argument("--request-file", type=Path, help="Read the exact request from a UTF-8 file")
-    parser.add_argument("--text", help="Exact Windows Search text override; otherwise select words from the request")
+    text_source = parser.add_mutually_exclusive_group()
+    text_source.add_argument("--text", help="Exact text for the first typing operation; typing stops if omitted, empty, or already used")
+    text_source.add_argument("--text-file", type=Path, help="Read first-typing text from a UTF-8 file, preserving whitespace and line endings")
     parser.add_argument("--delivery-mode", choices=("foreground", "background"),
                         help="Override targeted typing delivery (default: foreground for known browsers, native default otherwise); does not affect Windows Search desktop typing or clicks")
     parser.add_argument("--env-file", type=Path, default=project_dir / ".env")
@@ -58,8 +60,6 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
         parser.error("provide exactly one request argument or --request-file")
     if args.max_iterations < 1:
         parser.error("--max-iterations must be a positive integer")
-    if args.text is not None and not args.text.strip():
-        parser.error("--text must contain non-whitespace text")
     # Keep JSON output usable for non-ASCII UI labels on Windows consoles/pipes.
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -94,9 +94,13 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
                 args.request_file.read_bytes().decode("utf-8")
                 if args.request_file is not None else args.request
             )
+        text = args.text
+        if args.text_file is not None:
+            with report.span("initialization.text_read"):
+                text = args.text_file.read_bytes().decode("utf-8")
         report.append(
             "run_started", request=original_request,
-            **({"text": args.text} if args.text is not None else {}),
+            **({"text": text} if text is not None else {}),
             **({"delivery_mode": args.delivery_mode} if args.delivery_mode is not None else {}),
         )
         with report.span("initialization.configuration"):
@@ -132,7 +136,7 @@ def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> in
                     with report.span("pipeline"):
                         result = run_pipeline(
                             original_request, driver, selector,
-                            report=report, max_iterations=args.max_iterations, text=args.text,
+                            report=report, max_iterations=args.max_iterations, text=text,
                             delivery_mode=args.delivery_mode,
                         )
                     cleanup_started_ns = perf_counter_ns()

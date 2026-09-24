@@ -1,4 +1,4 @@
-"""Choice elimination and source-word inclusion with byte-budgeted batches."""
+"""Choice elimination with byte-budgeted batches."""
 
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -11,14 +11,14 @@ import math
 from typing import Any, TYPE_CHECKING
 
 import httpx2
-from typesafe_sdk import Choice, Noul, SystemOneResponse, TypeSafeError
+from typesafe_sdk import Choice, SystemOneResponse, TypeSafeError
 from typesafe_sdk._core.config import Config
 from typesafe_sdk._core.endpoints import prepare_system_one
 
 if __package__:
-    from .jev_questions import ACTION, QUESTION, TEXT_WORD, TIMER
+    from .jev_questions import ACTION, QUESTION, TIMER
 else:
-    from jev_questions import ACTION, QUESTION, TEXT_WORD, TIMER
+    from jev_questions import ACTION, QUESTION, TIMER
 
 if TYPE_CHECKING:
     from src.reporting import RunReport
@@ -28,8 +28,6 @@ PINNED_MODEL = "jev-1.13.0"
 # Maximum options per selection question; byte sizing can make a group smaller.
 GROUP_SIZE = 50
 REQUEST_BUDGET_BYTES = 90_000
-# Include the boundary exactly; retain raw Nouls for later policy evaluation.
-WORD_INCLUSION_THRESHOLD = 0.70
 SETTLING_MS = {
     "<50ms": 50,
     "100ms": 100,
@@ -69,7 +67,7 @@ def _probability(value: Any) -> bool:
 
 
 def _request_body_size(
-    state: str | dict[str, Any], questions: dict[str, Choice | Noul], model: str,
+    state: str | dict[str, Any], questions: dict[str, Choice], model: str,
 ) -> int:
     """Count the encoded body with the pinned SDK's own request builder.
 
@@ -109,9 +107,9 @@ class ChoiceSelector:
         self.model = model
 
     def judge(
-        self, state: str | dict[str, Any], questions: dict[str, Choice | Noul], *,
+        self, state: str | dict[str, Any], questions: dict[str, Choice], *,
         report: "RunReport | None" = None,
-    ) -> tuple[dict[str, str | float], dict]:
+    ) -> tuple[dict[str, str], dict]:
         """Submit one complete batch using the pinned client and shared validation."""
         try:
             body_bytes = _request_body_size(state, questions, self.model)
@@ -203,8 +201,8 @@ class ChoiceSelector:
         return groups, questions
 
     def _pack_questions(
-        self, state: str | dict[str, Any], questions: dict[str, Choice | Noul],
-    ) -> list[tuple[dict[str, Choice | Noul], int]]:
+        self, state: str | dict[str, Any], questions: dict[str, Choice],
+    ) -> list[tuple[dict[str, Choice], int]]:
         """Measure the full round first, then find the largest fitting prefixes."""
         items = list(questions.items())
         batches = []
@@ -216,8 +214,8 @@ class ChoiceSelector:
                 batches.append((remaining, remaining_bytes))
                 break
 
-            # Search complete question prefixes: a control Choice keeps its
-            # entire byte-sized group, and each source-word Noul stays atomic.
+            # Search complete question prefixes; each Choice keeps its
+            # entire byte-sized group.
             low, high = 1, len(items) - start - 1
             count, body_bytes = 0, 0
             while low <= high:
@@ -238,19 +236,18 @@ class ChoiceSelector:
         return batches
 
     def _judge_batches(
-        self, state: str | dict[str, Any], batches: list[tuple[dict[str, Choice | Noul], int]],
+        self, state: str | dict[str, Any], batches: list[tuple[dict[str, Choice], int]],
         question_candidate_counts: dict[str, int], *, report: "RunReport | None",
         group_keys: Sequence[str] = (),
-    ) -> tuple[dict[str, str | float], list[dict]]:
+    ) -> tuple[dict[str, str], list[dict]]:
         if not batches:
             return {}, []
         group_key_set = frozenset(group_keys)
 
-        def run_batch(index: int, batch: tuple[dict[str, Choice | Noul], int]):
+        def run_batch(index: int, batch: tuple[dict[str, Choice], int]):
             questions, body_bytes = batch
             batch_groups = [key for key in questions if key in group_key_set]
-            # Word questions count individually without inventing control
-            # groups; action and timer questions add no candidate count.
+            # Action and timer questions add no candidate count.
             candidate_count = sum(question_candidate_counts.get(key, 0) for key in questions)
             with report.span(
                 "selection.batch", batch=index + 1, batch_count=len(batches),
@@ -294,8 +291,8 @@ class ChoiceSelector:
         return chosen, api_calls
 
     def _validate_response(
-        self, questions: dict[str, Choice | Noul], response: Any
-    ) -> tuple[dict[str, str | float], dict]:
+        self, questions: dict[str, Choice], response: Any
+    ) -> tuple[dict[str, str], dict]:
         returned_model = getattr(response, "model", None)
         logger.info("Jev requested_model=%s response_model=%r", self.model, returned_model)
         if returned_model != self.model:
@@ -317,19 +314,10 @@ class ChoiceSelector:
         answers = getattr(response, "answers", None)
         if not isinstance(answers, Mapping) or set(answers) != set(questions):
             raise SelectionError("Jev must return exactly the requested question keys.")
-        choices: dict[str, str | float] = {}
+        choices: dict[str, str] = {}
         answer_traces = {}
         for key, question in questions.items():
             answer = answers[key]
-            if isinstance(question, Noul):
-                if getattr(answer, "type", None) != "noul":
-                    raise SelectionError("Jev returned a non-Noul answer.")
-                noul = getattr(answer, "noul", None)
-                if not _probability(noul):
-                    raise SelectionError("Jev returned an invalid Noul probability.")
-                choices[key] = float(noul)
-                answer_traces[key] = {"type": "noul", "noul": noul}
-                continue
             if getattr(answer, "type", None) != "choice":
                 raise SelectionError("Jev returned a non-Choice answer.")
             choice = getattr(answer, "choice", None)
@@ -511,104 +499,3 @@ class ChoiceSelector:
                 winner=current[0] if current else None, rounds=rounds,
                 settling_ms=settling_ms, action=action,
             )
-
-    def select_text(
-        self, state: str | dict[str, Any], words: Sequence[Candidate], *,
-        target: Mapping[str, Any], report: "RunReport | None" = None,
-    ) -> Selection:
-        """Include every word that meets the threshold, in original source order."""
-        with report.span("selection", stage="text") if report else nullcontext({}):
-            with report.span("selection.validation") if report else nullcontext({}):
-                request = state.get("original_request") if isinstance(state, dict) else state
-                if not isinstance(request, str) or not request.strip():
-                    raise ValueError("The original request must be a nonempty string.")
-                words = list(words)
-                keys = set()
-                previous_end = 0
-                for word in words:
-                    start, end = word.record.get("start"), word.record.get("end")
-                    if (
-                        not isinstance(word.key, str) or not word.key or word.key in keys
-                        or type(start) is not int or type(end) is not int
-                        or not previous_end <= start < end <= len(request)
-                        or (keys and start == previous_end)
-                        or request[previous_end:start].strip()
-                        or word.description.get("text") != request[start:end]
-                        or any(character.isspace() for character in request[start:end])
-                    ):
-                        raise ValueError("Words must have unique keys and exact whitespace-delimited source spans.")
-                    keys.add(word.key)
-                    previous_end = end
-                if request[previous_end:].strip():
-                    raise ValueError("Words must cover every non-whitespace source character.")
-                text_state = dict(state) if isinstance(state, dict) else {"original_request": request}
-                text_state["text_target"] = dict(target)
-            round_id = "text_r1"
-            with report.span(
-                "selection.round", round=1, round_id=round_id, candidate_count=len(words),
-            ) if report else nullcontext({}) as round_timing:
-                with report.span("selection.grouping") if report else nullcontext({}) as grouping_timing:
-                    questions = {
-                        f"{round_id}_{word.key}": Noul(instructions={
-                            "question": TEXT_WORD,
-                            "word": {"index": index, "text": word.description["text"], **word.record},
-                        })
-                        for index, word in enumerate(words)
-                    }
-                with report.span(
-                    "selection.packing", request_budget_bytes=REQUEST_BUDGET_BYTES,
-                ) if report else nullcontext({}) as packing_timing:
-                    text_state = deepcopy(text_state)
-                    questions = deepcopy(questions)
-                    batches = self._pack_questions(text_state, questions)
-                    packing_timing["batch_count"] = len(batches)
-                outcomes, api_calls = self._judge_batches(
-                    text_state, batches, {key: 1 for key in questions}, report=report,
-                )
-                # Merge the complete round before thresholding any source word.
-                # A failed batch must never produce a partial text payload.
-                with report.span("selection.advancement") if report else nullcontext({}) as advancement_timing:
-                    selected_indices = [
-                        index for index, word in enumerate(words)
-                        if outcomes[f"{round_id}_{word.key}"] >= WORD_INCLUSION_THRESHOLD
-                    ]
-                    # Keep every included word. Preserve original whitespace
-                    # between adjacent words; replace omitted-word gaps with a space.
-                    parts = []
-                    previous_index = None
-                    for index in selected_indices:
-                        start, end = words[index].record["start"], words[index].record["end"]
-                        if previous_index is not None:
-                            parts.append(
-                                request[words[previous_index].record["end"]:start]
-                                if index == previous_index + 1 else " "
-                            )
-                        parts.append(request[start:end])
-                        previous_index = index
-                    text = "".join(parts)
-                    winner = Candidate("text", {"text": text}, {"text": text}) if text else None
-                    round_trace = {
-                        "round": 1, "round_id": round_id, "candidate_count": len(words),
-                        "question_count": len(questions), "winner_count": int(winner is not None),
-                        "api_calls": api_calls, "threshold": WORD_INCLUSION_THRESHOLD,
-                        "request_budget_bytes": REQUEST_BUDGET_BYTES,
-                        "threshold_comparison": ">=", "selected_indices": selected_indices,
-                        "selected_offsets": [dict(words[index].record) for index in selected_indices],
-                        "reason": None if winner else (
-                            f"No request words met the text-inclusion threshold (>= {WORD_INCLUSION_THRESHOLD:.2f})."
-                        ),
-                    }
-                    if winner is not None:
-                        round_trace["text"] = text
-                        if selected_indices[-1] - selected_indices[0] + 1 == len(selected_indices):
-                            round_trace["source_span"] = {
-                                "start": words[selected_indices[0]].record["start"],
-                                "end": words[selected_indices[-1]].record["end"],
-                            }
-                if report:
-                    round_trace.update(
-                        span_id=round_timing["span_id"], grouping_span_id=grouping_timing["span_id"],
-                        packing_span_id=packing_timing["span_id"],
-                        advancement_span_id=advancement_timing["span_id"],
-                    )
-            return Selection(winner=winner, rounds=[round_trace], action="type_text" if winner else None)

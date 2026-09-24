@@ -1,7 +1,7 @@
 # Reading run timings
 
 The [main workflow](main-workflow.md) defines the selection and timing contract.
-A candidate is one window, control, or source word. A group contains up to 50
+A candidate is one window or control. A group contains up to 50
 window/control candidates. Its complete single-question request, including
 shared state, is sized locally first; groups shrink to the largest contiguous
 candidate prefix that fits 90,000 bytes. Each selection round prepares its
@@ -13,16 +13,13 @@ control group uses the same
 round also includes `ACTION` for every finalist and a hypothetical
 `TIMER` for each of `click` and `type_text`. Only the chosen control's action and
 matching timer are used. These questions are included before sizing the round.
-Text round `text_r1` evaluates a `TEXT_WORD` Noul for every source word, in one
-call when it fits the same byte budget or parallel calls otherwise. All batches
-must validate before the inclusive `>= 0.70` inclusion rule is applied. Code types
-every selected word in source order, including disjoint selections. There is no
-second Jev selection or span-length limit. Selected words keep their punctuation;
-adjacent selected words keep their source whitespace, and omitted-word gaps become
-one space. No selected words returns `no_action`.
+Typing uses only the prepared text supplied to the run. Nonempty text survives
+clicks and is consumed by the first typing dispatch. Missing, empty, or already
+consumed text returns `no_action` when typing is selected; whitespace-only text
+is preserved. Text preparation makes no Jev calls and adds no selection round.
 Windows Search bypasses control selection and timers:
-it resolves its query before activation, then sends Win+S and immediately types
-the exact resolved string in the same iteration.
+it requires available prepared text before activation, then sends Win+S and
+immediately types that exact string in the same iteration.
 There is no intervening observation, confirmation, sleep, or Jev call, and no
 settling wait after typing. Window discovery/selection repeats until a real
 window is chosen. Later iterations retain that window, skip discovery and window
@@ -47,8 +44,6 @@ reports/run-<timestamp>-<id>/
   0006_jev_output_loop_1_control_round_1_batch_1.json
   0007_jev_input_loop_1_control_round_1_batch_2.json
   0008_jev_output_loop_1_control_round_1_batch_2.json
-  0009_jev_input_loop_1_text_round_1.json
-  0010_jev_output_loop_1_text_round_1.json
 ```
 
 The prefix uses at least four digits, expanding uniformly for longer runs to
@@ -109,7 +104,7 @@ and `timing_finished` events describe operations:
 | `started_at`, `finished_at` | Corresponding anchored UTC work boundaries. |
 | `status` | `ok`, `error`, or `interrupted`; failures retain `error_type`. |
 | `iteration`, `stage`, `round`, `round_id`, `question_keys` | Loop, selection, and HTTP correlation where applicable. |
-| `batch`, `batch_count`, `batch_candidate_count` | One-based batch position, number of calls in the round, and candidates in this batch. Text batches count one candidate per source word; action/timer questions add no candidate count. Inherited by nested SDK and HTTP events. |
+| `batch`, `batch_count`, `batch_candidate_count` | One-based batch position, number of calls in the round, and candidates in this batch. Action/timer questions add no candidate count. Inherited by nested SDK and HTTP events. |
 | `body_bytes`, `request_budget_bytes` | Complete SDK-prepared body size and the 90,000-byte budget, retained with each API call and batch timing. |
 
 Use `duration_ms` or the explicit work boundaries, rather than subtracting event
@@ -134,24 +129,22 @@ $events | Where-Object event -eq 'timing_finished' |
 ```
 
 `startup.imports`, `startup.cli`, and `startup.report_initialization` cover the
-recorded startup work. `initialization.request_read`,
+recorded startup work. `initialization.request_read`, optional `initialization.text_read`,
 `initialization.configuration`, `initialization.driver`,
 `initialization.http_client`, `initialization.typesafe_client`, and
 `initialization.selector` cover setup before `pipeline`. Within the pipeline:
 
 | Operation | Measured work |
 | --- | --- |
-| `request_word_preparation` | Splitting the original request into ordered source words and offsets once, before the first loop. |
 | `window_discovery` | `driver.list_windows()` through return/error; absent after the first real window is selected. |
 | `candidate_preparation` | Building window or control candidate descriptions. |
 | `window_selection`, `control_selection` | Complete window/control selection, including final action Choices and hypothetical timers where applicable. Window selection is absent when the real window is reused. |
-| `text_selection` | Complete text stage: one source-word Noul round with packing and parallel calls as needed, validation, thresholding, and local assembly of every selected word. |
 | `synthetic_resolution` | Looking up controls for a synthetic selection. |
 | `foreground_preparation` | Preparing native activation arguments. |
 | `foreground_activation` | `driver.bring_to_front()` for a real window or `driver.hotkey()` for Windows Search, through return/error. |
 | `control_acquisition` | `driver.get_window_state()` through return/error. |
 | `observation_processing` | Extracting snapshot metadata and quality information. |
-| `action_dispatch` | Native control action preparation through click/text return, or Windows Search activation through text-entry return. Text resolution precedes this span. |
+| `action_dispatch` | Native control action preparation through click/text return, or Windows Search activation through text-entry return. The prepared-text availability check precedes this span. |
 | `action_preparation` | Building native click/text arguments from the selected snapshot target. Synthetic target checks precede this span. |
 | `native_action` | `driver.click()` or `driver.type_text()` through return/error. |
 | `loop.iteration` | The containing cycle, including observation, selection, native action return, and settling when another observation follows. |
@@ -168,14 +161,12 @@ groups. `selection.packing` measures complete-round preparation and batch byte
 sizing; neither sends API requests. A singleton window can bypass selection. A
 singleton control is still selected, with its action Choice and both timers included before packing
 when execution context is available. A trailing one-candidate group remains
-whole within the same round. Text round 1 uses this same packing/parallel-call
-path with one atomic Noul question per word. All words meeting the threshold
-are assembled locally; no subsequent text-selection question or round is added.
+whole within the same round.
 An oversized single-candidate selection question plus state fails during grouping;
-an oversized atomic action/timer/Noul question fails during packing. A round of
+an oversized atomic action/timer question fails during packing. A round of
 only singleton groups also fails during grouping when it cannot reduce multiple
 candidates. These failures occur before that round sends any API calls. A missing
-HTTP event after that failure does not imply that words or candidates were silently skipped.
+HTTP event after that failure does not imply that candidates were silently skipped.
 
 Foreground activation precedes every real-window control snapshot, including
 snapshots of the retained window. Reuse has no `window_discovery`,
@@ -184,25 +175,25 @@ the fresh snapshot still emits `window_observed`.
 Windows Search uses `foreground_activation` for desktop Win+S, then directly
 dispatches desktop `type_text`. It has no live UIA read, control candidates,
 control-selection rounds, or settling timer. Both native requests and results
-are recorded separately under the same iteration. Its entire text-selection stage occurs
-before `foreground_activation`, and is absent when the exact `--text` override
-is supplied. Unresolved text has no `native_action` or Search activation.
+are recorded separately under the same iteration. Missing, empty, or consumed
+prepared text stops with `no_action` before Search activation or `native_action`.
 Absent stages mean the work did not occur.
 
 Selection traces retain every group question, answer, and probability distribution
 in each round's `api_calls` list. The final control round also retains every
-finalist's action and both timing answers. Text round 1 retains every Noul
-probability, `threshold: 0.70`, `threshold_comparison: ">="`,
-`selected_indices`, `selected_offsets`, and assembled `text` or an unresolved
-`reason`. `source_span` appears only for contiguous selections and is omitted
-when selected words were disjoint. All words meeting the threshold appear in
-the final text. The `text_selected` event links this round to the destination.
-`request_words_prepared` records the source spans once.
+finalist's action and both timing answers. `run_started.text` records supplied
+text, and `action_requested.arguments.text` records the exact dispatched string.
 `loop_route` records whether the pipeline continues or stops. The result's
 `iterations` array retains the route and selected `settling_ms`. Use
 `(iteration, round_id)` when correlating repeated names such as `controls_r1`;
 `round_id` alone can identify different rounds in different passes. The existing
 span and HTTP request IDs remain unique within the run.
+
+Historical reports may include `request_word_preparation`, `request_words_prepared`,
+`text_selection`, `text_selected`, and a `text_r1` source-word Noul round. Its
+threshold, selected offsets/indices, optional `source_span`, and assembled text
+describe the former request-word fallback; use the recorded threshold and API
+calls when reading those runs. Current runs emit none of these text-selection fields.
 
 For a timeline, label each loop from the `window_discovery` operation's
 `started_elapsed_ms`, or `control_acquisition.started_elapsed_ms` when the real
@@ -270,10 +261,8 @@ unique across the whole round. `iteration`, `round_id`, `batch`, and
 uses one `api_calls` list, including rounds with only one call. Each call retains
 its own model identities, token usage, questions, answers, probabilities, and
 SDK/validation span IDs, plus its batch number, batch count, candidate count,
-prepared `body_bytes`, and batch span ID. The same fields apply to text-stage
-Noul batches. The round's groups retain their options and winners
-in original group order; word decisions retain source-word order, regardless of response
-order. Historical
+prepared `body_bytes`, and batch span ID. The round's groups retain their options
+and winners in original group order, regardless of response order. Historical
 reports used a singular `api_call` record; consumers reading them should treat
 it as a one-item list. New reports do not duplicate the singular field.
 
@@ -287,11 +276,9 @@ The timing summary's `jev_api_call_count` counts actual prepared requests seen
 by the HTTP hook. It is zero when no request occurs; Python callers must register
 the report hooks to obtain this count. It can also be checked by counting
 `jev_request` events across all iterations, including failed calls; local sizing
-is excluded. Each action, timer, or Noul question shares the duration of its batch.
-A final control round or the single text round may have one or more parallel
-calls. The complete text stage contains only `text_r1`; count its actual API
-requests while reporting the round's duration separately. Count actual requests,
-not individual questions. Inspect each
+is excluded. Each action or timer question shares the duration of its batch.
+A final control round may have one or more parallel calls. Count actual requests
+while reporting the round's duration separately. Inspect each
 request/response pair to see its complete question and probability distributions;
 do not count individual questions as requests.
 

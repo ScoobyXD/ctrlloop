@@ -14,11 +14,14 @@ PROJECT_DIR = Path(__file__).resolve().parents[2]
 
 def run(args: dict, **kwargs) -> str:
     """Return a Hermes JSON string; never wait for or summarize the child run."""
-    if not isinstance(args, dict) or set(args) != {"request"}:
-        return tool_error("Provide exactly one field: request (a nonempty string).")
+    if not isinstance(args, dict) or "request" not in args or set(args) - {"request", "text"}:
+        return tool_error("Provide request (a nonempty string) and optionally text (a string).")
     request = args["request"]
     if not isinstance(request, str) or not request.strip():
         return tool_error("request must be a nonempty string.")
+    text = args.get("text", "")
+    if not isinstance(text, str):
+        return tool_error("text must be a string when provided.")
     if os.name != "nt":
         return tool_error("This ctrlloop launcher requires Windows.")
 
@@ -31,14 +34,20 @@ def run(args: dict, **kwargs) -> str:
         # Use the existing --request-file contract, preserving UTF-8 bytes and
         # line endings without putting user text into a shell or command line.
         request_bytes = request.encode("utf-8")
+        text_bytes = text.encode("utf-8")
         launches = PROJECT_DIR / ".local" / "hermes"
         launches.mkdir(parents=True, exist_ok=True)
         directory = Path(tempfile.mkdtemp(prefix="launch-", dir=launches))
         request_file = directory / "request.txt"
         request_file.write_bytes(request_bytes)
+        command = [str(python), str(main), "--request-file", str(request_file)]
+        if text:
+            text_file = directory / "text.txt"
+            text_file.write_bytes(text_bytes)
+            command.extend(["--text-file", str(text_file)])
         with (directory / "stdout.json").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:
             process = subprocess.Popen(
-                [str(python), str(main), "--request-file", str(request_file)],
+                command,
                 cwd=PROJECT_DIR,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout,
@@ -59,10 +68,8 @@ def register(ctx) -> None:
         schema={
             "name": "ctrlloop_run",
             "description": (
-                "Launch a computer-use task in the local ctrlloop program; Jev selects the UI actions. "
-                "Pass the user's original task text unchanged. Returns only a process launch receipt, "
-                "not execution success or task completion. No result retrieval or Stop forwarding is connected. "
-                "Do not launch another task or perform other computer-use actions while it may still be running."
+                "Use for desktop or app interaction. Launch receipt only; no completion reporting or Stop. "
+                "Do not overlap other computer-use actions."
             ),
             "parameters": {
                 "type": "object",
@@ -70,7 +77,14 @@ def register(ctx) -> None:
                     "request": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "The original user task text, passed verbatim to ctrlloop. No conversation history is added.",
+                        "description": "Turn the user's intent and conversation context into a concise English computer-use command.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "Prepare the exact text for the first typing step (search, URL, or message). "
+                            "Required for typing; used once."
+                        ),
                     },
                 },
                 "required": ["request"],

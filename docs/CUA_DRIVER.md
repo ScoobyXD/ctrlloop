@@ -199,21 +199,26 @@ Windows Search command, and adds no automatic delivery-mode retry.
 
 If the synthetic Windows Search window wins, its activation stage instead sends
 `hotkey({scope: "desktop", keys: ["win", "s"]})` and directly follows it with
-`type_text({scope: "desktop", text: <resolved text>})`. There is no
+`type_text({scope: "desktop", text: <prepared text>})`. There is no
 intervening observation, confirmation, sleep, control search, or Jev call. Both
 commands use the same MCP client and iteration; the next iteration observes the
 real search results without a settling wait. Real Start/Search windows remain
 available to normal window and control selection. A freshly observed visible
-Search destination suppresses the synthetic opener until it closes. If Search
-is not observed and the opener wins again immediately after the identical query,
-the pipeline returns `observation_unavailable` without another hotkey or typing
-call. The adapter retains each native result, and uncertain input is never replayed.
+Search destination suppresses the synthetic opener until it closes. If the opener
+wins after prepared text was consumed, the pipeline returns `no_action` without
+another hotkey or typing call. The adapter retains each native result, and
+uncertain input is never replayed.
 
-Supply the exact query with `--text` or `run_pipeline(..., text=...)`. Valid
-strings are preserved verbatim, while explicitly empty or whitespace-only
-strings are rejected. Otherwise, one round of source-word Nouls selects every
-word meeting `>= 0.70` in request order before either command. No selected words
-returns `no_action` before sending Win+S or typing.
+Supply exact prepared text with `--text`, `--text-file`, or
+`run_pipeline(..., text=...)`. A nonempty string remains available through clicks
+and is consumed by the first typing dispatch, either into an observed control or
+Windows Search. Unicode, whitespace, and line endings are preserved, including
+whitespace-only strings; `--text-file` reads UTF-8 bytes without newline conversion.
+Missing, empty, or already used text returns `no_action` when typing is selected,
+with the reason `No prepared text is available for this typing operation (missing, empty, or already used).`
+Windows Search checks this before sending Win+S. There is no text-generation or
+source-word selection call in the loop. Existing native insertion and caret behavior
+remain unchanged; the app does not clear, replace, or submit the field automatically.
 
 The `action_returned` event and `last_action.result` preserve native response
 facts, including their actual effect and delivery metadata. Clicks continue to
