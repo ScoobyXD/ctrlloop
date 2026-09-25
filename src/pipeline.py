@@ -153,6 +153,7 @@ async def run_pipeline(
     original_request: str, driver: BrowserDriver, selector: ChoiceSelector,
     *, report: RunReport | None = None, max_iterations: int = DEFAULT_MAX_ITERATIONS,
     text: str | None = None,
+    screenshots: bool = True,
 ) -> PipelineResult:
     """Execute bounded loops; external text is used once, completion is not inferred."""
     if type(max_iterations) is not int or max_iterations < 1:
@@ -241,16 +242,24 @@ async def run_pipeline(
                 arguments["text"] = pending_text
             result.last_control = {"page": state["current_page"], "control": winner.description, "action": tool}
             state["last_control"] = result.last_control
-            with _span(report, "action_dispatch", tool=tool):
-                if report:
-                    report.append("action_requested", tool=tool, arguments=arguments, snapshot_id=result.snapshot_id,
-                                  boundary="before_browser_use_action_call")
-                with _span(report, "browser_action", tool=tool, completion_scope="call_return"):
-                    try:
+            if screenshots and report:
+                trace["screenshots"] = {
+                    "before": await report.capture_screenshot(driver, phase="before", iteration=iteration),
+                }
+            try:
+                with _span(report, "action_dispatch", tool=tool):
+                    if report:
+                        report.append("action_requested", tool=tool, arguments=arguments, snapshot_id=result.snapshot_id,
+                                      boundary="before_browser_use_action_call")
+                    with _span(report, "browser_action", tool=tool, completion_scope="call_return"):
                         native_result = await driver.act(tool, **arguments)
-                    except DriverError as error:
-                        error.context.update(stage=tool, selection=result.to_dict())
-                        raise
+            except DriverError as error:
+                if report:
+                    report.append("loop_action_finished", iteration=iteration, boundary="browser_use_action_call_error")
+                if screenshots and report:
+                    trace["screenshots"]["after"] = await report.capture_screenshot(driver, phase="after", iteration=iteration)
+                error.context.update(stage=tool, selection=result.to_dict())
+                raise
             result.action_result = native_result.model_dump(mode="json", exclude_none=True)
             state["last_action"] = {"tool": tool, "result": result.action_result}
             if tool == "type_text":
@@ -262,6 +271,8 @@ async def run_pipeline(
             if report:
                 report.append("action_returned", tool=tool, action_result=result.action_result)
                 report.append("loop_action_finished", iteration=iteration, boundary="browser_use_action_call_return")
+            if screenshots and report:
+                trace["screenshots"]["after"] = await report.capture_screenshot(driver, phase="after", iteration=iteration)
             if native_result.error:
                 result.status = "action_error"
                 result.reason = native_result.error

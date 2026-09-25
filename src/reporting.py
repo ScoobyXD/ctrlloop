@@ -1,11 +1,13 @@
 """Buffer observations and HTTP bytes; save reports on a worker at completion."""
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -99,6 +101,32 @@ class RunReport:
         finally:
             self._write_ns += perf_counter_ns() - started_ns
             self._write_count += 1
+
+    async def capture_screenshot(self, driver, *, phase: str, iteration: int | None = None) -> str | None:
+        """Save a native viewport image without refreshing the selected DOM map.
+
+        Images are local report artifacts, never Jev inputs. Capture failures are
+        diagnostic and must not hide an action result or cause an action replay.
+        """
+        if phase not in {"before", "after", "navigation_error"}:
+            raise ValueError("Unknown screenshot phase")
+        name = f"loop-{iteration:04d}-{phase}.png" if iteration is not None else f"{phase}.png"
+        destination = self.requests_path / "screenshots" / name
+        try:
+            with self.span("screenshot_capture", phase=phase, iteration=iteration):
+                content = await asyncio.wait_for(driver.screenshot(), timeout=5.0)
+            with self.span("screenshot_write", phase=phase, iteration=iteration):
+                def write_image():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    self._write_document(content, path=destination)
+
+                await asyncio.to_thread(write_image)
+            self.append("screenshot_saved", phase=phase, iteration=iteration, path=str(destination))
+            return str(destination)
+        except Exception as error:
+            self.append("screenshot_error", phase=phase, iteration=iteration, error_type=type(error).__name__)
+            logging.getLogger(__name__).warning("Could not save %s screenshot; see the run report.", phase)
+            return None
 
     def _write_document(self, content: str | bytes, *, path: Path | None = None) -> None:
         destination = self.path if path is None else path

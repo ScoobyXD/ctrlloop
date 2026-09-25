@@ -9,6 +9,7 @@ dependencies = ["typesafe-sdk==0.7.1", "python-dotenv==1.2.2", "httpx2==2.13.0",
 preferred-python = "3.11.15"
 jev-model = "jev-1.13.0"
 browser-use-commit = "d8110c5ff87ccba887aaa726cdb780f2f84bef8d"
+browser-use-patches = ["patches/browser-use-profile-copy-cleanup.patch", "patches/browser-use-storage-state-privacy.patch", "patches/browser-use-attached-profile.patch"]
 
 [tool.uv]
 package = false

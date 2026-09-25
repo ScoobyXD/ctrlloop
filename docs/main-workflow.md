@@ -1,19 +1,25 @@
 # Browser workflow
 
-The caller supplies an original request, starting HTTP(S) URL, optional exact text and iteration bound. One invocation owns one local headless Browser Use session and fresh profile.
+The caller supplies an original request, optional HTTP(S) URL, optional exact text and iteration bound. Commands attach to a named persistent headless browser (`--browser-profile`, default `default`). The profile lives under `.local/browsers/<name>/user-data`; Chrome is launched detached from the command and is never killed by command cleanup.
 
-1. Start the browser and navigate to the supplied URL.
-2. Capture fresh `BrowserStateSummary` without a screenshot. Use its native filtered selector map, including every offered entry.
+1. Acquire the profile's nonblocking OS command lease. Verify its loopback CDP listener against the exact executable and managed user-data directory, or start Chrome independently with that same directory and `--restore-last-session`. Attach Browser Use with external ownership and `keep_alive=True`. For an uninitialized profile, seed starting-host cookies/origin storage from the verified live personal Chrome session once (or explicitly initialize signed out with `--fresh-profile`), verify the import, and save initialization metadata. Subsequent commands use native browser state without contacting personal Chrome. Restore the last controlled tab if it still exists. Navigate only when `--url` is provided; otherwise continue the current page without reloading.
+2. Capture fresh `BrowserStateSummary`. Use its native filtered selector map, including every offered entry. Action screenshots are captured separately so selection does not use images and preview never refreshes the map.
 3. Build existing `Candidate` objects. Compact descriptions contain observed labels, roles, selected attributes, state and ancestor context. Local records retain execution identity; original nodes remain in Browser Use.
 4. Run the existing `ChoiceSelector` in a worker thread. Groups of up to 50 advance through batched rounds to one winner. Selection, speculative action and settling questions retain their wording/choices. The model remains `jev-1.13.0`; requests retain the 90,000-byte ceiling.
-5. Dispatch one Browser Use click or input with prepared text and `clear=False`. Do not refresh the selected map before dispatch. Stop on unavailable text, invalid identity or native action error.
-6. Retain action result and previous-control context. If another iteration is allowed, wait the selected settling duration and observe again.
-7. At the limit, return `iteration_limit` without claiming completion. Close the owned browser.
+5. Save a before-action viewport PNG, then dispatch one Browser Use click or input with prepared text and `clear=False`. Do not refresh the selected map before dispatch. Stop on unavailable text, invalid identity or native action error.
+6. Retain action result and previous-control context, record the action-return boundary, and save an after-action PNG. Capture failures are diagnostics, not action failures. If another iteration is allowed, wait the selected settling duration and observe again.
+7. At the limit, return `iteration_limit` without claiming completion. Save the controlled tab ID, stop the command preview, disconnect Browser Use/CDP, and release the profile lease. Leave Chrome and all its profile files intact. This cleanup also runs on ordinary errors and Ctrl+C; OS locks are released on process death.
 
 No Browser Use `Agent.run()` or planning LLM is used. Browser Use performs observation/execution, and our Jev selector owns decisions. No additional eligibility filtering is applied, so Browser Use's candidate-quality limitations remain visible in reports.
 
 Prepared text is not generated or rewritten. It survives click-only iterations and is consumed once at typing dispatch. The current questions choose click versus type; other browser capabilities are not newly inferred decisions.
 
-Parallel invocations share code/packages only. Each owns its profile, session, candidate map, history and reports. An index from one browser must never be dispatched in another.
+Parallel commands require different named automation profiles. A second command targeting the same profile fails with `browser_runtime_busy` instead of navigating shared tabs during selection. A browser index from one command must never be dispatched against another observation. The persistent profile retains every site's browser-managed data and all open tabs; live page state remains while the process is alive. Reboot loses JavaScript memory, but Chrome reuses the same disk profile and requests session restoration.
+
+`browser_runtime.py --install-startup` registers an idempotent HKCU Run entry for the current Windows user. It runs `pythonw.exe .../browser_runtime.py --start-all` at sign-in, starts every configured automation profile, writes credential-free startup status, then exits without closing browsers. This is user-logon startup, not pre-login execution. Browsers have no command-completion or idle timeout. Unexpectedly exited browsers restart from the same directory on the next command. Removing the startup entry does not terminate browsers or delete data.
+
+The initial personal Chrome import is still limited to starting-host cookies plus localStorage/sessionStorage from matching open tabs; it does not clone IndexedDB, passkeys, or every account. Chrome consent/profile checks remain in force only for this initial seed. The persistent browser then maintains its own complete storage; it does not sync mutations back to personal Chrome. Reports retain only source metadata/counts, never cookie values.
+
+The CLI enables screenshots and a read-only live viewer by default (`--no-screenshots` / `--no-preview` disable them). The viewer samples the current page using Browser Use's existing CDP screenshot method, binds only to loopback, and requires the per-run URL token. It starts after connection/navigation, shows capture status, and closes before the command disconnects. The browser itself stays running. Reports retain before/after paths and capture/write timings; a navigation failure also attempts a diagnostic image. These images do not enter Jev state. The after-action image is immediate, without an extra final settling wait.
 
 The preserved desktop loop and its launch compatibility are described in [demo preservation](hermes-plugin.md).

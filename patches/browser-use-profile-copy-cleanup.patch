@@ -1,0 +1,88 @@
+diff --git a/browser_use/browser/profile.py b/browser_use/browser/profile.py
+index c5f4b73..f1519d4 100644
+--- a/browser_use/browser/profile.py
++++ b/browser_use/browser/profile.py
+@@ -866,42 +866,60 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
+ 		if not is_chrome:
+ 			return
+ 
+-		temp_dir = tempfile.mkdtemp(prefix='browser-use-user-data-dir-')
++		import shutil
++
+ 		path_original_user_data = Path(self.user_data_dir)
++		original_user_data = path_original_user_data.resolve()
++		temp_root = Path(tempfile.gettempdir()).resolve()
++		temp_dir = tempfile.mkdtemp(prefix='browser-use-user-data-dir-')
++		owned_temp_dir = Path(temp_dir).resolve()
+ 		path_original_profile = path_original_user_data / self.profile_directory
+ 		path_temp_profile = Path(temp_dir) / self.profile_directory
+-
+-		if path_original_profile.exists():
+-			import shutil
+-
+-			try:
++		copy_completed = False
++		try:
++			if path_original_profile.exists():
+ 				shutil.copytree(
+ 					path_original_profile,
+ 					path_temp_profile,
+ 					ignore=_ignore_chrome_profile_transient_files,
+ 				)
+-			except (OSError, shutil.Error) as error:
+-				if not _is_chrome_profile_lock_error(error):
+-					raise
+-
+-				shutil.rmtree(temp_dir, ignore_errors=True)
++				local_state_src = path_original_user_data / 'Local State'
++				local_state_dst = Path(temp_dir) / 'Local State'
++				if local_state_src.exists():
++					shutil.copy(local_state_src, local_state_dst)
++				logger.info(f'Copied profile ({self.profile_directory}) and Local State to temp directory: {temp_dir}')
++			else:
++				Path(temp_dir).mkdir(parents=True, exist_ok=True)
++				path_temp_profile.mkdir(parents=True, exist_ok=True)
++				logger.info(f'Created new profile ({self.profile_directory}) in temp directory: {temp_dir}')
++			self.user_data_dir = temp_dir
++			copy_completed = True
++		except (OSError, shutil.Error) as error:
++			if _is_chrome_profile_lock_error(error):
+ 				raise RuntimeError(
+ 					f'Unable to copy Chrome profile "{self.profile_directory}" because one or more files are locked. '
+ 					'Close any Chrome windows using this profile, or start browser-use with --cdp-url to connect to '
+ 					'an already-running browser instead of copying the profile.'
+ 				) from error
+-			local_state_src = path_original_user_data / 'Local State'
+-			local_state_dst = Path(temp_dir) / 'Local State'
+-			if local_state_src.exists():
+-				shutil.copy(local_state_src, local_state_dst)
+-			logger.info(f'Copied profile ({self.profile_directory}) and Local State to temp directory: {temp_dir}')
+-
+-		else:
+-			Path(temp_dir).mkdir(parents=True, exist_ok=True)
+-			path_temp_profile.mkdir(parents=True, exist_ok=True)
+-			logger.info(f'Created new profile ({self.profile_directory}) in temp directory: {temp_dir}')
+-
+-		self.user_data_dir = temp_dir
++			raise
++		finally:
++			if not copy_completed:
++				try:
++					# Only this exact mkdtemp result is ours; never delete the source or a redirected path.
++					if (
++						Path(temp_dir).resolve() == owned_temp_dir
++						and not Path(temp_dir).is_symlink()
++						and owned_temp_dir.parent == temp_root
++						and owned_temp_dir.name.startswith('browser-use-user-data-dir-')
++						and not owned_temp_dir.is_relative_to(original_user_data)
++						and not original_user_data.is_relative_to(owned_temp_dir)
++					):
++						shutil.rmtree(owned_temp_dir)
++					else:
++						logger.warning('Failed profile copy changed its temporary path; cleanup refused: %s', temp_dir)
++				except OSError:
++					# Preserve the copy failure while identifying any leftover owned directory.
++					logger.warning('Unable to clean up failed profile copy: %s', temp_dir)
+ 
+ 	def get_args(self) -> list[str]:
+ 		"""Get the list of all Chrome CLI launch args for this profile (compiled from defaults, user-provided, and system-specific)."""
