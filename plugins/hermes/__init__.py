@@ -1,4 +1,4 @@
-"""Minimal Hermes adapter: launch the existing CLI and acknowledge the launch."""
+"""Hermes adapter for the preserved desktop demo and its original tool contract."""
 
 import os
 from pathlib import Path
@@ -8,8 +8,10 @@ import tempfile
 from tools.registry import tool_error, tool_result
 
 
-# resolve() follows the user-plugin junction back to this editable checkout.
-PROJECT_DIR = Path(__file__).resolve().parents[2]
+# The existing user-plugin junction stays valid. New Hermes imports launch the
+# archived demo directly; already-loaded adapters are handled by src/main.py.
+SOURCE_PROJECT_DIR = Path(__file__).resolve().parents[2]
+PROJECT_DIR = SOURCE_PROJECT_DIR.with_name("ctrlloop-hermes-cua-demo-2026-09-25")
 
 
 def run(args: dict, **kwargs) -> str:
@@ -27,12 +29,13 @@ def run(args: dict, **kwargs) -> str:
 
     python = PROJECT_DIR / ".venv" / "Scripts" / "python.exe"
     main = PROJECT_DIR / "src" / "main.py"
+    driver = PROJECT_DIR / ".runtime" / "cua-driver" / "cua-driver.exe"
     if not python.is_file() or not main.is_file():
         return tool_error("ctrlloop requires .venv/Scripts/python.exe and src/main.py in its source checkout.")
+    if not driver.is_file():
+        return tool_error("The preserved ctrlloop demo requires its archived CUA driver.")
 
     try:
-        # Use the existing --request-file contract, preserving UTF-8 bytes and
-        # line endings without putting user text into a shell or command line.
         request_bytes = request.encode("utf-8")
         text_bytes = text.encode("utf-8")
         launches = PROJECT_DIR / ".local" / "hermes"
@@ -40,7 +43,8 @@ def run(args: dict, **kwargs) -> str:
         directory = Path(tempfile.mkdtemp(prefix="launch-", dir=launches))
         request_file = directory / "request.txt"
         request_file.write_bytes(request_bytes)
-        command = [str(python), str(main), "--request-file", str(request_file)]
+        command = [str(python), str(main), "--request-file", str(request_file),
+                   "--env-file", str(SOURCE_PROJECT_DIR / ".env"), "--driver", str(driver)]
         if text:
             text_file = directory / "text.txt"
             text_file.write_bytes(text_bytes)
@@ -55,7 +59,6 @@ def run(args: dict, **kwargs) -> str:
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
     except (OSError, UnicodeError) as error:
-        # OS errors can embed paths or request contents; return only the type.
         return tool_error(f"ctrlloop launch failed ({type(error).__name__}). Check the local checkout and file permissions.")
 
     return tool_result(status="launched", pid=process.pid, directory=str(directory))

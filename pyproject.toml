@@ -2,12 +2,16 @@
 name = "ctrlloop"
 version = "0.0.0"
 requires-python = ">=3.11"
-dependencies = ["typesafe-sdk==0.7.1", "python-dotenv==1.2.3", "httpx2==2.13.0"]
+dependencies = ["typesafe-sdk==0.7.1", "python-dotenv==1.2.2", "httpx2==2.13.0", "browser-use==0.13.10"]
 
 [tool.ctrlloop]
-# SETUP.md passes this preference to uv; it does not restrict compatibility.
+# Recorded interpreter preference; it does not restrict compatibility.
 preferred-python = "3.11.15"
 jev-model = "jev-1.13.0"
+browser-use-commit = "d8110c5ff87ccba887aaa726cdb780f2f84bef8d"
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+browser-use = { path = "browser-use", editable = true }

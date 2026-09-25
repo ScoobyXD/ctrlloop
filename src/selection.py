@@ -423,7 +423,7 @@ class ChoiceSelector:
                                                 "candidate": {candidate.key: candidate.description},
                                                 "action": possible_action,
                                                 "app_context": settling_context,
-                                                "timing_scope": "after_cua_return",
+                                                "timing_scope": "after_browser_action_return",
                                                 "premise": "Assume this candidate and action are selected.",
                                             },
                                             criteria={label: None for label in SETTLING_MS},
