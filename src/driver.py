@@ -1,4 +1,4 @@
-"""Native Cua Driver MCP over an existing Fleet claim; no parallel wire model.
+"""Native Cua Driver MCP over Fleet or VM loopback; no parallel wire model.
 
 Fleet handles authentication/routing. Closing ends this request's Driver session
 and disconnects, without releasing the desktop or changing its expiry.
@@ -16,11 +16,13 @@ import math
 import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Any
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from cua_sandbox import Sandbox
+import httpx2
 
 
 PINNED_DRIVER_VERSION = "0.24.0"
@@ -63,33 +65,52 @@ class CuaDriver:
     Actions are never retried. Uncertain transport failures end this run.
     """
 
-    def __init__(self, claim_file: Path, *, service: str = "mcp", timeout: float = 60.0) -> None:
+    def __init__(self, claim_file: Path | None = None, *, service: str = "mcp", timeout: float = 60.0,
+                 local_endpoint: str | None = None, local_token: str | None = None) -> None:
         if not isinstance(service, str) or not re.fullmatch(r"[a-zA-Z0-9_-]+", service):
             raise ValueError("service must name one Fleet service")
         if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be a positive finite number")
-        self.claim_file = Path(claim_file).expanduser().resolve()
+        if (claim_file is None) == (local_endpoint is None):
+            raise ValueError("Provide exactly one Fleet claim_file or local_endpoint.")
+        if local_endpoint is not None:
+            parts = urlsplit(local_endpoint)
+            if (parts.scheme != "http" or parts.hostname not in {"127.0.0.1", "::1", "localhost"}
+                    or parts.path != "/mcp" or parts.query or parts.fragment or parts.username or parts.password):
+                raise ValueError("local_endpoint must be an HTTP loopback /mcp endpoint without credentials.")
+            parts.port  # Reject malformed ports before opening a connection.
+        elif local_token is not None:
+            raise ValueError("local_token is only supported with local_endpoint.")
+        self.claim_file = Path(claim_file).expanduser().resolve() if claim_file is not None else None
+        self.local_endpoint = local_endpoint
+        self._local_http: httpx2.AsyncClient | None = None
         self.service, self.timeout = service, timeout
         self.session = f"ctrlloop-{uuid4().hex[:16]}"
         self.session_info: dict[str, Any] = {
-            "provider": "fleet", "service": service, "session": self.session,
+            "provider": "local" if local_endpoint else "fleet", "service": service, "session": self.session,
             "close_behavior": "disconnect_only", "claim_preserved": True,
-            "local_lock_scope": "this_checkout_and_claim",
+            "local_lock_scope": "this_user_and_endpoint" if local_endpoint else "this_checkout_and_claim",
         }
         self.desktop_url: str | None = None
         self.server_info: dict[str, Any] = {}
         self.tools: dict[str, dict[str, Any]] = {}
         self._sandbox: Any = None
         self._headers = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
+        if local_token:
+            self._headers["authorization"] = f"Bearer {local_token}"
         self._sequence = 0
         self._lock = asyncio.Lock()
         self._claim_lock: Any = None
         self._started = self._closed = self._broken = self._session_started = False
         self._snapshot: dict[str, Any] | None = None
 
-    def _acquire_claim_lock(self, reference: dict[str, Any]) -> None:
-        identity = json.dumps([reference["namespace"], reference["claim"]], separators=(",", ":"))
-        directory = _PROJECT / ".local" / "fleet-locks"
+    def _acquire_claim_lock(self, reference: dict[str, Any] | None = None) -> None:
+        if self.local_endpoint:
+            identity = self.local_endpoint
+            directory = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir())) / "ctrlloop-driver-locks"
+        else:
+            identity = json.dumps([reference["namespace"], reference["claim"]], separators=(",", ":"))
+            directory = _PROJECT / ".local" / "fleet-locks"
         directory.mkdir(parents=True, exist_ok=True)
         handle = (directory / f"{hashlib.sha256(identity.encode()).hexdigest()}.lock").open("a+b")
         try:
@@ -106,7 +127,7 @@ class CuaDriver:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             handle.close()
-            raise DriverError("Another local control loop is using this Fleet claim.", code="desktop_in_use") from None
+            raise DriverError("Another control loop is using this desktop.", code="desktop_in_use") from None
         self._claim_lock = handle
 
     def _release_claim_lock(self) -> None:
@@ -125,22 +146,27 @@ class CuaDriver:
                 raise ValueError("The starting URL must be an absolute HTTP or HTTPS URL without credentials.")
         self._started = True
         try:
-            try:
-                reference = _json(self.claim_file.read_text(encoding="utf-8"))
-                if not isinstance(reference, dict) or any(
-                    not isinstance(reference.get(key), str) or not reference[key]
-                    for key in ("namespace", "pool", "claim")
-                ):
-                    raise ValueError
-                self._acquire_claim_lock(reference)
-            except (OSError, ValueError, KeyError):
-                raise DriverError("The saved Fleet claim reference is missing or invalid.", code="claim_reference_invalid") from None
-            self._sandbox = await asyncio.wait_for(Sandbox.from_dict(reference), self.timeout)
-            self.session_info.update(namespace=reference["namespace"], pool=reference["pool"],
-                                     claim=reference["claim"], sandbox=self._sandbox.name)
-            base = (f"https://run.cua.ai/api/svc/{quote(reference['namespace'], safe='')}/"
-                    f"{quote(self._sandbox.name, safe='')}")
-            self.desktop_url = base + "-vnc/vnc.html?autoconnect=1"
+            if self.local_endpoint:
+                self._acquire_claim_lock()
+                # VM-internal requests must never inherit host proxy settings.
+                self._local_http = httpx2.AsyncClient(timeout=self.timeout, trust_env=False, follow_redirects=False)
+            else:
+                try:
+                    reference = _json(self.claim_file.read_text(encoding="utf-8"))
+                    if not isinstance(reference, dict) or any(
+                        not isinstance(reference.get(key), str) or not reference[key]
+                        for key in ("namespace", "pool", "claim")
+                    ):
+                        raise ValueError
+                    self._acquire_claim_lock(reference)
+                except (OSError, ValueError, KeyError):
+                    raise DriverError("The saved Fleet claim reference is missing or invalid.", code="claim_reference_invalid") from None
+                self._sandbox = await asyncio.wait_for(Sandbox.from_dict(reference), self.timeout)
+                self.session_info.update(namespace=reference["namespace"], pool=reference["pool"],
+                                         claim=reference["claim"], sandbox=self._sandbox.name)
+                base = (f"https://run.cua.ai/api/svc/{quote(reference['namespace'], safe='')}/"
+                        f"{quote(self._sandbox.name, safe='')}")
+                self.desktop_url = base + "-vnc/vnc.html?autoconnect=1"
             initialized = await self._rpc("initialize", {
                 "protocolVersion": "2025-06-18", "capabilities": {},
                 "clientInfo": {"name": "ctrlloop", "version": "0.0.0"},
@@ -180,8 +206,15 @@ class CuaDriver:
                 pass
             if isinstance(error, (DriverError, asyncio.CancelledError, KeyboardInterrupt)):
                 raise
-            raise DriverError("Could not connect to the saved Fleet desktop; check its expiry and credentials.",
-                              code="fleet_connection_failed") from None
+            raise DriverError("Could not connect to the configured desktop Driver.",
+                              code="local_connection_failed" if self.local_endpoint else "fleet_connection_failed") from None
+
+    async def _request(self, method: str, body: dict[str, Any] | None = None):
+        if self._local_http:
+            return await self._local_http.request(method, self.local_endpoint, headers=self._headers, json=body)
+        return await self._sandbox.services.request(
+            self.service, method=method, path="/mcp", headers=self._headers, **({"json": body} if body is not None else {}),
+        )
 
     async def _rpc(self, method: str, params: dict[str, Any] | None = None,
                    *, notification: bool = False) -> dict[str, Any]:
@@ -193,12 +226,10 @@ class CuaDriver:
         if not notification:
             body["id"] = request_id
         try:
-            response = await asyncio.wait_for(self._sandbox.services.request(
-                self.service, method="POST", path="/mcp", headers=self._headers, json=body,
-            ), self.timeout)
+            response = await asyncio.wait_for(self._request("POST", body), self.timeout)
             if not 200 <= response.status_code < 300:
-                code = "fleet_authorization_denied" if response.status_code in (401, 403) else "driver_transport_failed"
-                raise DriverError("The Fleet Driver request failed; completion is unknown and was not retried.", code=code)
+                code = ("driver_authorization_denied" if self.local_endpoint else "fleet_authorization_denied") if response.status_code in (401, 403) else "driver_transport_failed"
+                raise DriverError("The Driver request failed; completion is unknown and was not retried.", code=code)
             if session := response.headers.get("mcp-session-id"):
                 if previous := self._headers.get("mcp-session-id"):
                     if session != previous:
@@ -360,10 +391,10 @@ class CuaDriver:
         return payload
 
     async def _tool_result(self, tool: str, arguments: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        if self._closed or not self._sandbox or self._broken:
+        if self._closed or not (self._sandbox or self._local_http) or self._broken:
             raise DriverError("This Driver connection is unavailable; start a new run and observe again.", code="driver_closed", tool=tool)
         args = self._arguments(tool, arguments)
-        if tool in {"click", "type_text"}:
+        if tool in {"click", "type_text", "press_key"}:
             self._validate_target(tool, args)
         if tool == "get_window_state" or self.tools[tool].get("annotations", {}).get("readOnlyHint") is not True:
             # Invalidate BEFORE dispatch: interrupted input may already land.
@@ -373,7 +404,7 @@ class CuaDriver:
             payload = self._payload(tool, result)
             if tool == "get_window_state":
                 self._validate_snapshot(payload, args)
-            if tool in {"click", "type_text"}:
+            if tool in {"click", "type_text", "press_key"}:
                 # These are native ActionResult fields. A successful transport
                 # without these facts cannot justify another control decision.
                 effect, route = payload.get("effect"), payload.get("route")
@@ -427,7 +458,7 @@ class CuaDriver:
             self._snapshot = None
             failure: Exception | None = None
             try:
-                if self._sandbox and self._session_started:
+                if (self._sandbox or self._local_http) and self._session_started:
                     try:
                         result = await asyncio.wait_for(self._rpc("tools/call", {
                             "name": "end_session", "arguments": {"session": self.session},
@@ -435,11 +466,9 @@ class CuaDriver:
                         self._payload("end_session", result)
                     except Exception as error:
                         failure = error
-                if self._sandbox and "mcp-session-id" in self._headers:
+                if (self._sandbox or self._local_http) and "mcp-session-id" in self._headers:
                     try:
-                        response = await asyncio.wait_for(self._sandbox.services.request(
-                            self.service, method="DELETE", path="/mcp", headers=self._headers,
-                        ), 5.0)
+                        response = await asyncio.wait_for(self._request("DELETE"), 5.0)
                         if response.status_code not in (200, 202, 204, 404, 405):
                             raise DriverError("MCP cleanup was not confirmed.", code="driver_cleanup_failed")
                     except Exception as error:
@@ -448,10 +477,13 @@ class CuaDriver:
                 try:
                     if self._sandbox:
                         await asyncio.wait_for(self._sandbox.disconnect(), 5.0)
+                    if self._local_http:
+                        await self._local_http.aclose()
                 except Exception as error:
                     failure = failure or error
                 finally:
                     self._sandbox = None
+                    self._local_http = None
                     self._release_claim_lock()
             if failure is not None:
                 raise DriverError("Driver cleanup was not confirmed; the Fleet claim remains reserved.",

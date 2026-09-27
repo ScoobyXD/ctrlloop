@@ -62,6 +62,25 @@ https://run.cua.ai/api/svc/<namespace>/<sandbox>-vnc/vnc.html?autoconnect=1&resi
 
 The helper intentionally disconnects without releasing the claim. Closing its process or the browser viewer leaves the desktop available until explicit cleanup or expiry. Trial storage is disposable; download anything needed before cleanup.
 
+### Current trial: missing desktop tools and theme recovery
+
+The replacement image lacked a browser, `xdg-terminal-exec`, and the `vipsthumbnail` helper used by Omarchy's background picker. Its current theme contained only an empty `foot.ini`; `theme.name` and the current background link were missing. The recovery uses per-user files and the existing desktop user's permissions. It does not change Driver code, system packages, passwords, keys, or the Fleet expiry.
+
+After copying `scripts/setup-omarchy-helpers.sh` and `scripts/setup-omarchy-browser.sh` into a directory inside the guest, run these commands from that directory as the logged-in Omarchy user, without `sudo`:
+
+```bash
+bash ./setup-omarchy-helpers.sh --stage
+# Review the staged package manifest and dependency output before activation.
+bash ./setup-omarchy-helpers.sh --activate
+bash ./setup-omarchy-browser.sh
+```
+
+The helpers script extracts the required official package payloads below `~/.local/opt/omarchy-helpers`, verifies repository checksums and available distribution signatures, and activates commands in `~/.local/bin`. Activation succeeded on this worker: `vipsthumbnail` and `xdg-terminal-exec` resolve there, and eight PNG/JPEG thumbnails were created. The browser script extracts Google's official Chrome package below `~/.local/opt/google-chrome`, preserves existing files/defaults before replacement, checks dependencies, and installs a user desktop launcher and HTTP/HTTPS defaults. Chrome `154.0.8037.57` and those defaults were verified. Chrome's first-run terms dialog is awaiting the user's consent; browser use is not yet verified beyond installation and launch to that dialog.
+
+Before theme recovery, the existing state was backed up at `/home/omarchy/.local/state/omarchy/ctrlloop-before-desktop-repair-20260927T185918Z`. The official command `OMARCHY_THEME_HEADLESS=1 omarchy-theme-set "Tokyo Night"` then initialized the missing theme name and background. The authenticated viewer visibly shows the eight-image background carousel. Selecting an image has not yet been verified.
+
+These per-user package copies do not receive automatic updates and belong to this disposable VM. No repository tests or Jev calls were run for this recovery. The configured pool expiry remains `2026-09-27T23:08:51Z`, with claim shutdown at `2026-09-27T23:08:53Z` and automatic renewal disabled.
+
 ### Prior trial: WayVNC seat compatibility and recovery
 
 On the expired pool `ctrlloop-omarchy-20260927-01a0e1e6`, the first noVNC connection triggered a Hyprland `0.56.2` crash around `2026-09-27T08:35:04Z`, followed by a safe-mode desktop. The stack reached `CSignalBase::registerListenerInternal` through `CCursorshareSession::CCursorshareSession`. That guest had the upstream `cua-hyprland-plugin` `0.1.0` loaded. This history explains the installer fixes retained for the replacement trial.

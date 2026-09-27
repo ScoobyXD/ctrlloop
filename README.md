@@ -4,6 +4,8 @@ Cua Driver observes an Omarchy cloud desktop, existing Jev rounds select a windo
 
 The loop connects to an existing Fleet claim. It does not provision, renew, release, or delete workers. The preserved Windows Hermes/CUA demo remains separate; its [compatibility launcher](docs/hermes-plugin.md) still works independently of this runtime.
 
+The new **[CTRL] Loop website MVP** adds typed chat, real `gpt-6-luna` instruction generation with high reasoning, PostgreSQL persistence, an assigned in-VM worker using `jev-1.13.0`, and an embedded desktop viewer with coordinated takeover. See the [MVP setup, AWS/worker deployment, APIs, and current limitations](docs/mvp.md). The bounded sample opens X in an already-open Chrome window; it does not establish that authenticated feed contents were read. Deployment and run evidence are documented separately from implementation.
+
 ## Run
 
 Use Python 3.11–3.13 and `uv` from this repository:
@@ -39,11 +41,11 @@ Run `uv run --locked python src/main.py --help` for the full CLI. The former Bro
 
 ## Desktop ownership and lifetime
 
-The CLI prints the existing noVNC desktop URL. Open it in a browser signed into Cua to inspect the worker. **Do not send manual mouse or keyboard input through noVNC while the agent is running.** Stop the command before taking control, then start a new command so it observes fresh state. The website's coordinated pause/takeover/resume flow is still future work.
+The CLI prints the existing noVNC desktop URL. Open it in a browser signed into Cua to inspect the worker. **Do not send manual mouse or keyboard input through noVNC while the agent is running.** Stop the command before taking control, then start a new command so it observes fresh state. The [website MVP](docs/mvp.md#access-and-desktop-ownership) has its own authenticated viewer and session-owned takeover, locked while a run is queued or running; that coordination does not cover external Fleet viewers or separate CLI processes.
 
 An OS lock prevents two ctrlloop commands from this checkout from using the same claim concurrently. It does not exclude viewers, other machines, or other controller implementations. All window activation and input occur inside the assigned VM.
 
-Normal completion, errors, and Ctrl+C disconnect the controller and release its local lock. They leave the cloud claim and its expiry unchanged. The current trial has a six-hour lifetime; see its [timestamps, cost, viewer configuration, and exact cleanup command](docs/omarchy-fleet-trial.md). Closing the viewer does not stop billing or delete the worker.
+Normal completion, errors, and Ctrl+C disconnect the controller and release its local lock. They leave the cloud claim and its expiry unchanged. The original six-hour trial was extended in place to **September 30, 2026, 2:19:52 PM PDT**; see the [verified lifetime readback](docs/vm-lifetime-20260927.md) and the [trial's viewer configuration and cleanup command](docs/omarchy-fleet-trial.md). Closing the viewer does not stop billing or delete the worker.
 
 Existing `.local/browsers` profiles were preserved but are unused. The Browser Use Windows login startup entry was removed. The remote desktop maintains its own application state for the worker's lifetime; persistence across worker deletion is not implemented here.
 
@@ -69,7 +71,7 @@ Exit code `1` indicates an error, `observation_unavailable`, or `action_unconfir
 
 - [`src/main.py`](src/main.py): entry point and preserved cached-Hermes dispatch.
 - [`src/cli.py`](src/cli.py): configuration, connection, reporting, and command lifetime.
-- [`src/driver.py`](src/driver.py): native Driver MCP through the existing Fleet claim, local ownership lock, response validation, and snapshot-bound actions.
+- [`src/driver.py`](src/driver.py): native Driver MCP through the existing Fleet claim or guest loopback, ownership lock, response validation, and snapshot-bound actions.
 - [`src/pipeline.py`](src/pipeline.py): window/control observation, selection, and action loop.
 - [`src/selection.py`](src/selection.py), [`src/jev_questions.py`](src/jev_questions.py), and [`src/reporting.py`](src/reporting.py): shared selection, authored questions, and reports.
 

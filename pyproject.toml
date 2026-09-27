@@ -2,7 +2,17 @@
 name = "ctrlloop"
 version = "0.0.0"
 requires-python = ">=3.11,<3.14"
-dependencies = ["typesafe-sdk==0.7.1", "python-dotenv==1.2.2", "httpx2==2.13.0", "cua-sandbox==0.7.0", "cua-fleet==0.1.17"]
+dependencies = [
+    "typesafe-sdk==0.7.1",
+    "python-dotenv==1.2.2",
+    "httpx2==2.13.0",
+    "cua-sandbox==0.7.0",
+    "cua-fleet==0.1.17",
+    "fastapi>=0.118,<1",
+    "uvicorn>=0.37,<1",
+    "psycopg[binary]>=3.2,<4",
+    "websockets>=15,<18",
+]
 
 [tool.ctrlloop]
 # Recorded interpreter preference; it does not restrict compatibility.

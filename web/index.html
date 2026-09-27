@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101312">
+    <title>[CTRL] Loop — your desktop, in motion</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23151816'/%3E%3Cpath d='M14 10H9v20h5m12-20h5v20h-5M16 20h8' fill='none' stroke='%23c1f57b' stroke-width='3'/%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <div id="login-screen" class="login-screen">
+      <div class="login-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="orbit orbit-three"></div><div class="orbit-center">[↳]</div><span class="orbit-label">INTENT → INSTRUCTION → ACTION</span></div>
+      <main class="login-card">
+        <a class="brand" href="/" aria-label="CTRL Loop home"><span class="brand-mark">[CTRL]</span><span>Loop<span class="brand-dot">.</span></span></a>
+        <span class="eyebrow login-eyebrow">YOUR DESKTOP, IN MOTION</span>
+        <h1>A thought.<br>A little action.</h1>
+        <p class="login-description">Turn a request into a saved instruction. Follow every step on your cloud desktop.</p>
+        <form id="login-form">
+          <label for="password">Workspace password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required placeholder="Enter your password">
+          <p id="login-error" class="form-error" role="alert" hidden></p>
+          <button class="button primary login-submit" id="login-submit" type="submit"><span>Open workspace</span><span aria-hidden="true">↗</span></button>
+        </form>
+        <p class="login-note"><span class="tiny-lock" aria-hidden="true">⌑</span> Private workspace · Authorized desktop access</p>
+      </main>
+    </div>
+
+    <div id="app" class="app" hidden>
+      <header class="app-header">
+        <a class="brand" href="/" aria-label="CTRL Loop home"><span class="brand-mark">[CTRL]</span><span>Loop<span class="brand-dot">.</span></span></a>
+        <div class="header-divider"></div><span class="workspace-label">WORKSPACE <span class="preview-pill">MVP</span></span>
+        <div class="header-end"><span id="connection-state" class="connection-state"><i class="status-dot"></i>Connecting</span><button id="logout" class="button quiet small">Sign out</button></div>
+      </header>
+
+      <div class="app-layout">
+        <aside class="sidebar" aria-label="Saved loops">
+          <button id="new-loop" class="new-loop"><span aria-hidden="true">＋</span> New loop <span class="shortcut">N</span></button>
+          <div class="sidebar-section-label"><h2>YOUR LOOPS</h2><span id="loop-count">0</span></div>
+          <div id="loop-list" class="loop-list"><p class="list-empty">Loading saved loops…</p></div>
+          <footer class="sidebar-footer"><span class="footer-symbol" aria-hidden="true">↳</span><div><strong>Small actions. Real progress.</strong><p>One instruction at a time.</p></div></footer>
+        </aside>
+
+        <main class="workspace">
+          <div id="page-notice" class="notice" role="status" hidden><span id="page-notice-text"></span><button id="dismiss-notice" aria-label="Dismiss notification">×</button></div>
+          <div class="workspace-heading"><div><div class="eyebrow">FROM INTENT TO ACTION</div><h1>Your control room<span>.</span></h1><p>Give your desktop a direction. Watch it happen.</p></div><div class="workspace-coordinate" aria-hidden="true"><span>◌</span> HUMAN + AGENT</div></div>
+
+          <div class="work-grid">
+            <section class="loop-column" aria-label="Loop instructions and activity">
+              <section class="panel compose-panel" id="compose-panel">
+                <div class="panel-heading"><h2><span class="section-number">01</span> Give it a direction</h2><span class="quiet-label">TYPED CHAT</span></div>
+                <form id="compose-form">
+                  <label class="sr-only" for="prompt">What would you like your desktop to do?</label>
+                  <textarea id="prompt" name="prompt" rows="3" maxlength="2000" required placeholder="What would you like your desktop to do?">I want to see the latest posts on X</textarea>
+                  <div class="compose-bottom"><span class="compose-hint">Generate an instruction<br>and save it as a loop.</span><button id="create-loop" class="button primary" type="submit"><span>Create loop</span><span aria-hidden="true">↗</span></button></div>
+                </form>
+                <div class="model-line"><span class="spark" aria-hidden="true">✳</span><span id="model-label">Model details loading</span></div>
+              </section>
+
+              <section id="loop-detail" class="panel detail-panel" aria-label="Selected loop">
+                <div class="empty-detail"><div class="empty-symbol" aria-hidden="true">↳</div><h2>Start your first loop</h2><p>Your generated instruction and its activity will appear here. The desktop is ready to watch on the right.</p><div class="empty-flow"><span>Request</span><i>→</i><span>Instruction</span><i>→</i><span>Action</span></div></div>
+              </section>
+            </section>
+
+            <section class="desktop-column" aria-label="Cloud desktop">
+              <section id="desktop-panel" class="panel desktop-panel">
+                <div class="panel-heading desktop-heading"><h2><span class="section-number">02</span> Live desktop</h2><span id="viewer-state" class="viewer-status"><i class="status-dot"></i>Disconnected</span></div>
+                <div class="desktop-toolbar"><div class="desktop-identity"><span class="desktop-icon" aria-hidden="true">▣</span><div><strong>Omarchy workspace</strong><span id="worker-identity">Waiting for assigned worker</span></div></div><div class="viewer-tools"><button id="fit-view" class="icon-button active" title="Fit desktop to viewer" aria-label="Fit desktop to viewer" aria-pressed="true">Fit</button><button id="fullscreen" class="icon-button" title="Enter fullscreen" aria-label="Enter fullscreen"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button></div></div>
+                <div class="desktop-display">
+                  <div id="desktop-canvas" class="desktop-canvas" aria-label="Remote desktop screen"></div>
+                  <div id="viewer-placeholder" class="viewer-placeholder"><div class="monitor-symbol" aria-hidden="true"><span>↳</span></div><h3 id="viewer-placeholder-title">Connecting to your desktop</h3><p id="viewer-placeholder-message">A live view of the assigned workspace will appear here.</p><button id="reconnect-viewer" class="button secondary small" hidden>Reconnect viewer</button></div>
+                </div>
+                <div class="desktop-control-bar"><div class="control-mode"><span id="control-mode-icon" aria-hidden="true">◉</span><div><strong id="control-mode-label">View only</strong><span id="control-mode-description">The agent controls this desktop.</span></div></div><button id="toggle-control" class="button secondary small" disabled>Take control <span aria-hidden="true">↗</span></button></div>
+              </section>
+              <div class="desktop-meta"><span id="worker-status">Worker status pending</span><span id="worker-last-seen"></span></div>
+              <section class="scope-note"><span aria-hidden="true">↳</span><p>This first demo opens a website in Chrome. Completion requires an observed result. Seeing X open does not mean an authenticated feed was read.</p></section>
+              <details class="workspace-details"><summary>Workspace details <span aria-hidden="true">＋</span></summary><dl><div><dt>Assigned worker</dt><dd id="worker-detail-id">—</dd></div><div><dt>Instruction model</dt><dd id="model-detail-id">—</dd></div><div><dt>Selection model</dt><dd id="jev-detail-id">—</dd></div><div><dt>Desktop connection</dt><dd>Authenticated, same-origin gateway</dd></div></dl></details>
+            </section>
+          </div>
+          <footer class="workspace-footer"><span>[CTRL] LOOP</span><span>Intent, made visible.</span></footer>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>

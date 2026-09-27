@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import nullcontext
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -106,6 +107,11 @@ async def run_pipeline(
     original_request: str, driver: CuaDriver, selector: ChoiceSelector,
     *, report: RunReport | None = None, max_iterations: int = DEFAULT_MAX_ITERATIONS,
     text: str | None = None, screenshots: bool = True,
+    on_observation: Callable[[dict[str, Any], PipelineResult], Awaitable[bool]] | None = None,
+    before_action: Callable[[PipelineResult, str, dict[str, Any]], Awaitable[None]] | None = None,
+    after_action: Callable[[PipelineResult, str], Awaitable[bool]] | None = None,
+    on_event: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    candidate_filter: Callable[[str, list[Candidate]], list[Candidate]] | None = None,
 ) -> PipelineResult:
     """Run on the private worker desktop; never replay an uncertain mutation."""
     if type(max_iterations) is not int or max_iterations < 1:
@@ -117,6 +123,9 @@ async def run_pipeline(
     result = PipelineResult(status="no_windows")
     pending_text = text or None
     state = {"original_request": original_request, "iteration": 0, "current_window": None, "last_control": None}
+    async def notify(event, **details):
+        if on_event:
+            await on_event(event, details)
     for iteration in range(1, max_iterations + 1):
         state["iteration"] = iteration
         state["current_window"] = None
@@ -134,8 +143,11 @@ async def run_pipeline(
                 raise DriverError("Driver did not return a window list.", code="invalid_window_observation")
             if report:
                 report.append("windows_discovered", windows=windows)
+            await notify("windows_discovered", iteration=iteration, candidate_count=len(windows))
             with _span(report, "candidate_preparation", stage="windows"):
                 candidates = window_candidates(windows)
+                if candidate_filter:
+                    candidates = candidate_filter("windows", candidates)
             if not candidates:
                 return _stop(result, trace, "no_windows", "Driver returned no visible application windows.", report)
             with _span(report, "window_selection", stage="windows"):
@@ -148,6 +160,7 @@ async def run_pipeline(
             state["current_window"] = selection.winner.description
             if report:
                 report.append("window_selected", window=result.window, selections=selection.rounds)
+            await notify("window_selected", iteration=iteration, window=result.window, rounds=selection.rounds)
             # Foreground activation stays inside the private VM, before snapshot.
             with _span(report, "foreground_activation", tool="bring_to_front"):
                 activation = await driver.call("bring_to_front", target)
@@ -166,6 +179,8 @@ async def run_pipeline(
                 result.observation["observed_control_count"] = len(elements)
             if report:
                 report.append("window_observed", window=result.window, snapshot_id=result.snapshot_id, observation=result.observation)
+            if on_observation and await on_observation(observed, result):
+                return _stop(result, trace, "verified", "The caller verified the requested postcondition from fresh state.", report)
             if not isinstance(elements, list) or not result.snapshot_id:
                 return _stop(result, trace, "observation_unavailable", "Driver returned no snapshot-bound control observation.", report)
             if observed.get("degraded") and all(e.get("role") in {"window", "application"} for e in elements):
@@ -174,6 +189,8 @@ async def run_pipeline(
                 return _stop(result, trace, "no_controls", "Driver returned no controls; this does not prove the app has none.", report)
             with _span(report, "candidate_preparation", stage="controls"):
                 candidates = control_candidates(elements)
+                if candidate_filter:
+                    candidates = candidate_filter("controls", candidates)
             if report:
                 report.append("controls_observed", candidates=[{"key": c.key, "description": c.description, "record": c.record} for c in candidates])
             state["observation"] = {key: result.observation[key] for key in ("coverage", "degraded", "truncated") if key in result.observation}
@@ -192,6 +209,7 @@ async def run_pipeline(
             result.control = winner.record
             if report:
                 report.append("control_selected", control=winner.record, description=winner.description, action=tool, selections=selection.rounds)
+            await notify("control_selected", iteration=iteration, control=winner.description, action=tool, rounds=selection.rounds)
             if tool == "type_text" and pending_text is None:
                 return _stop(result, trace, "no_action", "No prepared text is available for this typing operation (missing, empty, or already used).", report)
             arguments = {**target, "delivery_mode": "foreground"}
@@ -201,6 +219,8 @@ async def run_pipeline(
                 arguments.update(element_index=winner.record["element_index"], snapshot_id=result.snapshot_id)
             if tool == "type_text":
                 arguments["text"] = pending_text
+            if before_action:
+                await before_action(result, tool, arguments)
             result.last_control = {"window": state["current_window"], "control": winner.description, "action": tool}
             state["last_control"] = result.last_control
             if screenshots and report:
@@ -209,6 +229,7 @@ async def run_pipeline(
                 with _span(report, "action_dispatch", tool=tool):
                     if report:
                         report.append("action_requested", tool=tool, arguments=arguments, snapshot_id=result.snapshot_id, boundary="before_cua_driver_call")
+                    await notify("action_requested", iteration=iteration, tool=tool, control=winner.description)
                     if tool == "type_text":
                         pending_text = None  # Consume before sending, including uncertain delivery.
                     with _span(report, "native_action", tool=tool, completion_scope="call_return"):
@@ -224,11 +245,19 @@ async def run_pipeline(
             trace["last_action"] = state["last_action"]
             settling_ms = selection.settling_ms
             trace["settling_ms"] = settling_ms
+            verified = (
+                await after_action(result, tool)
+                if after_action and result.action_result.get("effect") in {"confirmed", "unverifiable"}
+                else False
+            )
             if report:
                 report.append("action_returned", tool=tool, action_result=result.action_result)
                 report.append("loop_action_finished", iteration=iteration, boundary="cua_driver_call_return")
                 if screenshots:
                     trace["screenshots"]["after"] = await report.capture_screenshot(driver, phase="after", iteration=iteration)
+            await notify("action_returned", iteration=iteration, tool=tool, result=result.action_result)
+            if verified:
+                return _stop(result, trace, "verified", "The caller verified the requested postcondition from fresh state.", report)
             effect = result.action_result.get("effect")
             # Unverifiable delivery is not task success. Take fresh state on the
             # next loop; never automatically resend the same native command.

@@ -1,0 +1,12 @@
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!src/
+!src/*.py
+!src/*.sql
+!web/
+!web/**
+!vendor/
+!vendor/novnc/
+!vendor/novnc/**
