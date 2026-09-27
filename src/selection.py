@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 PINNED_MODEL = "jev-1.13.0"
 # Maximum options per selection question; byte sizing can make a group smaller.
-GROUP_SIZE = 50
+GROUP_SIZE = 10
 REQUEST_BUDGET_BYTES = 90_000
 SETTLING_MS = {
     "<50ms": 50,
@@ -361,6 +361,8 @@ class ChoiceSelector:
             "requested_model": self.model,
             "response_model": returned_model,
             **tokens,
+            "input_cost_usd": tokens["input_tokens"] * 0.042 / 1_000_000,
+            "input_price_per_million_usd": 0.042,
         }
 
     def select(
@@ -423,7 +425,7 @@ class ChoiceSelector:
                                                 "candidate": {candidate.key: candidate.description},
                                                 "action": possible_action,
                                                 "app_context": settling_context,
-                                                "timing_scope": "after_browser_action_return",
+                                                "timing_scope": "after_native_action_return",
                                                 "premise": "Assume this candidate and action are selected.",
                                             },
                                             criteria={label: None for label in SETTLING_MS},

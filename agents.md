@@ -3,7 +3,7 @@ We are making a computer use agent using Jev.
 
 
 General Architecture:
-1. Get user question and starting URL -> Read Browser Use's filtered DOM selector map in an isolated headless browser → existing Jev rounds narrow candidates → Jev selects one control and click/type action → Browser Use executes → observe the result → repeat. The Hermes/CUA demo is preserved separately; its compatibility launch must remain functional.
+1. Get the user question -> Cua Driver observes windows and controls in the assigned Omarchy cloud desktop → existing Jev rounds narrow candidates → Jev selects one control and click/type action → Cua Driver executes in that desktop → observe the result → repeat. The Hermes/CUA demo is preserved separately; its compatibility launch must remain functional.
 2. Modularity. Every part of our workflow here should be swappable or replacable with another tool that can do the same thing but in a better way. BThis is a fast moving space and developers and companies are making different parts of the stack right now. So whenever something comes up thats better we just swap what we have with theirs.
 3. Do not make redundant api's and don't make up new data models if one already exists. I can not emphasize this enough, do not make near-identical data models or api's for the same thing.
 4. Have a unified set of backend and and frontend apis, this rule extends from rule #3 of not having near-identical apis or data structures.

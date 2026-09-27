@@ -17,7 +17,7 @@ Already-running Hermes can retain its old plugin module and checkout path. `src/
 [--text-file <same-directory>\text.txt]
 ```
 
-It forwards that call to the preserved CLI before importing browser dependencies. Extra flags and unrelated request files do not enter this route. Browser invocations require `--url`. Keep this compatibility entry point while the demo needs already-loaded Hermes sessions.
+It forwards that call to the preserved CLI before importing the current runtime's dependencies. Extra flags and unrelated request files do not enter this route. Ordinary invocations use the Omarchy cloud desktop loop. Keep this compatibility entry point while the demo needs already-loaded Hermes sessions.
 
 The tool returns `{status: "launched", pid, directory}`; it does not assert completion or parse the child's final report. Existing Hermes settings, plugin junction and running processes are not switched by this migration.
 

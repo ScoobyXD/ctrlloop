@@ -1,49 +1,41 @@
-"""Attach each command to a durable, independently running headless browser.
+"""Native Cua Driver MCP over an existing Fleet claim; no parallel wire model.
 
-Browser Use owns DOM filtering, target identities and browser action execution.
-This adapter does not create a second browser observation or action schema.
+Fleet handles authentication/routing. Closing ends this request's Driver session
+and disconnects, without releasing the desktop or changing its expiry.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+from collections.abc import Mapping
+from copy import deepcopy
 import hashlib
 import json
-import logging
+import math
 import os
 from pathlib import Path
-import time
-from typing import Any, Callable
-from urllib.parse import urlsplit
+import re
+from typing import Any
+from urllib.parse import quote, urlsplit
+from uuid import uuid4
 
-os.environ.setdefault("BROWSER_USE_CONFIG_DIR", str(Path(__file__).resolve().parents[1] / ".local" / "browser-use"))
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
-os.environ.setdefault("BROWSER_USE_CLOUD_SYNC", "false")
+from cua_sandbox import Sandbox
 
-from browser_use.agent.views import ActionResult
-from browser_use.browser.chrome import find_chrome_executable, get_chrome_profile_path
-from browser_use.browser.events import NavigateToUrlEvent, StorageStateLoadedEvent
-from browser_use.browser.session import BrowserSession
-from browser_use.browser.views import BrowserStateSummary
-from browser_use.tools.service import Tools
 
-# Apply after Browser Use's own logger setup, including explicitly configured
-# child loggers. CDP payloads contain authentication values.
-for _transport_logger in ("cdp_use", "cdp_use.client", "websockets.client"):
-    logging.getLogger(_transport_logger).setLevel(logging.WARNING)
+PINNED_DRIVER_VERSION = "0.24.0"
+_PROTOCOLS = {"2025-06-18", "2025-03-26"}
+_PROJECT = Path(__file__).resolve().parents[1]
+_RESPONSE_LIMIT = 20 * 1024 * 1024
 
 
 class DriverError(Exception):
-    """A browser lifecycle or target error with a safe public summary."""
+    """A driver transport, refusal, or contract error with a safe summary."""
 
-    def __init__(
-        self, message: str, *, code: str = "driver_error", tool: str | None = None,
-        exit_code: int | None = None,
-    ) -> None:
+    def __init__(self, message: str, *, code: str = "driver_error",
+                 tool: str | None = None, exit_code: int | None = None) -> None:
         super().__init__(message)
-        self.code = code
-        self.tool = tool
-        self.exit_code = exit_code
+        self.code, self.tool, self.exit_code = code, tool, exit_code
         self.context: dict[str, Any] = {}
 
     def details(self) -> dict[str, Any]:
@@ -55,467 +47,412 @@ class DriverError(Exception):
         return details
 
 
-class BrowserDriver:
-    """Control a named persistent browser; close() only detaches the command."""
+def _reject_constant(value: str) -> None:
+    raise ValueError("Nonstandard JSON numeric constant")
 
-    def __init__(
-        self, *, executable_path: str | Path | None = None,
-        viewport: dict[str, int] | None = None,
-        user_data_dir: str | Path | None = None,
-        profile_directory: str | None = None,
-        fresh_profile: bool = False,
-        browser_profile: str = "default",
-    ) -> None:
-        if fresh_profile and (user_data_dir is not None or profile_directory is not None):
-            raise DriverError(
-                "--fresh-profile cannot be combined with --user-data-dir or --profile-directory.",
-                code="browser_profile_configuration_invalid",
-            )
-        if __package__:
-            from .browser_runtime import BrowserRuntime
-        else:
-            from browser_runtime import BrowserRuntime
-        self.runtime = BrowserRuntime(browser_profile, executable_path=executable_path, viewport=viewport)
-        self.profile_path = self.runtime.profile_path
-        self._fresh_profile = fresh_profile
-        self._source_user_data_dir = user_data_dir
-        self._source_profile_directory = profile_directory
-        self._source_profile: Path | None = None
-        self._executable = str(executable_path) if executable_path is not None else find_chrome_executable()
-        self._viewport = viewport
-        self.browser: BrowserSession | None = None
+
+def _json(text: str) -> Any:
+    return json.loads(text, parse_constant=_reject_constant)
+
+
+class CuaDriver:
+    """Serialize calls, retaining one fresh native snapshot for one action.
+
+    The advisory lock excludes ctrlloop processes using this checkout and claim.
+    It cannot exclude a noVNC user or controllers on other computers.
+    Actions are never retried. Uncertain transport failures end this run.
+    """
+
+    def __init__(self, claim_file: Path, *, service: str = "mcp", timeout: float = 60.0) -> None:
+        if not isinstance(service, str) or not re.fullmatch(r"[a-zA-Z0-9_-]+", service):
+            raise ValueError("service must name one Fleet service")
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be a positive finite number")
+        self.claim_file = Path(claim_file).expanduser().resolve()
+        self.service, self.timeout = service, timeout
+        self.session = f"ctrlloop-{uuid4().hex[:16]}"
         self.session_info: dict[str, Any] = {
-            "mode": "persistent", "browser_profile": browser_profile,
-            "persistent_user_data_dir": str(self.profile_path),
-            "fresh_profile": fresh_profile, "headless": True,
-            "close_behavior": "disconnect_only",
+            "provider": "fleet", "service": service, "session": self.session,
+            "close_behavior": "disconnect_only", "claim_preserved": True,
+            "local_lock_scope": "this_checkout_and_claim",
         }
-        self.tools = Tools()
-        self._action_model = self.tools.registry.create_action_model(include_actions=["navigate", "click", "input"])
-        self._started = False
-        self._closed = False
-        self._state: BrowserStateSummary | None = None
-        self._capture_number = 0
-        self.snapshot_id: str | None = None
-        self._observed_target_id: str | None = None
-        self._action_used = False
-        self._navigation_response: dict[str, Any] | None = None
-        self._runtime_acquired = False
+        self.desktop_url: str | None = None
+        self.server_info: dict[str, Any] = {}
+        self.tools: dict[str, dict[str, Any]] = {}
+        self._sandbox: Any = None
+        self._headers = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
+        self._sequence = 0
+        self._lock = asyncio.Lock()
+        self._claim_lock: Any = None
+        self._started = self._closed = self._broken = self._session_started = False
+        self._snapshot: dict[str, Any] | None = None
 
-    @staticmethod
-    def _resolve_user_profile(
-        user_data_dir: str | Path | None, profile_directory: str | None, executable: str | None,
-    ) -> tuple[Path, str]:
-        """Select Chrome's last-used profile without reading account identities."""
-        source = user_data_dir if user_data_dir is not None else get_chrome_profile_path(None, executable_path=executable)
-        if source is None:
-            raise DriverError(
-                "No Chrome profile location was found. Provide --user-data-dir, or use --fresh-profile to run signed out.",
-                code="browser_profile_missing",
-            )
-        root = Path(source).expanduser().resolve()
-        def valid_directory(name: Any) -> bool:
-            if not isinstance(name, str) or not name or name in {".", ".."} or any(c in name for c in "/\\:"):
-                return False
-            candidate = root / name
-            return (
-                candidate.resolve().parent == root and candidate.resolve() == candidate
-                and candidate.is_dir() and (candidate / "Preferences").is_file()
-            )
-
+    def _acquire_claim_lock(self, reference: dict[str, Any]) -> None:
+        identity = json.dumps([reference["namespace"], reference["claim"]], separators=(",", ":"))
+        directory = _PROJECT / ".local" / "fleet-locks"
+        directory.mkdir(parents=True, exist_ok=True)
+        handle = (directory / f"{hashlib.sha256(identity.encode()).hexdigest()}.lock").open("a+b")
         try:
-            if not root.is_dir() or not (root / "Local State").is_file():
-                raise DriverError(
-                    "The Chrome user-data directory or its Local State file is missing. Open Chrome and sign in, "
-                    "or provide --user-data-dir pointing to the directory containing Local State. "
-                    "Use --fresh-profile only to run signed out.",
-                    code="browser_profile_missing",
-                )
-            with (root / "Local State").open(encoding="utf-8") as handle:
-                local_state = json.load(handle)
-            metadata = local_state.get("profile", {}) if isinstance(local_state, dict) else {}
-            if not isinstance(metadata, dict):
-                metadata = {}
-            if profile_directory is not None:
-                if not valid_directory(profile_directory):
-                    raise DriverError(
-                        "--profile-directory must name one existing profile directly inside --user-data-dir "
-                        "(for example Default or Profile 1), containing its Preferences file.",
-                        code="browser_profile_missing",
-                    )
-                selected = profile_directory
-            elif valid_directory(metadata.get("last_used")):
-                selected = metadata["last_used"]
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:
-                available = sorted(child.name for child in root.iterdir() if valid_directory(child.name))
-                if len(available) != 1:
-                    failure = DriverError(
-                        "Chrome's last-used profile could not be determined. Select one with --profile-directory, "
-                        "or open Chrome with the intended profile and retry.",
-                        code="browser_profile_ambiguous" if available else "browser_profile_missing",
-                    )
-                    failure.context["available_profile_directories"] = available
-                    raise failure
-                selected = available[0]
-            return root, selected
-        except DriverError as error:
-            error.context.update({"source_user_data_dir": str(root), "profile_directory": profile_directory})
-            raise
-        except (OSError, ValueError) as error:
-            failure = DriverError(
-                "The Chrome profile metadata is unreadable. Select your running Chrome user-data directory "
-                "with --user-data-dir. Use --fresh-profile only to run signed out.",
-                code="browser_profile_unreadable",
-            )
-            failure.context.update({
-                "source_user_data_dir": str(root), "profile_directory": locals().get("selected", profile_directory),
-                "cause_type": type(error).__name__,
-            })
-            raise failure from error
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise DriverError("Another local control loop is using this Fleet claim.", code="desktop_in_use") from None
+        self._claim_lock = handle
 
-    @staticmethod
-    def _cookie_identity(cookie: dict[str, Any]) -> tuple[str, str, str, str, str, int]:
-        return (
-            cookie["domain"], cookie["name"], cookie["path"],
-            json.dumps(cookie.get("partitionKey"), sort_keys=True, separators=(",", ":")),
-            cookie.get("sourceScheme", "Unset"), cookie.get("sourcePort", -1),
-        )
-
-    async def _import_live_session(self, url: str) -> dict[tuple[str, str, str, str, str, int], tuple[float, bytes]]:
-        """Transfer native storage state in memory; retain only hashes for checks."""
-        if self._fresh_profile:
-            return {}
-        if __package__:
-            from .browser_session import import_live_session
-        else:
-            from browser_session import import_live_session
-        storage, metadata = await import_live_session(
-            self._source_profile, self.session_info["profile_directory"], self._executable, url,
-        )
-        self.session_info.update(metadata)
-        expected = {
-            self._cookie_identity(cookie): (
-                cookie.get("expires", -1), hashlib.sha256(cookie["value"].encode()).digest(),
-            ) for cookie in storage.get("cookies", [])
-        }
-        try:
-            self.browser.browser_profile.storage_state = storage
-        except Exception:
-            # Pydantic validation errors can include the supplied input value.
-            raise DriverError(
-                "The imported session could not be prepared for Browser Use.",
-                code="browser_session_import_failed",
-            ) from None
-        return expected
-
-    async def _verify_cookie_import(self, expected: dict[tuple[str, str, str, str, str, int], tuple[float, bytes]]) -> None:
-        """Check imported values and partition identities before any navigation."""
-        if self._fresh_profile:
-            return
-        storage = self.browser.browser_profile.storage_state
-        loaded_events = [
-            event for event in self.browser.event_bus.event_history.values()
-            if isinstance(event, StorageStateLoadedEvent)
-        ]
-        if not isinstance(storage, dict) or not any(
-            event.cookies_count == len(storage.get("cookies", []))
-            and event.origins_count == len(storage.get("origins", []))
-            for event in loaded_events
-        ):
-            raise DriverError(
-                "Browser Use did not finish loading the imported cookies and origin storage.",
-                code="browser_session_unavailable",
-            )
-        try:
-            cookies = await asyncio.wait_for(self.browser.cookies(), timeout=10)
-            loaded = {
-                self._cookie_identity(cookie): hashlib.sha256(cookie["value"].encode()).digest()
-                for cookie in cookies
-            }
-            loaded_count = len(cookies)
-            del cookies
-        except Exception as error:
-            failure = DriverError(
-                "The worker's imported browser session could not be verified.",
-                code="browser_session_unavailable",
-            )
-            failure.context.update({"browser_session": dict(self.session_info), "cause_type": type(error).__name__})
-            raise failure from None
-        now = time.time()
-        needed = {key: digest for key, (expiry, digest) in expected.items() if expiry <= 0 or expiry > now}
-        missing = sum(loaded.get(key) != digest for key, digest in needed.items())
-        self.session_info.update({"loaded_cookie_count": loaded_count, "missing_or_changed_cookie_count": missing})
-        if missing:
-            self.session_info["cookie_import_status"] = "cookies_missing_or_changed"
-            failure = DriverError(
-                "The worker could not retain all imported login cookies. Startup stopped before navigation; "
-                "it will not silently continue signed out.", code="browser_session_unavailable",
-            )
-            failure.context["browser_session"] = dict(self.session_info)
-            raise failure
-        self.session_info["cookie_import_status"] = "cookie_values_verified" if needed else "no_source_cookies"
-
-    async def _watch_navigation_response(self) -> Callable[[], None]:
-        """Observe the main document's status on this existing CDP connection."""
-        session = await self.browser.get_or_create_cdp_session()
-        registry = session.cdp_client.register._registry
-        methods = ("Network.requestWillBeSent", "Network.responseReceivedExtraInfo")
-        # The pinned CDP registry allows one callback per method. Never replace
-        # a native Browser Use consumer (for example, an enabled HAR recorder).
-        if any(method in registry.get_registered_methods() for method in methods):
-            return lambda: None
-        frame_tree = await session.cdp_client.send.Page.getFrameTree(session_id=session.session_id)
-        main_frame_id = frame_tree["frameTree"]["frame"]["id"]
-        await session.cdp_client.send.Network.enable(session_id=session.session_id)
-
-        def request(event: dict[str, Any], session_id: str | None) -> None:
-            if session_id == session.session_id and event.get("type") == "Document" and event.get("frameId") == main_frame_id:
-                self._navigation_response = {
-                    "requestId": event["requestId"], "url": event["request"]["url"],
-                }
-
-        def response(event: dict[str, Any], session_id: str | None) -> None:
-            if session_id == session.session_id and self._navigation_response is not None:
-                if event.get("requestId") == self._navigation_response["requestId"]:
-                    # ExtraInfo also arrives when an HTTP failure prevents a
-                    # responseReceived event; keep no headers/cookies/bodies.
-                    self._navigation_response["statusCode"] = event["statusCode"]
-
-        callbacks = (request, response)
-        # CDP awaits above may let a native consumer register in the meantime.
-        if any(method in registry.get_registered_methods() for method in methods):
-            return lambda: None
-        for method, callback in zip(methods, callbacks):
-            registry.register(method, callback)
-
-        def stop() -> None:
-            for method, callback in zip(methods, callbacks):
-                if registry._handlers.get(method) is callback:
-                    registry.unregister(method)
-
-        return stop
-
-    async def _navigation_context(self, url: str) -> dict[str, Any]:
-        """Keep the native navigation cause that Tools.act reduces to unavailable."""
-        context: dict[str, Any] = {
-            "requested_url": url, "fresh_profile": self._fresh_profile, "headless": True,
-            "browser_session": dict(self.session_info),
-        }
-        if self._navigation_response is not None:
-            context["document_response"] = dict(self._navigation_response)
-        for event in reversed(list(self.browser.event_bus.event_history.values())):
-            if isinstance(event, NavigateToUrlEvent) and event.url == url:
-                failures = [str(result.error) for result in event.event_results.values() if result.error is not None]
-                if failures:
-                    context["navigation_errors"] = failures
-                break
-        try:
-            # Native cached target information does not refresh the selector map.
-            target = await self.browser.get_current_target_info()
-            if target is not None:
-                context["current_page"] = target
-        except Exception:
-            # Diagnostics must never replace the original navigation failure.
-            pass
-        if any("ERR_HTTP_RESPONSE_CODE_FAILURE" in item for item in context.get("navigation_errors", [])):
-            context["guidance"] = (
-                "Chrome rejected the navigation because of an HTTP response failure. "
-                + ("The browser profile was initialized signed out. " if self._fresh_profile else
-                   "The browser uses a persistent profile. Session reuse does not guarantee site access. ")
-                +
-                "The response alone does not identify whether the site or an intermediary "
-                "rejected the request."
-            )
-        return context
+    def _release_claim_lock(self) -> None:
+        handle, self._claim_lock = self._claim_lock, None
+        if handle is not None:
+            # Closing releases the OS lock, including after a process crash.
+            # Keep the stable lock file so another owner's lock is never unlinked.
+            handle.close()
 
     async def start(self, url: str | None = None) -> None:
-        """Attach to the existing browser, optionally navigating its current tab."""
         if self._started or self._closed:
-            raise DriverError("This browser driver cannot be started twice.", code="browser_lifecycle_error")
+            raise DriverError("This Cua client cannot be started twice.", code="driver_lifecycle_error")
         if url is not None:
             parts = urlsplit(url)
-            if parts.scheme not in {"http", "https"} or not parts.hostname:
-                raise ValueError("The starting URL must be an absolute HTTP or HTTPS URL.")
+            if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+                raise ValueError("The starting URL must be an absolute HTTP or HTTPS URL without credentials.")
+        self._started = True
         try:
-            self.runtime.acquire()
-            self._runtime_acquired = True
-            saved = self.runtime.read_state()
-            initialized = bool(saved.get("initialized"))
-            if initialized and self._fresh_profile:
-                raise DriverError(
-                    "This browser profile already exists. Omit --fresh-profile to reuse it, or choose "
-                    "a new --browser-profile NAME to create a separate signed-out profile.",
-                    code="browser_profile_already_initialized",
-                )
-            if initialized and (self._source_user_data_dir is not None or self._source_profile_directory is not None):
-                raise DriverError(
-                    "This browser profile already has its own persistent session. Source Chrome profile flags "
-                    "only apply on first use; choose a new --browser-profile NAME to initialize another account.",
-                    code="browser_profile_already_initialized",
-                )
-            if not initialized and not self._fresh_profile and url is None:
-                raise DriverError(
-                    "The first command for this browser profile needs --url to import its initial login. "
-                    "Later commands can omit --url to continue the current page.",
-                    code="browser_profile_initialization_required",
-                )
-            endpoint = self.runtime.ensure_started()
-            self.session_info.update(self.runtime.metadata)
-            # External CDP ownership is deliberate: Browser Use must never
-            # launch, copy, kill, or delete the persistent runtime's profile.
-            self.browser = BrowserSession(
-                cdp_url=endpoint, is_local=False, use_cloud=False, headless=True,
-                keep_alive=True, user_data_dir=self.profile_path,
-                downloads_path=self.profile_path.parent / "downloads",
-                viewport=self.runtime.read_state()["viewport"],
-            )
-            if self.browser.is_local or Path(self.browser.browser_profile.user_data_dir).resolve() != self.profile_path:
-                raise DriverError("Browser Use substituted the persistent profile or ownership.", code="browser_profile_changed")
-            expected_cookies = None
-            if not initialized and not self._fresh_profile:
-                self._source_profile, source_directory = self._resolve_user_profile(
-                    self._source_user_data_dir, self._source_profile_directory, self._executable,
-                )
-                self.session_info.update({
-                    "source_user_data_dir": str(self._source_profile), "profile_directory": source_directory,
-                })
-                expected_cookies = await self._import_live_session(url)
-            await self.browser.start()
-            self._started = True
-            if expected_cookies is not None:
-                await self._verify_cookie_import(expected_cookies)
-                # Do not reapply the original snapshot if this adapter reconnects.
-                self.browser.browser_profile.storage_state = None
-            if not initialized:
-                self.runtime.update_state(initialized=True, initialization_mode=(
-                    "signed_out" if self._fresh_profile else "live_session_import"
-                ))
-            self.session_info["session_source"] = (
-                "persistent_profile" if initialized else "signed_out" if self._fresh_profile else "initial_live_import"
-            )
-            last_target = saved.get("last_target_id")
-            targets = self.browser.session_manager.get_all_page_targets()
-            if last_target and any(target.target_id == last_target for target in targets):
-                await self.browser.get_or_create_cdp_session(last_target, focus=True)
-            if url is None:
-                self.session_info["navigation"] = "continued_current_page"
-                return
-            action = self._action_model.model_validate({"navigate": {"url": url, "new_tab": False}})
             try:
-                stop_observing = await self._watch_navigation_response()
+                reference = _json(self.claim_file.read_text(encoding="utf-8"))
+                if not isinstance(reference, dict) or any(
+                    not isinstance(reference.get(key), str) or not reference[key]
+                    for key in ("namespace", "pool", "claim")
+                ):
+                    raise ValueError
+                self._acquire_claim_lock(reference)
+            except (OSError, ValueError, KeyError):
+                raise DriverError("The saved Fleet claim reference is missing or invalid.", code="claim_reference_invalid") from None
+            self._sandbox = await asyncio.wait_for(Sandbox.from_dict(reference), self.timeout)
+            self.session_info.update(namespace=reference["namespace"], pool=reference["pool"],
+                                     claim=reference["claim"], sandbox=self._sandbox.name)
+            base = (f"https://run.cua.ai/api/svc/{quote(reference['namespace'], safe='')}/"
+                    f"{quote(self._sandbox.name, safe='')}")
+            self.desktop_url = base + "-vnc/vnc.html?autoconnect=1"
+            initialized = await self._rpc("initialize", {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "ctrlloop", "version": "0.0.0"},
+            })
+            if initialized.get("protocolVersion") not in _PROTOCOLS:
+                raise DriverError("Driver advertised an unsupported MCP protocol.", code="driver_protocol_unsupported")
+            self.server_info = initialized.get("serverInfo", {})
+            if (not isinstance(self.server_info, dict) or self.server_info.get("name") != "cua-driver"
+                    or self.server_info.get("version") != PINNED_DRIVER_VERSION):
+                raise DriverError(f"This adapter requires Cua Driver {PINNED_DRIVER_VERSION}.", code="driver_version_unsupported")
+            self._headers["mcp-protocol-version"] = initialized["protocolVersion"]
+            await self._rpc("notifications/initialized", notification=True)
+            listing = await self._rpc("tools/list", {})
+            schemas = listing.get("tools")
+            if not isinstance(schemas, list):
+                raise DriverError("Driver returned an invalid tool catalog.", code="invalid_driver_response")
+            for tool in schemas:
+                if (not isinstance(tool, dict) or not isinstance(tool.get("name"), str)
+                        or not isinstance(tool.get("inputSchema"), dict) or tool["name"] in self.tools):
+                    raise DriverError("Driver returned an invalid tool schema.", code="invalid_driver_response")
+                self.tools[tool["name"]] = tool
+            required = {"list_windows", "get_window_state", "click", "type_text", "bring_to_front",
+                        "get_desktop_state", "start_session", "end_session"}
+            if not required.issubset(self.tools):
+                raise DriverError("Driver lacks a required desktop tool.", code="driver_schema_unsupported")
+            # Driver lifecycle labels and MCP transport sessions are separate.
+            # Cleanup this known label even if its creation response is lost.
+            self._session_started = True
+            await self.call("start_session", {"session": self.session})
+            self.session_info["driver"] = dict(self.server_info)
+            if url is not None:
+                await self.call("launch_app", {"urls": [url]})
+        except BaseException as error:
+            try:
+                await self.close()
             except Exception:
-                stop_observing = lambda: None
+                pass
+            if isinstance(error, (DriverError, asyncio.CancelledError, KeyboardInterrupt)):
+                raise
+            raise DriverError("Could not connect to the saved Fleet desktop; check its expiry and credentials.",
+                              code="fleet_connection_failed") from None
+
+    async def _rpc(self, method: str, params: dict[str, Any] | None = None,
+                   *, notification: bool = False) -> dict[str, Any]:
+        body: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            body["params"] = params
+        self._sequence += 1
+        request_id = self._sequence
+        if not notification:
+            body["id"] = request_id
+        try:
+            response = await asyncio.wait_for(self._sandbox.services.request(
+                self.service, method="POST", path="/mcp", headers=self._headers, json=body,
+            ), self.timeout)
+            if not 200 <= response.status_code < 300:
+                code = "fleet_authorization_denied" if response.status_code in (401, 403) else "driver_transport_failed"
+                raise DriverError("The Fleet Driver request failed; completion is unknown and was not retried.", code=code)
+            if session := response.headers.get("mcp-session-id"):
+                if previous := self._headers.get("mcp-session-id"):
+                    if session != previous:
+                        raise DriverError("Driver changed its MCP session unexpectedly.", code="invalid_driver_response")
+                self._headers["mcp-session-id"] = session
+            if notification:
+                return {}
+            if len(response.content) > _RESPONSE_LIMIT:
+                raise DriverError("Driver response exceeds the allowed size.", code="invalid_driver_response")
+            if "text/event-stream" in response.headers.get("content-type", ""):
+                messages = []
+                for event in response.text.replace("\r\n", "\n").replace("\r", "\n").split("\n\n"):
+                    data = "\n".join(line[5:].removeprefix(" ") for line in event.splitlines() if line.startswith("data:"))
+                    if data:
+                        messages.append(_json(data))
+            else:
+                messages = [_json(response.text)]
+            matched = [item for item in messages if isinstance(item, dict)
+                       and type(item.get("id")) is int and item["id"] == request_id]
+            if len(matched) != 1:
+                raise DriverError("Driver returned no unique matching MCP response.", code="invalid_driver_response")
+            message = matched[0]
+            if message.get("jsonrpc") != "2.0" or ("result" in message) == ("error" in message):
+                raise DriverError("Driver returned an invalid MCP response.", code="invalid_driver_response")
+            if "error" in message:
+                raise DriverError("Driver rejected the MCP request; it was not retried.", code="driver_call_failed")
+            if not isinstance(message["result"], dict):
+                raise DriverError("Driver returned a non-object MCP result.", code="invalid_driver_response")
+            return message["result"]
+        except BaseException as error:
+            self._broken = True
+            self._snapshot = None
+            if isinstance(error, (DriverError, asyncio.CancelledError, KeyboardInterrupt)):
+                raise
+            code = "driver_timeout" if isinstance(error, TimeoutError) else "driver_transport_failed"
+            raise DriverError("The Driver connection failed; completion is unknown and was not retried.", code=code) from None
+
+    def _arguments(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        schema = self.tools.get(tool, {}).get("inputSchema")
+        if not isinstance(schema, dict):
+            raise DriverError("This tool was not advertised by the Driver.", code="driver_schema_unsupported", tool=tool)
+        args = dict(arguments)
+        properties = schema.get("properties", {})
+        if "session" in properties:
+            if "session" in args and args["session"] != self.session:
+                raise DriverError("This client only uses its own Driver session.", code="invalid_driver_arguments", tool=tool)
+            args["session"] = self.session
+        if any(key not in args for key in schema.get("required", [])) or (
+            schema.get("additionalProperties") is False and set(args) - set(properties)
+        ):
+            raise DriverError("Arguments do not match the Driver's advertised fields.", code="invalid_driver_arguments", tool=tool)
+        # Validate the primitive constraints used by the loop using native
+        # schemas. Rich unions remain authoritative on the Driver server.
+        for key, value in args.items():
+            spec = properties.get(key, {})
+            kind = spec.get("type")
+            valid_type = {"string": isinstance(value, str), "integer": type(value) is int,
+                          "number": type(value) in (int, float) and math.isfinite(value),
+                          "boolean": type(value) is bool, "array": isinstance(value, list),
+                          "object": isinstance(value, dict), "null": value is None}
+            if isinstance(kind, str) and not valid_type.get(kind, True):
+                raise DriverError("A Driver argument has an invalid type.", code="invalid_driver_arguments", tool=tool)
+            if "enum" in spec and value not in spec["enum"]:
+                raise DriverError("A Driver argument has an unsupported value.", code="invalid_driver_arguments", tool=tool)
+            if type(value) in (int, float) and (
+                ("minimum" in spec and value < spec["minimum"]) or ("maximum" in spec and value > spec["maximum"])
+            ):
+                raise DriverError("A Driver argument is outside its supported range.", code="invalid_driver_arguments", tool=tool)
+        return args
+
+    def _validate_target(self, tool: str, args: dict[str, Any]) -> None:
+        snapshot = self._snapshot
+        if not snapshot or any(args.get(key) != snapshot.get(key) for key in ("pid", "window_id")):
+            raise DriverError("Observe and select a fresh window control before acting.", code="stale_element_token", tool=tool)
+        elements = snapshot.get("elements") or []
+        if "element_token" in args:
+            matching = [row for row in elements if row.get("element_token") == args["element_token"]]
+            valid = isinstance(args["element_token"], str) and bool(args["element_token"]) and bool(matching)
+            if valid and "element_index" in args:
+                valid = matching[0].get("element_index") == args["element_index"]
+            if "snapshot_id" in args:
+                valid = valid and args["snapshot_id"] == snapshot.get("snapshot_id")
+        else:
+            valid = (isinstance(args.get("snapshot_id"), str) and bool(args["snapshot_id"])
+                     and args["snapshot_id"] == snapshot.get("snapshot_id")
+                     and type(args.get("element_index")) is int
+                     and any(row.get("element_index") == args["element_index"] for row in elements))
+        if not valid or any(key in args for key in ("x", "y", "target", "scope")):
+            raise DriverError("The action must use a control from the latest window snapshot.", code="stale_element_token", tool=tool)
+
+    @staticmethod
+    def _validate_snapshot(payload: dict[str, Any], args: dict[str, Any]) -> None:
+        """Validate native identities used by candidate selection, retaining all fields."""
+        def invalid() -> None:
+            raise DriverError("Driver returned an invalid native window observation.",
+                              code="invalid_driver_response", tool="get_window_state")
+
+        if any(type(payload.get(key)) is not int or payload[key] != args.get(key)
+               for key in ("pid", "window_id")):
+            invalid()
+        snapshot_id = payload.get("snapshot_id")
+        if snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id):
+            invalid()
+        elements = payload.get("elements")
+        if elements is None:
+            return
+        if not isinstance(elements, list):
+            invalid()
+        indices: set[int] = set()
+        for row in elements:
+            if (not isinstance(row, dict) or type(row.get("element_index")) is not int
+                    or row["element_index"] < 0 or row["element_index"] in indices
+                    or not isinstance(row.get("role"), str)):
+                invalid()
+            indices.add(row["element_index"])
+            parent = row.get("parent_index")
+            if parent is not None and (type(parent) is not int or parent < 0):
+                invalid()
+            token = row.get("element_token")
+            if token is not None and (not isinstance(token, str) or not token):
+                invalid()
+        returned_count = payload.get("returned_element_count")
+        if returned_count is not None and (type(returned_count) is not int or returned_count != len(elements)):
+            invalid()
+
+    @staticmethod
+    def _payload(tool: str, result: dict[str, Any]) -> dict[str, Any]:
+        content = result.get("content", [])
+        if not isinstance(content, list) or type(result.get("isError", False)) is not bool:
+            raise DriverError("Driver returned an invalid tool envelope.", code="invalid_driver_response", tool=tool)
+        payload = result.get("structuredContent")
+        if payload is None:
+            text = "\n".join(block["text"] for block in content if isinstance(block, dict)
+                             and block.get("type") == "text" and isinstance(block.get("text"), str))
             try:
-                outcome = await self.tools.act(action, browser_session=self.browser)
-            finally:
-                stop_observing()
-            if outcome.error:
-                context = await self._navigation_context(url)
-                status = context.get("document_response", {}).get("statusCode")
-                message = f"Initial browser navigation failed (HTTP {status})." if status is not None else "Initial browser navigation failed."
-                error = DriverError(message, code="browser_navigation_failed", tool="navigate")
-                error.context["action_result"] = outcome.model_dump(mode="json", exclude_none=True)
-                error.context.update(context)
-                raise error
-        except DriverError:
+                payload = _json(text)
+            except (ValueError, TypeError):
+                payload = None
+        refused = isinstance(payload, dict) and (
+            any(key in payload for key in ("refusal", "error", "code"))
+            or payload.get("effect") == "refused"
+            or ("status" in payload and payload["status"] != "success")
+        )
+        if result.get("isError") or refused:
+            code = "driver_call_failed"
+            if isinstance(payload, dict):
+                refusal = payload.get("refusal")
+                candidates = [payload.get("code"), refusal.get("code") if isinstance(refusal, dict) else refusal]
+                for known in ("stale_element_token", "snapshot_id_required", "background_unavailable", "session_ended", "permission_denied"):
+                    if known in candidates:
+                        code = known
+                        break
+            error = DriverError("Cua Driver refused or failed the call; it was not retried.", code=code, tool=tool)
+            if isinstance(payload, dict):
+                error.context["native_result"] = payload
+            raise error
+        if not isinstance(payload, dict):
+            raise DriverError("Driver returned no native structured object.", code="invalid_driver_response", tool=tool)
+        return payload
+
+    async def _tool_result(self, tool: str, arguments: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        if self._closed or not self._sandbox or self._broken:
+            raise DriverError("This Driver connection is unavailable; start a new run and observe again.", code="driver_closed", tool=tool)
+        args = self._arguments(tool, arguments)
+        if tool in {"click", "type_text"}:
+            self._validate_target(tool, args)
+        if tool == "get_window_state" or self.tools[tool].get("annotations", {}).get("readOnlyHint") is not True:
+            # Invalidate BEFORE dispatch: interrupted input may already land.
+            self._snapshot = None
+        try:
+            result = await self._rpc("tools/call", {"name": tool, "arguments": args})
+            payload = self._payload(tool, result)
+            if tool == "get_window_state":
+                self._validate_snapshot(payload, args)
+            if tool in {"click", "type_text"}:
+                # These are native ActionResult fields. A successful transport
+                # without these facts cannot justify another control decision.
+                effect, route = payload.get("effect"), payload.get("route")
+                if (not isinstance(effect, str) or effect not in {"confirmed", "partial", "unverifiable", "suspected_noop"}
+                        or not isinstance(route, str) or route not in {"accessibility", "synthetic_events", "global_input",
+                                                                    "system_api", "dom", "trusted_input"}):
+                    error = DriverError("Driver returned no recognized action facts; delivery is unknown.",
+                                        code="invalid_driver_response", tool=tool)
+                    error.context["native_result"] = payload
+                    raise error
+        except DriverError as error:
+            error.tool = tool
+            if error.code == "invalid_driver_response":
+                self._broken = True
+                self._snapshot = None
             raise
-        except Exception as error:
-            failure = DriverError(
-                f"The persistent browser could not {'navigate' if self._started else 'connect'} ({type(error).__name__}).",
-                code="browser_navigation_failed" if self._started else "browser_start_failed", tool="navigate",
-            )
-            failure.context["browser_session"] = dict(self.session_info)
-            raise failure from None
+        if tool == "get_window_state":
+            self._snapshot = deepcopy(payload)
+        return payload, result
+
+    async def call(self, tool: str, arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Return native structuredContent, with no action replay or coercion."""
+        if arguments is not None and not isinstance(arguments, Mapping):
+            raise DriverError("Driver arguments must be a mapping.", code="invalid_driver_arguments", tool=tool)
+        async with self._lock:
+            payload, _ = await self._tool_result(tool, arguments or {})
+            return payload
 
     async def screenshot(self) -> bytes:
-        """Capture native PNG bytes without refreshing Browser Use's target map."""
-        if not self._started or self._closed:
-            raise DriverError("Start the browser before capturing a screenshot.", code="browser_not_started")
-        try:
-            return await self.browser.take_screenshot()
-        except Exception as error:
-            raise DriverError(
-                f"Browser screenshot failed ({type(error).__name__}).",
-                code="browser_screenshot_failed", tool="take_screenshot",
-            ) from error
-
-    async def get_state(self) -> BrowserStateSummary:
-        """Return Browser Use's fresh native state, including its filtered map."""
-        if not self._started or self._closed:
-            raise DriverError("Start the browser before reading page state.", code="browser_not_started")
-        self._state = None
-        self.snapshot_id = None
-        self._observed_target_id = None
-        self._action_used = False
-        try:
-            state = await self.browser.get_browser_state_summary(include_screenshot=False, cached=False)
-        except Exception as error:
-            raise DriverError(
-                f"Browser state capture failed ({type(error).__name__}).",
-                code="browser_observation_failed", tool="get_browser_state_summary",
-            ) from error
-        self._state = state
-        self._capture_number += 1
-        # An application observation ID for reports; never passed to CDP as a node token.
-        self.snapshot_id = f"{self.browser.id}:observation:{self._capture_number}"
-        self._observed_target_id = self.browser.agent_focus_target_id
-        return state
-
-    async def act(self, action: str, index: int, text: str | None = None) -> ActionResult:
-        """Submit one native action for the current observation; never replay it."""
-        if action not in {"click", "type_text"}:
-            raise DriverError("The selected action must be click or type_text.", code="unsupported_action")
-        if type(index) is not int or self._state is None or self._action_used:
-            raise DriverError("Capture fresh state before another action.", code="stale_browser_observation", tool=action)
-        node = self._state.dom_state.selector_map.get(index)
-        if node is None or self.browser.agent_focus_target_id != self._observed_target_id:
-            raise DriverError("The target is not in the current browser observation.", code="stale_browser_target", tool=action)
-        if await self.browser.get_element_by_index(index) is not node:
-            raise DriverError("Browser Use replaced the observed target map.", code="stale_browser_target", tool=action)
-        if action == "type_text":
-            if not isinstance(text, str) or not text:
-                raise DriverError("Typing requires nonempty prepared text.", code="missing_prepared_text", tool=action)
-            payload = {"input": {"index": index, "text": text, "clear": False}}
-        else:
-            payload = {"click": {"index": index}}
-        native_action = self._action_model.model_validate(payload)
-        # Set before dispatch: an uncertain return must not make replay permissible.
-        self._action_used = True
-        try:
-            return await self.tools.act(native_action, browser_session=self.browser)
-        except Exception as error:
-            raise DriverError(
-                f"Browser action failed with unknown delivery ({type(error).__name__}); it was not retried.",
-                code="browser_action_failed", tool=action,
-            ) from error
+        """Capture the desktop without reindexing any window's AT-SPI tree."""
+        async with self._lock:
+            _, result = await self._tool_result("get_desktop_state", {})
+            images = [block for block in result.get("content", []) if isinstance(block, dict)
+                      and block.get("type") == "image" and block.get("mimeType") == "image/png"]
+            try:
+                if len(images) != 1:
+                    raise ValueError
+                png = base64.b64decode(images[0]["data"], validate=True)
+                if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+                    raise ValueError
+                return png
+            except (ValueError, KeyError, TypeError):
+                raise DriverError("Driver returned no usable desktop PNG.", code="screenshot_unavailable") from None
 
     async def close(self) -> None:
-        """Release this command's connection and lock, leaving Chrome and its data alive."""
-        if self._closed:
-            return
-        self._closed = True
-        self._state = None
-        failure: Exception | None = None
-        try:
-            if self.browser is not None:
-                if self._runtime_acquired and self.browser.agent_focus_target_id:
+        """End this run's Driver session, disconnect, and preserve the claim."""
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._snapshot = None
+            failure: Exception | None = None
+            try:
+                if self._sandbox and self._session_started:
                     try:
-                        self.runtime.update_state(last_target_id=self.browser.agent_focus_target_id)
+                        result = await asyncio.wait_for(self._rpc("tools/call", {
+                            "name": "end_session", "arguments": {"session": self.session},
+                        }), 5.0)
+                        self._payload("end_session", result)
                     except Exception as error:
                         failure = error
-                # stop() with external ownership and keep_alive=True detaches
-                # CDP/watchdogs. It does not send Browser.close or kill Chrome.
+                if self._sandbox and "mcp-session-id" in self._headers:
+                    try:
+                        response = await asyncio.wait_for(self._sandbox.services.request(
+                            self.service, method="DELETE", path="/mcp", headers=self._headers,
+                        ), 5.0)
+                        if response.status_code not in (200, 202, 204, 404, 405):
+                            raise DriverError("MCP cleanup was not confirmed.", code="driver_cleanup_failed")
+                    except Exception as error:
+                        failure = failure or error
+            finally:
                 try:
-                    await self.browser.stop()
+                    if self._sandbox:
+                        await asyncio.wait_for(self._sandbox.disconnect(), 5.0)
                 except Exception as error:
                     failure = failure or error
-                    await self.browser.reset()
-        finally:
-            if self._runtime_acquired:
-                self.runtime.release()
-                self._runtime_acquired = False
-        if failure is not None:
-            raise DriverError(
-                f"Browser disconnect failed ({type(failure).__name__}); the persistent browser was left running.",
-                code="browser_disconnect_failed", tool="close",
-            ) from None
+                finally:
+                    self._sandbox = None
+                    self._release_claim_lock()
+            if failure is not None:
+                raise DriverError("Driver cleanup was not confirmed; the Fleet claim remains reserved.",
+                                  code="driver_cleanup_failed") from None

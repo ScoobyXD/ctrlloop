@@ -32,4 +32,4 @@ VMs are the agreed starting point. Keep worker provisioning, desktop observation
 
 The exact Linux image and hosting provider remain evaluation choices. Omarchy has a documented cloud VM recipe. Its experimental feature for independent background input within a shared desktop is not required for this private-desktop design. Chrome workflows and website acceptance still require verification; VM isolation alone does not establish browser compatibility or remove bot detection. [Cua Linux desktop concepts](https://cua.ai/docs/concepts/linux-desktops-and-computer-use)
 
-This records the agreed direction without changing the current Browser Use implementation or the preserved Hermes/CUA compatibility demo.
+The control loop now targets Cua Driver in an Omarchy cloud desktop. Browser Use has been removed. The preserved Hermes/CUA compatibility demo remains separate; the broader website, scheduling, storage, and control-handoff capabilities above remain product direction.

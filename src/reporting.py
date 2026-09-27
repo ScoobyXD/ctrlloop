@@ -103,7 +103,7 @@ class RunReport:
             self._write_count += 1
 
     async def capture_screenshot(self, driver, *, phase: str, iteration: int | None = None) -> str | None:
-        """Save a native viewport image without refreshing the selected DOM map.
+        """Save a desktop image without refreshing the selected window's tokens.
 
         Images are local report artifacts, never Jev inputs. Capture failures are
         diagnostic and must not hide an action result or cause an action replay.
@@ -114,7 +114,9 @@ class RunReport:
         destination = self.requests_path / "screenshots" / name
         try:
             with self.span("screenshot_capture", phase=phase, iteration=iteration):
-                content = await asyncio.wait_for(driver.screenshot(), timeout=5.0)
+                # Driver owns the bounded network deadline. A shorter wrapper
+                # cancellation would invalidate its otherwise healthy session.
+                content = await driver.screenshot()
             with self.span("screenshot_write", phase=phase, iteration=iteration):
                 def write_image():
                     destination.parent.mkdir(parents=True, exist_ok=True)

@@ -1,110 +1,76 @@
 # ctrlloop
 
-Headless Browser Use observation → existing Jev selection rounds → one Browser Use action → fresh observation.
+Cua Driver observes an Omarchy cloud desktop, existing Jev rounds select a window and control, and Cua Driver performs one click or typing action before the next observation. Browser Use and its local headless-browser runtime have been removed.
 
-This checkout runs the browser implementation. The Hermes/CUA desktop demo is preserved separately at `C:\Users\Jonat\ctrlloop-hermes-cua-demo-2026-09-25`. See [demo preservation](docs/hermes-plugin.md) before changing its compatibility launcher.
+The loop connects to an existing Fleet claim. It does not provision, renew, release, or delete workers. The preserved Windows Hermes/CUA demo remains separate; its [compatibility launcher](docs/hermes-plugin.md) still works independently of this runtime.
 
 ## Run
 
-Python 3.11+, `uv`, and installed Chrome/Chromium are required. The existing `browser-use/` checkout is the local dependency, pinned to version 0.13.10 and commit `d8110c5ff87ccba887aaa726cdb780f2f84bef8d`. For a fresh clone:
+Use Python 3.11–3.13 and `uv` from this repository:
 
 ```powershell
-git clone https://github.com/browser-use/browser-use.git browser-use
-git -C browser-use checkout d8110c5ff87ccba887aaa726cdb780f2f84bef8d
-git -C browser-use apply ../patches/browser-use-profile-copy-cleanup.patch
-git -C browser-use apply ../patches/browser-use-storage-state-privacy.patch
-git -C browser-use apply ../patches/browser-use-attached-profile.patch
 uv sync --locked --no-dev
 ```
 
-The local cleanup patch makes Browser Use remove its temporary profile if copying fails, including while copying `Local State`. The privacy patch keeps storage-state contents out of profile representations and the configuration-conflict warning. The attachment patch prevents copying a profile when connecting to an already-running browser. All preserve the existing Browser Use APIs.
+The project pins `typesafe-sdk==0.7.1`, `cua-sandbox==0.7.0`, and `cua-fleet==0.1.17`. Jev remains `jev-1.13.0`; the adapter requires the trial image's upstream Cua Driver `0.24.0`.
 
-Set `TYPESAFE_API_KEY` in the environment or existing local `.env`, then:
-
-```powershell
-uv run --locked python src/main.py "Open the World section." --url https://www.cnn.com/ --max-iterations 1
-uv run --locked python src/main.py "Enter the provided text into Email or phone." --url https://mail.google.com/ --text "demo@example.com" --max-iterations 1 --browser-profile demo --fresh-profile
-```
-
-**Browsers persist independently of commands.** Each named automation profile has its own headless Chrome process and durable directory under `.local/browsers/<name>/user-data`. Success, errors, iteration limits, and Ctrl+C detach the command; they do not close Chrome or delete its profile. Cookies, tabs, page JavaScript, and unsaved input remain available to subsequent commands while Chrome keeps running. Browser-owned cookies and site storage persist on disk across Windows restarts; live JavaScript memory cannot survive a reboot, and websites can expire their sessions.
-
-The default profile is `default`. Use `--browser-profile work` for another account/workspace. One command at a time can control each profile; another command receives `browser_runtime_busy`. Different profiles run independently. `--url` explicitly navigates the current tab; omit it on follow-up commands to continue exactly where the browser is:
+Keep `TYPESAFE_API_KEY` in the local `.env` and Fleet credentials in the local `.env.fleet`. Both files are Git-ignored. The default worker reference is `.local/omarchy-fleet/claim.json`, saved by the separate [Fleet setup helper](docs/omarchy-fleet-trial.md). That reference identifies an existing claim; it is not a desktop backup. An expired or deleted claim needs deliberate provisioning outside the control loop.
 
 ```powershell
-uv run --locked python src/main.py "Click on history" --url https://x.com/home --max-iterations 5
-uv run --locked python src/main.py "Open the first item" --max-iterations 1
+uv run --locked python src/main.py "Click the More information link." --url https://example.com/ --max-iterations 1
+uv run --locked python src/main.py "Enter the provided text into the selected text field." --text "example" --max-iterations 1
 ```
 
-Enable Windows user-logon startup once and inspect its status:
+`--url` opens an HTTP(S) URL through Driver in the remote desktop's default browser. Omit it to continue the desktop as it stands. Neither invocation imports cookies or uses the host's personal Chrome. Prepared text is exact caller input, available for one typing dispatch; Jev does not generate it.
 
-```powershell
-.\.venv\Scripts\python.exe src/browser_runtime.py --install-startup
-.\.venv\Scripts\python.exe src/browser_runtime.py --status
-```
+The first command illustrates the CLI contract, not a claim of verified end-to-end website coverage. Window/control accessibility, action delivery, and website behavior depend on the selected application and the guest runtime.
 
-The hidden startup helper launches **every configured automation profile**, using the same directories and Chrome's session restoration. It does not run Jev tasks or import credentials. Browsers stay running when the helper exits and until Windows ends the user session/shuts down. Startup is tied to **your Windows sign-in**, not the pre-login system account. The absolute checkout/interpreter paths must remain available. `--start-all` runs the same helper manually. `--uninstall-startup` removes only the login entry, leaving running browsers and profiles intact. If Chrome exits unexpectedly, the next command restarts it with the same profile; there is no idle shutdown.
+| Option | Purpose |
+| --- | --- |
+| `--request-file PATH` | Read the exact UTF-8 request instead of the positional request. |
+| `--text TEXT` / `--text-file PATH` | Supply exact text for one typing operation. |
+| `--claim-file PATH` | Select an existing Fleet claim reference. |
+| `--env-file PATH` | Select the TypeSafe credentials file; default `.env`. |
+| `--fleet-env-file PATH` | Select the Fleet credentials file; default `.env.fleet`. |
+| `--max-iterations N` | Bound observation/action iterations; default `10`. |
+| `--no-screenshots` | Disable before/after desktop PNGs; `--screenshots` is the default. |
 
-On **first use only**, the default behavior seeds the starting site's login from personal Chrome. Chrome 144+ must have **Allow remote debugging for this browser instance** enabled at `chrome://inspect/#remote-debugging`; approve its connection prompt if shown. Keep the starting website open to include localStorage/sessionStorage. Cookies matching the starting hostname can be imported without an open tab. `--profile-directory "Profile 2"` and `--user-data-dir "C:\path\to\User Data"` select the initial source. Startup verifies that profile through its own temporary diagnostic tab and never navigates/closes existing personal tabs.
+Run `uv run --locked python src/main.py --help` for the full CLI. The former Browser Use profile, browser-executable, session-import, and local-preview options are gone.
 
-Later commands use the persistent automation profile directly, without reconnecting to personal Chrome or re-importing its old snapshot. Logins and storage obtained by the automation browser are retained. The initial import still covers only the starting hostname/origin, not all personal Chrome profiles, IndexedDB, passkeys, or device-bound credentials; unrelated sites may need a login in the persistent browser. Missing initial import setup stops startup without silently selecting a signed-out session. Cookie values stay out of reports and Jev input.
+## Desktop ownership and lifetime
 
-`--fresh-profile` explicitly initializes a **new named persistent profile** signed out; it never erases/resets an existing profile. After its first command, omit the flag to reuse that profile. No profile deletion or browser shutdown is performed by ordinary commands.
+The CLI prints the existing noVNC desktop URL. Open it in a browser signed into Cua to inspect the worker. **Do not send manual mouse or keyboard input through noVNC while the agent is running.** Stop the command before taking control, then start a new command so it observes fresh state. The website's coordinated pause/takeover/resume flow is still future work.
 
-Use `--executable-path` for a specific Chrome/Chromium executable. `--request-file` and `--text-file` read exact UTF-8 contents. `--env-file` references existing credentials without copying them. Run `python src/main.py --help` for all arguments.
+An OS lock prevents two ctrlloop commands from this checkout from using the same claim concurrently. It does not exclude viewers, other machines, or other controller implementations. All window activation and input occur inside the assigned VM.
 
-Screenshots and live preview are enabled by default. Open the printed **Live page preview** localhost URL while the command runs to watch the current page. The viewer is read-only, refreshes about twice per second through the same Browser Use CDP connection, and stops with the run; Chrome itself remains running. Each invocation has its own viewer URL.
+Normal completion, errors, and Ctrl+C disconnect the controller and release its local lock. They leave the cloud claim and its expiry unchanged. The current trial has a six-hour lifetime; see its [timestamps, cost, viewer configuration, and exact cleanup command](docs/omarchy-fleet-trial.md). Closing the viewer does not stop billing or delete the worker.
 
-Viewport PNGs are saved to the printed report directory under `screenshots/`: `loop-0001-before.png`, `loop-0001-after.png`, and so on. The before image is captured just before dispatch, after selection; the after image is captured as soon as the action returns, including the last action and action errors. It can show a page still loading. Initial navigation failures save `navigation_error.png` when capture is possible. Images stay local and are never sent to Jev. Report events record image paths and capture/write timings. Use `--no-preview` or `--no-screenshots` to disable either feature and its overhead.
+Existing `.local/browsers` profiles were preserved but are unused. The Browser Use Windows login startup entry was removed. The remote desktop maintains its own application state for the worker's lifetime; persistence across worker deletion is not implemented here.
 
-If startup returns `browser_navigation_failed`, no selection loop has run. Check the saved navigation image and the report's native navigation diagnostic, including `document_response.statusCode` when available. An HTTP response failure alone does not identify whether the cause is site access policy, authentication, or an upstream network response. Session reuse does not guarantee that a site accepts the automated browser. The page selector map also does not contain Chrome toolbar controls or Chrome's browsing history.
+## Selection and execution
 
-## Behavior
+Each iteration discovers visible windows, runs the existing window-selection question, brings the chosen window forward inside the VM, and requests a fresh native control snapshot. Existing `Candidate` and `ChoiceSelector` interfaces retain compact descriptions and native execution identities. Screenshot pixels are not sent to Jev.
 
-- Use every entry in Browser Use's already-filtered `BrowserStateSummary.dom_state.selector_map`; no additional candidate eligibility filter.
-- Reuse `Candidate`, `ChoiceSelector`, authored questions and response validation. Jev remains **jev-1.13.0**.
-- Groups contain at most **50 candidates**, subject to byte sizing. Round questions are batched into requests of at most **90,000 bytes**, then winners advance together until one remains.
-- The final round includes existing speculative click/type and settling questions. No new question was introduced.
-- Browser Use's existing registry executes `click(index)` or `input(index, text, clear=False)`. Typing appends. Its executor retains its own focus, scrolling and click mechanisms.
-- Prepared text is caller-supplied and consumed once when typing is dispatched. Jev does not generate text. Typing without available text returns `no_action`.
-- Each iteration captures fresh state and dispatches at most one chosen action. The map is not refreshed between selection and execution.
-- Jev's synchronous selector runs in a worker thread while the browser's async event loop remains responsive.
-- The existing timer controls settling before the next observation. There is no wait after the final permitted action and no automatic action replay.
-- Screenshots use native viewport capture without rebuilding the selector map. Preview capture runs in the background; action captures have separate timing spans. The `loop_action_finished` event marks action return before the after image, while the encompassing iteration span also includes artifact capture overhead.
-- `--max-iterations` defaults to 10. There is no completion question: `iteration_limit` is not a success claim.
+A group contains at most **10 candidates**. Groups shrink when needed to fit the existing **90,000-byte request ceiling**; round questions are batched, and winners advance together. The final control round reuses the existing click/type and settling questions. No new Jev question or completion decision is introduced.
 
-The current decision surface is **click and type**. Scrolling, dropdown choice, tab selection, generated text and completion are not new model decisions in this migration; expanding those decisions requires auditing their Jev questions.
+One chosen control receives `click` or `type_text` with explicit foreground delivery inside the VM. Execution uses its native element token, or its element index together with the originating snapshot ID. Stale identities, malformed observations, and native refusals stop the run. Degraded observations containing only window/application metadata return `observation_unavailable`. Driver effects `confirmed` and `unverifiable` permit a fresh observation and new selection when iterations remain; `unverifiable` does not establish that the intended effect occurred. Partial effects, suspected no-ops, malformed responses, and refusals stop the run through `action_unconfirmed` or a Driver error. The controller never automatically replays a native action.
 
-## Interfaces and reports
+Nonempty prepared text survives click-only iterations and is consumed before the first typing dispatch, even if delivery becomes uncertain. Selecting typing without available text returns `no_action`. Driver owns native typing semantics; the loop does not invent a separate clear/replace operation.
 
-Final result JSON goes to stdout; diagnostics go to stderr. Ignored `reports/` contains observations, exact Jev questions/answers, probabilities, API counts, timings and action results. Native browser nodes remain in the live selector map; reports contain identifiers rather than recursive node objects.
+An action reporting `confirmed` or `unverifiable` can be followed by the existing selected settling delay before another iteration. That iteration observes and selects again; it does not reuse the previous action. There is no extra settling wait after the final permitted action. Reaching the bound returns `iteration_limit`: it does not establish task completion.
 
-Exit code 1 indicates an error. Exit code 2 is a bounded run without established completion. Ctrl+C interrupts the run and disconnects its controller, leaving the browser running.
+## Reports and source
 
-```python
-import asyncio
-from typesafe_sdk import RetryPolicy, TypeSafeClient
-from src.driver import BrowserDriver
-from src.pipeline import run_pipeline
-from src.selection import ChoiceSelector, PINNED_MODEL
+The CLI writes result JSON to stdout and diagnostics to stderr. Each run saves observations, native action results, exact Jev payloads and responses, probabilities, API counts, input-token cost, and stage timings under ignored `reports/`. Input cost uses the configured rate of `$0.042` per million input tokens. Report data can contain application text and caller-supplied text; keep it local unless intentionally sharing it.
 
-async def main():
-    driver = BrowserDriver()
-    try:
-        await driver.start("https://example.com/")
-        with TypeSafeClient(model=PINNED_MODEL, retry=RetryPolicy(max_retries=0)) as client:
-            result = await run_pipeline(
-                "Open the More information link.", driver, ChoiceSelector(client),
-                max_iterations=1,
-            )
-            print(result.to_dict())
-    finally:
-        await driver.close()
+Desktop screenshots are enabled by default and saved as `screenshots/loop-0001-before.png`, `loop-0001-after.png`, and so on. The before image is taken after selection and before action dispatch. The after image is immediate and may show an unfinished page transition. Capture failures are recorded separately from action failures.
 
-asyncio.run(main())
-```
+Exit code `1` indicates an error, `observation_unavailable`, or `action_unconfirmed`. Exit code `2` indicates a bounded stop without established completion, including `iteration_limit`. A native `unverifiable` effect alone is not an error or proof of completion.
 
-`src/main.py` is the entry point and narrow old-Hermes compatibility dispatcher; `browser_cli.py` owns configuration and reporting; `driver.py` attaches Browser Use; `browser_runtime.py` owns persistent browser launch, profile leases, and Windows startup; `browser_session.py` seeds the initial source session; `pipeline.py` owns the loop; `browser_preview.py` serves the local viewer. Existing `selection.py`, `jev_questions.py` and `reporting.py` retain shared selection/reporting behavior. `plugins/hermes/` continues launching the preserved desktop demo.
+- [`src/main.py`](src/main.py): entry point and preserved cached-Hermes dispatch.
+- [`src/cli.py`](src/cli.py): configuration, connection, reporting, and command lifetime.
+- [`src/driver.py`](src/driver.py): native Driver MCP through the existing Fleet claim, local ownership lock, response validation, and snapshot-bound actions.
+- [`src/pipeline.py`](src/pipeline.py): window/control observation, selection, and action loop.
+- [`src/selection.py`](src/selection.py), [`src/jev_questions.py`](src/jev_questions.py), and [`src/reporting.py`](src/reporting.py): shared selection, authored questions, and reports.
 
-See [workflow](docs/main-workflow.md), [demo preservation](docs/hermes-plugin.md), and the saved [Browser Use investigation](reports/browser-state-investigation-2026-09-25/REPORT.md). Older CUA research/schema documents are historical references; runnable desktop code is in the separate demo directory.
-
-Migration verification, before session reuse became the default: two simultaneous local headless workers with fresh profiles each selected from 80 controls in two rounds (80 → 2 → 1), clicked the chosen button and typed their distinct prepared text. Six Jev calls covered the four loops. Browser processes, profiles and storage were separate, and temporary profiles were removed on close. The actual CLI also passed a local one-action check. These are local smoke results, not a claim of general website coverage; saved details are in `reports/migration-2026-09-25/SMOKE.json` and `CLI_SMOKE.json`.
+See the [main workflow](docs/main-workflow.md), [target architecture](docs/architecture.md), and [preserved Hermes demo](docs/hermes-plugin.md). Older Windows and browser research describes the implementation that existed when each investigation was written.

@@ -1,4 +1,4 @@
-"""Route cached Hermes launches to the preserved demo; run the browser CLI otherwise."""
+"""Route cached Hermes launches to the preserved demo; otherwise use remote Cua."""
 
 import json
 import os
@@ -70,15 +70,15 @@ def _run_preserved_demo(arguments: list[str]) -> int:
 
 def main(argv: list[str] | None = None, *, _include_imports: bool = False) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    # This must precede all current SDK/browser imports: a running Hermes process
+    # This must precede all current SDK imports: a running Hermes process
     # can still hold the original checkout path in its imported plugin module.
     if _is_cached_hermes_launch(arguments):
         return _run_preserved_demo(arguments)
     if __package__:
-        from .browser_cli import main as browser_main
+        from .cli import main as desktop_main
     else:
-        from browser_cli import main as browser_main
-    return browser_main(arguments, _include_imports=_include_imports)
+        from cli import main as desktop_main
+    return desktop_main(arguments, _include_imports=_include_imports)
 
 
 if __name__ == "__main__":
