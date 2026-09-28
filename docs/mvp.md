@@ -53,7 +53,7 @@ Signing out releases that session's human ownership. Expired ownership is cleare
 
 ## Viewer recovery and performance diagnosis
 
-The follow-up changes below are implemented locally. **Deployment and live takeover/reconnect verification are pending AWS sign-in.** The earlier successful MVP demonstration does not establish that these viewer fixes resolve the subsequently reported 3–4 second interaction lag or disconnections.
+The viewer changes are deployed as **`20260928-viewer-001`**, ECS task definition **`ctrlloop-mvp:2`**, image digest **`sha256:3562084c0092dc93581a708ae26a308c062ce254e3b6d34ef882c7478a05872c`**. The deployment was healthy by **`2026-09-28T17:17Z`**; subsequent readback confirmed one running task, none pending, and HTTP health 200. It reuses the same VM, worker revision `7443318e84165bc5`, native Driver, and Jev questions. No tests were added.
 
 The application now reuses a PostgreSQL pool of **2–8 connections**. The gateway forwards RFB negotiation and framebuffer requests without an ownership query; only keyboard, pointer, and clipboard input needs the database ownership check. Adjacent input packets in one browser message share that check. The shared worker-row lock remains held until authorized input is forwarded, so ownership changes and run starts cannot race past it. Signed-in session validity is also checked independently every 15 seconds. The parser now consumes noVNC's **seven-byte extended PointerEvent** when its extension bit is present; treating it as six bytes left an extra byte that could corrupt the following message.
 
@@ -63,9 +63,23 @@ Starting sign-in invalidates outstanding session reads from before that sign-in.
 
 Gateway logs now emit payload-free **`desktop_closed`** records with a connection ID, terminating task, classified cause, close codes, connection duration, input/protocol counts, byte counts, and ownership-check total/maximum duration. Use these records in CloudWatch `/ecs/ctrlloop-mvp` to distinguish protocol rejection, upstream closure, expired sessions, and operation timeouts. They omit packet contents, keyboard/clipboard text, tokens, and raw exception messages. Compare permission timing and close causes during a live reproduction before attributing the remaining delay to the browser, database, or upstream stream.
 
-The pre-deployment read-only baseline at **`2026-09-28T07:14:05Z`** recorded a **81.145 ms median framebuffer response** over eight nonincremental **32 × 32** reads and approximately **24 ms WebSocket ping**. The first framebuffer read took 554.69 ms. Evidence is in the ignored `.local/mvp/latency-live-baseline.json`; guest observations are in `latency-guest-baseline.json`. These small read-only samples do not measure human input-to-visible-result latency or prove the follow-up fix.
+Comparable read-only probes before deployment (`2026-09-28T07:14:05Z`) and after deployment (`17:18:12Z`) recorded:
 
-A further pre-deployment reproduction held one shared viewer through run **`ef570e1f-8d7d-4650-96f6-0c379cc05296`** and 5.4 seconds afterward. It received **34 framebuffer replies**, median **78 ms**, without an unexpected close. The run stopped with a bounded-action selection error after about 1.58 seconds; successful navigation was not exercised. The probe then closed normally with code **1000**. This did not reproduce the reported loop-triggered disconnect. Evidence is in `.local/mvp/old-app-viewer-during-run.json`; the exact historical disconnect cause remains unconfirmed.
+| Measurement | Before | Deployed revision |
+| --- | ---: | ---: |
+| Median framebuffer response; eight nonincremental 32 × 32 reads | 81.145 ms | 53.495 ms |
+| Median `/api/session` response; three requests | 106.01 ms | 32.82 ms |
+| WebSocket ping, approximately | 24 ms | 28 ms |
+
+The new task's read-only probe connection **`9a545cc03b09`** recorded **12 protocol packets, 0 input packets, and 0 ownership checks**, confirming the display protocol avoids those queries. Through the actual embedded viewer, three dispatched characters were visible in the immediately following screenshots after **434, 416, and 463 ms**. These are upper bounds including automation and screenshot overhead, not precise input-to-frame latency measurements. The small framebuffer probes likewise do not measure interactive rendering of the full desktop.
+
+Embedded viewer connection **`8a9c883fd053`** stayed open from **`17:18:14.583Z` until an intentional page reload at `17:30:02.235Z`**, with a logged lifetime of **11m 47.8s**, across five run attempts and human/agent ownership changes. Runs **`781f5316`**, **`ee2021cf`**, and **`068eab7d`** succeeded in approximately **6.60, 5.42, and 5.27 seconds** respectively (persisted run durations). Runs **`6c3dd98b`** and **`856aefde`** stopped before an action because Jev selected outside the bounded navigation scope while Chrome was already on X; this existing executor guard is separate from the viewer changes. No viewer disconnect was observed during these attempts. The connection forwarded **982 protocol packets** and checked **94 input packets**, forwarding 93 and dropping one. Ownership checks averaged **1.90 ms**, with a **59.24 ms** maximum; sampled ECS CPU during the runs stayed below **18%**.
+
+**Controlled automatic recovery passed.** The operator disconnected only the current WayVNC client, **26**, at **`17:31:58.993Z`**; the WayVNC daemon remained active with PID **1876**. The gateway recorded upstream closure at **`17:31:59.015Z`** for connection `b597f8e157ee` (upstream code 1000, browser code 1011), then accepted new connection **`e08c507643d3` at `17:32:00.406Z`**: **1.391 seconds** from logged closure to transport recovery. New WayVNC client **27** was present by `17:32:01.993Z`. Fresh UI observation at **`17:32:43.835Z`** showed **Live** with the placeholder hidden, without a manual reconnect or reload after the interruption. The earlier UI wait expired before the interruption, so the transient Reconnecting state was not captured.
+
+The exact cause of the historically reported loop-triggered disconnect remains **unconfirmed**. A pre-deployment reproduction also received 34 framebuffer replies through a bounded-error run without an unexpected close. The deployed checks establish improved measured response times, stable viewing across runs, and automatic recovery from the controlled interruption.
+
+The ignored evidence is under `.local/mvp/`: `latency-live-baseline.json`, `latency-live-after.json`, `latency-rollout-readback.json`, `latency-desktop-metrics-after.json`, `viewer-input-checks.json`, `viewer-ui-runs-readback.json`, `viewer-controlled-recovery.json`, and `viewer-recovery-ui.json`. `old-app-viewer-during-run.json` records the pre-deployment reproduction. These artifacts contain the observed timings and sanitized diagnostics used here.
 
 ## Local development
 
