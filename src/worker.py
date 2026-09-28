@@ -154,6 +154,9 @@ async def execute_instruction(
         messages = {"windows_discovered": "Observed the desktop windows", "window_selected": "Selected the Chrome window",
                     "control_selected": "Jev selected the next Chrome control and action", "action_requested": "Sending native input to Chrome",
                     "action_returned": "Native input returned; completion depends on the observed page"}
+        if name == "window_selected" and not details.get("rounds"):
+            stages[name] = "window_selection"
+            messages[name] = "Selected the only eligible Chrome window; no Jev window call was needed"
         await event(stages.get(name, name), message=messages.get(name, name), **details)
 
     async def observe(snapshot: dict[str, Any], result: PipelineResult) -> bool:
@@ -190,12 +193,21 @@ async def execute_instruction(
         target = {key: result.window[key] for key in ("pid", "window_id")}
         latest = await driver.call("get_window_state", {**target, "include_screenshot": False})
         _guard_observation(latest)
-        if tool != "type_text":
+        if tool not in {"click", "type_text"}:
             return False
         address = _address(latest)
         typed_url = _site_url(address.get("value") if address else None)
         if typed_url is None or typed_url.rstrip("/") != url.rstrip("/"):
+            if tool == "click":
+                return False
             raise DriverError("The exact navigation URL was not read back from Chrome; Enter was not sent.", code="address_readback_failed")
+        evidence = _evidence(latest)
+        if evidence:
+            report.append("observed_result", **evidence)
+            await event("observed_result", **evidence)
+            return True
+        report.append("navigation_address_verified", url=typed_url, after_action=tool,
+                      snapshot_id=latest.get("snapshot_id"), source="cua_driver.get_window_state")
         await event("action_dispatch", tool="press_key", key="Enter", purpose="Commit the observed navigation URL")
         with report.span("navigation.commit", tool="press_key"):
             report.append("action_requested", tool="press_key", boundary="before_cua_driver_call", purpose="commit_verified_address")
@@ -209,6 +221,7 @@ async def execute_instruction(
                 if attempt:
                     await asyncio.sleep(1)
                 latest = await driver.call("get_window_state", {**target, "include_screenshot": False})
+                _guard_observation(latest)
                 evidence = _evidence(latest)
                 if evidence:
                     report.append("observed_result", **evidence)

@@ -2,7 +2,7 @@
 
 The MVP has a typed-chat website, saved instructions and run history in PostgreSQL, a worker inside the existing Omarchy VM, and an embedded noVNC desktop viewer. The sample request is prefilled as **“I want to see the latest posts on X”**. OpenAI generates the instruction; the worker uses the existing Jev selection rounds and native Cua Driver to execute the supported navigation.
 
-The live site is [CTRL Loop](https://d1t0sm9jhdinfi.cloudfront.net). The deployed service, authenticated viewer, and online worker have been verified. Sample instruction generation and execution are tracked separately in [acceptance evidence](#acceptance-evidence) below.
+The live site is [CTRL Loop](https://d1t0sm9jhdinfi.cloudfront.net). The complete saved-instruction demonstration **succeeded**: real OpenAI generation, PostgreSQL persistence, delivery to the existing VM, Jev selection, native Chrome input, and observation of the loaded X root page. The authenticated embedded viewer and ownership controls were also verified. [Acceptance evidence](#acceptance-evidence) records the successful run and the earlier errors; authenticated feed contents were not evaluated.
 
 ## Components and pins
 
@@ -23,6 +23,8 @@ Jev remains **`jev-1.13.0`** with **`typesafe-sdk==0.7.1`**. Existing authored q
 
 The native guest Driver is **`0.24.0`**; the adapter rejects a different reported version. Fleet dependencies are **`cua-sandbox==0.7.0`** and **`cua-fleet==0.1.17`**. Python supports `>=3.11,<3.14`; project preference is `3.11.15`, while the deployment container and guest installer use Python **3.12**. Runtime dependency resolution is committed in `uv.lock`. The application vendors noVNC **1.6.0**, including its licenses, under `vendor/novnc/`; this is separate from the VM's existing noVNC installation.
 
+The live run exposed a Linux Driver omission in named entry-field values. The [native entry-value patch and reproducible build guide](native-driver-entry-value.md) records the exact upstream 0.24.0 commit and existing-schema fix. Chrome's 16 affected child processes were preserved through the user systemd manager, and daemon activation preserved the browser, compositor, and viewer/MCP service PIDs. The revised patch built successfully at `2026-09-28T04:45:37.026213Z`, activated at `04:49:56Z`, and passed fresh native address readback. The resumed worker subsequently verified the loaded X page at `04:55:44.038Z` in the unchanged Chrome window.
+
 ## Request and execution flow
 
 1. Sign in and choose **Create loop**. The server stores the exact user prompt and starts a real LLM request. The response initially has `status: generating`.
@@ -30,7 +32,7 @@ The native guest Driver is **`0.24.0`**; the adapter rejects a different reporte
 3. Choose **Run instruction**. The server requires a ready instruction, an online assigned worker, agent ownership, and no queued or running task for that worker. PostgreSQL also enforces one active run per worker.
 4. The guest worker polls over HTTPS. The server dispatches the instruction read from PostgreSQL. The worker journals the run before acknowledging receipt and invoking the executor.
 5. The executor validates the supported navigation, observes real Chrome windows and toolbar controls, and invokes the existing Jev rounds. Jev chooses among the permitted observed controls and selects click or typing. Only the address-field action is allowed to proceed.
-6. Native Driver targets fresh snapshot identities. Before navigation, the worker reads back the typed URL and only then sends Enter. It observes fresh native state until the address and a loaded X document are present, or reports an error.
+6. Native Driver targets fresh snapshot identities. After the selected address-field click or typing action, the worker reads back the exact saved destination and only then sends Enter. It observes fresh native state until the address and a loaded X document are present, or reports an error.
 7. The worker persists progress and its result through the application API. A successful finish requires `verified_url`; a sent click, unverified input effect, or iteration limit cannot establish success.
 
 The browser polls saved-loop detail and session state every two seconds while visible. Activity includes the user request, generation, database save, dispatch, acknowledgment, Jev selection, action dispatch, and observed result or error. Displayed event times are database timestamps in the viewer's local timezone. Worker event data also retains the worker timestamp; expand **Event data** for native evidence, selection rounds, and details.
@@ -115,6 +117,8 @@ Wait until `status` reports database initialization success and a successful bui
 
 The deploy command starts an ECS rollout; its return is not proof of a healthy site. Check target health, running task count, CloudFront deployment state, HTTPS `/healthz`, and the login page. The deploy helper records its current image/revision and resource identifiers in `.local/mvp/aws.json`. Application logs are in CloudWatch `/ecs/ctrlloop-mvp` with 14-day retention. CodeBuild status includes its own log URL.
 
+Deploy while instruction generation and desktop runs are idle. The configured ECS rolling deployment uses `minimumHealthyPercent=100` and `maximumPercent=200`, so the old and new app processes can overlap temporarily. New-process startup marks unfinished generation as interrupted; this mechanism does not support an uninterrupted rollout during active generation.
+
 ## Deploy the worker to the existing VM
 
 [`scripts/deploy_worker.py`](../scripts/deploy_worker.py) deliberately checks the existing claim, namespace, and bound sandbox. It preserves the VM and its disk and does not provision, release, suspend, or recreate a desktop. It expects the local AWS state and deployment-secret files created above.
@@ -139,7 +143,7 @@ The same VM's effective expiry was extended to **September 30, 2026, 2:19:52 PM 
 ## Failure handling and current limits
 
 - **Chrome must already be open** in the assigned graphical session. This executor selects an existing observed Chrome window; it does not launch Chrome, accept its first-run terms, dismiss arbitrary dialogs, or configure a browser profile.
-- Only navigation to the HTTPS **X root** is supported. The instruction must actually describe that supported Chrome navigation. The executor rejects other destinations, paths, queries, fragments, ports, and unsupported actions. It does not post, purchase, sign in, or read an authenticated feed.
+- Only navigation to the HTTPS **X root** is supported. The instruction must describe that Chrome navigation and contain exactly one valid destination. The executor rejects other destinations, paths, queries, fragments, and ports; it executes no additional requested action. It does not post, purchase, sign in, or read an authenticated feed. The current candidate filter expects the English Chrome accessibility labels.
 - A loaded X page and address must be observed through native Driver. The address field by itself is insufficient. Verification is bounded to 20 observations after committing the URL; failure to observe the page is an error, not completion.
 - Jev sees compact native candidates and the saved instruction. The navigation scope retains Chrome toolbar candidates and excludes page/account/feed controls. Existing window/control selection and action questions remain the source of the decision.
 - Native input is **not automatically replayed** after uncertain delivery or an exception. The guest journal can retry reporting a recorded result; it never repeats the GUI action. A restarted worker marks in-progress runs interrupted and releases stale server ownership after acquiring its guest process lock. Inspect the desktop before starting a new run.
@@ -178,15 +182,56 @@ Verified deployment checkpoint, **September 27, 2026**:
 | CloudFront distribution | `EFZQEEWLIM0FZ` |
 | PostgreSQL database | `ctrlloop_mvp`; bootstrap recorded ready |
 | Application deployment requested | `2026-09-27T21:36:48.141226Z` / 2:36:48 PM PDT |
-| Running guest worker revision | `3bc1f22bdb7c5d4c` |
-| Guest worker active since | `2026-09-27T21:43:33Z` / 2:43:33 PM PDT |
+| Guest worker revision at this deployment checkpoint | `3bc1f22bdb7c5d4c` |
+| That guest revision active since | `2026-09-27T21:43:33Z` / 2:43:33 PM PDT |
 
 The live `/healthz`, authentication, PostgreSQL connection, and authenticated read endpoints passed checks. Signing in through the deployed website displayed the real Chrome desktop inside its embedded viewer and **Worker · Online**. A separate read-only protocol check completed the RFB 3.8 handshake and read the **1920 × 1080** framebuffer through the application's gateway. This establishes the authenticated desktop viewing path; it does not establish that an instruction was executed.
 
 The task's visual evidence is labeled **“Authenticated CTRL Loop workspace — live embedded Chrome desktop and online assigned worker.”** It shows the product interface and guest desktop, with no provider credentials or private access-file contents. No screenshot containing secrets is included in this document.
 
-At this checkpoint, automatic approval review rejected the real sample **Create loop** action and also rejected re-review with the originating task's quoted user authorization, treating that transcript as untrusted. A direct approval question is pending in this task. The sample's actual generated instruction, persisted loop/run IDs, Jev decision, and verified navigation result are therefore **not yet recorded as completed**. Credential-transfer approval is resolved and is not the remaining blocker. The separate successful model-access check in [model-access.md](model-access.md) is not a substitute for this application run.
+The user subsequently approved the complete live demonstration; generation/execution authorization and credential-transfer approval are resolved. The application created PostgreSQL loop **`1681e48a-e35c-4c0e-8779-457621abe348`** from the exact sample request. Its real saved instruction is:
 
-The remaining manual verification is to create the sample loop, wait for the real instruction to be saved, and run it while observing the stage events and desktop. Record loop/run IDs, the actual generated string, timestamps, Jev rounds/calls, and `observed_result` evidence. Verify persisted detail remains after reloading. Check takeover ownership between two signed-in sessions and disabled takeover during an active run. A successful run record must include the native snapshot's URL, loaded document title, snapshot ID, and observation time.
+> Open https://x.com/ in Google Chrome to view the latest posts on X.
 
-No repository test suite is added. Syntax/build checks, the live service/viewer checks above, and the authorized manual/integration demonstration are the validation path for this MVP. Append the final run evidence or unresolved blocker after observation.
+The request was saved at **September 27, 2026, 8:36:43.020276 PM PDT** (`2026-09-28T03:36:43.020276Z`); the generated instruction was committed at **8:36:46.468914 PM PDT** (`03:36:46.468914Z`). The actual `gpt-6-luna` / high-reasoning API call took **3,429 ms**, used **125 input tokens** and **67 output tokens**, including **44 reasoning tokens**, and returned response ID **`resp_0aba74e14f04cae4016ab9e0cbd67487d0a2557ed39715abe1`**. The loop record, generation event, and worker acknowledgment retain the same instruction string. This is separate from the earlier minimal model-access check.
+
+**Run `fd224a26-652c-4896-bb4b-64115b7f38e7` succeeded** on worker revision **`7443318e84165bc5`**, deployed at `2026-09-28T04:54:50Z`. On September 27 PDT, it was queued at **21:55:35.049555**, started at **21:55:35.949624**, and persisted as succeeded at **21:55:44.750116**. The worker's operational duration was **8,486.804 ms**, excluding delivery queue time and subsequent report generation.
+
+The successful run used **1 iteration**, **0 Jev window-selection rounds** (one eligible Chrome window), and **1 control-selection round**. Its **3 candidates in 1 group** were Reload, Home, and Address and search bar; they reduced to **1 winner**. The sole **`jev-1.13.0`** API call took **150.798 ms** and used **3,809 input tokens**, **686 output tokens**, and **$0.000159978** input cost. The full control round took **153.297 ms**. Ten existing questions were batched in that call: one candidate choice, three action choices, and six hypothetical settling choices. Jev chose the address field with probability **0.98** (Home 0.02, Reload 0.00), then **click** with probability **0.84** (typing 0.16). Its selected settling label was `>500ms`, configured as 500 ms, with probability **0.43**.
+
+The worker read back the already-entered destination from a fresh native snapshot after that selected click and sent Enter. At **`2026-09-28T04:55:44.038Z`**, native `cua_driver.get_window_state` snapshot **`s0000000d`** observed URL **`https://x.com`**, window title **“X. It’s what’s happening / X - Google Chrome”**, and document title **“X. It’s what’s happening / X”**. Chrome PID **22550** and window **94562712109632** remained unchanged. This observed URL and document—not the returned click effect—established `status: verified` and the persisted successful run. Its scope is opening the X root page; no authenticated feed was read.
+
+Selected measured spans from that successful run are below. The Jev API duration is inside the control round; these spans are not an additive breakdown of the full run.
+
+| Operation | Duration |
+| --- | ---: |
+| Native window discovery | 3.716 ms |
+| Native foreground activation | 4.452 ms |
+| Native control acquisition | 411.355 ms |
+| Jev control-selection round 1 | 153.297 ms |
+| Native selected-address click | 857.815 ms |
+| Navigation commit (Enter) | 470.326 ms |
+| Native loaded-page verification | 4,207.790 ms |
+| Full worker execution | **8,486.804 ms** |
+
+Three earlier attempts remain visible as errors:
+
+| Run / guest revision | Recorded interval, PDT on September 27 | Worker execution duration | Result |
+| --- | --- | --- | --- |
+| `f2babdad-3ee0-482e-826b-ea9e2e3f9c16` / `3bc1f22bdb7c5d4c` | Queued 20:37:49.583684; started 20:37:51.610615; finished 20:37:52.853564 | **956.682 ms**; 0 Jev API calls | `invalid_driver_response`: native focus response was not accepted as a structured object; stopped before Jev control selection. |
+| `c6de6614-be74-480f-b48b-ee9dd88b194c` / `d9efe4f7aa7d984c` | Queued 20:43:26.970683; started 20:43:28.566943; finished 20:43:33.708271 | **4,943.188 ms**; 1 Jev API call | `address_readback_failed`: URL typing was dispatched, but the exact address could not be read back; Enter was not sent and navigation success was not claimed. |
+| `b50776a2-a041-4a0a-bbcc-01b9f6460a27` / `d9efe4f7aa7d984c` | Queued 21:50:50.940015; started 21:50:52.136155; finished 21:51:07.570919 | **14,946.652 ms**; 4 Jev API calls | `iteration_limit`: with native address readback fixed, Jev clicked the address field four times; this worker revision committed only after typing, so the already-entered URL remained uncommitted. |
+
+Worker durations above are the reports' operational durations, excluding delivery queue time and subsequent report generation. The second run's real **`jev-1.13.0`** call took **160.703 ms**, with **3,761 input tokens**, **687 output tokens**, and **$0.000157962** input cost at $0.042 per million input tokens. It batched 10 questions in one API call: one candidate-selection question, three action questions, and six hypothetical settling questions.
+
+That run had one observed Chrome window, so window selection needed **0 Jev rounds**. Control selection used **1 round**, **3 candidates in 1 group**, and reduced them to **1 winner** in **163.503 ms**. The candidates were Reload, Home, and Address and search bar. Jev selected the address field (`control_18`) with candidate probability **1.00**, then selected `type_text` with probability **0.74** versus **0.26** for click. The selected hypothetical settling label was `>500ms` (configured as 500 ms, probability 0.25); execution stopped before a settling wait. This proves a real instruction-related Jev choice and native typing attempt, **not a verified loaded X page**.
+
+The third run had **0 window-selection rounds** and **4 control-selection rounds**, one per iteration; each round narrowed **3 candidates in 1 group to 1 winner**. Its four Jev calls took **122.243, 97.541, 68.628, and 88.901 ms**, using **3,809, 4,133, 4,133, and 4,133 input tokens** respectively. Their input costs were **$0.000159978, $0.000173586, $0.000173586, and $0.000173586**: **16,208 input tokens** and **$0.000680736** total. Each selected an address-field click. The corrected worker commits after that selected click only when fresh native readback exactly matches the saved destination; the successful fourth run exercised this path without changing a Jev question.
+
+The live UI takeover check passed: **Take control** changed the session to human ownership, **Run again** became disabled, and **Return to agent** restored agent ownership. At approximately **9:11 PM PDT on September 27** (`2026-09-28T04:11Z`), a manual page reload and saved-loop selection showed the same exact generated instruction and both then-existing persisted error runs; the viewer reconnected as **Live** and the worker remained **Online**. During the third run, the live UI showed **Running**, disabled **Run in progress** and **Take control**, and displayed **“The agent is running. Takeover is locked.”** while the viewer remained **Live** and worker **Online**. This verifies the visible active-run lock; the optional negative ownership check from a second signed-in session was not run because automatic approval review rejected that check and is not counted as passed.
+
+At **9:56:57 PM PDT on September 27** (`2026-09-28T04:56:57Z`), a further manual reload retained the exact instruction and **all four runs**, including the successful run displayed as **Succeeded · 8.8 s** with its observed-result events. The viewer reconnected **Live**, the worker was **Online**, and the embedded desktop showed the loaded X landing page in view-only mode without signing into an account. The UI duration uses the persisted start/finish interval; the report's 8,486.804 ms measures worker execution before report generation.
+
+The private local evidence files are `.local/mvp/demo-1681e48a-e35c-4c0e-8779-457621abe348.json`, `successful-run-worker-report.json`, the three earlier `first-run-worker-report.json`, `second-run-worker-report.json`, and `third-run-worker-report.json` files, plus `demo-running-ax.txt`, `demo-success-ax.txt`, and `demo-success.png` in the same directory. They contain actual persisted records, detailed timing/selection traces, and the running website's accessibility state. The final screenshot is labeled **“Successful saved instruction — loaded X page in the live embedded desktop.”** It contains no credentials or private access-file contents.
+
+No repository test suite is added. Syntax/build checks, the live service/viewer/ownership checks, the reproducible native build and readback, and the authorized successful integration run are the validation path for this MVP.

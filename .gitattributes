@@ -1,2 +1,4 @@
 scripts/*.sh text eol=lf
+# Blank context lines in unified patches contain a required single space.
+scripts/patches/*.patch text eol=lf whitespace=-blank-at-eol
 vendor/novnc/** linguist-vendored

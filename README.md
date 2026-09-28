@@ -14,7 +14,7 @@ Use Python 3.11–3.13 and `uv` from this repository:
 uv sync --locked --no-dev
 ```
 
-The project pins `typesafe-sdk==0.7.1`, `cua-sandbox==0.7.0`, and `cua-fleet==0.1.17`. Jev remains `jev-1.13.0`; the adapter requires the trial image's upstream Cua Driver `0.24.0`.
+The project pins `typesafe-sdk==0.7.1`, `cua-sandbox==0.7.0`, and `cua-fleet==0.1.17`. Jev remains `jev-1.13.0`; the adapter requires Cua Driver `0.24.0`. The deployed Linux Driver includes the [verified native entry-value patch](docs/native-driver-entry-value.md) needed to read Chrome's address before navigation.
 
 Keep `TYPESAFE_API_KEY` in the local `.env` and Fleet credentials in the local `.env.fleet`. Both files are Git-ignored. The default worker reference is `.local/omarchy-fleet/claim.json`, saved by the separate [Fleet setup helper](docs/omarchy-fleet-trial.md). That reference identifies an existing claim; it is not a desktop backup. An expired or deleted claim needs deliberate provisioning outside the control loop.
 

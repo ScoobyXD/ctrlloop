@@ -386,6 +386,15 @@ class CuaDriver:
             if isinstance(payload, dict):
                 error.context["native_result"] = payload
             raise error
+        if (tool == "bring_to_front" and payload is None and content == [{
+            "type": "text",
+            "text": "Dispatched exact-target Hyprland input; application effect is unverifiable.",
+        }]):
+            # Pinned Linux 0.24.0 advertises no outputSchema for activation and
+            # returns this text-only MCP acknowledgment. Preserve its native
+            # envelope; it proves dispatch only, never focus or task completion.
+            # The pipeline takes fresh window state immediately afterward.
+            return result
         if not isinstance(payload, dict):
             raise DriverError("Driver returned no native structured object.", code="invalid_driver_response", tool=tool)
         return payload
@@ -426,7 +435,7 @@ class CuaDriver:
         return payload, result
 
     async def call(self, tool: str, arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        """Return native structuredContent, with no action replay or coercion."""
+        """Return native structured content or the pinned activation envelope."""
         if arguments is not None and not isinstance(arguments, Mapping):
             raise DriverError("Driver arguments must be a mapping.", code="invalid_driver_arguments", tool=tool)
         async with self._lock:

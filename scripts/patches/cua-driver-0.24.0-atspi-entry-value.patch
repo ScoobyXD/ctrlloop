@@ -1,0 +1,51 @@
+diff --git a/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs b/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
+--- a/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
+@@ -840,6 +840,11 @@
+         };
+         let focused = matches!(state_r.as_ref(), Some(Ok(s)) if s.contains(State::Focused));
+         let role_lower = role.to_ascii_lowercase();
++        // AT-SPI represents password fields by role, not a Protected state.
++        // Do not read their Text/Value payloads or use them as label fallbacks.
++        let protected_text = role_lower.contains("password")
++            || role_lower.contains("protected")
++            || role_lower.contains("secure");
+         let checked = if role_lower.contains("check") {
+             state_r
+                 .as_ref()
+@@ -897,7 +902,7 @@
+                         }
+                     }
+                 }
+-                if has_value {
++                if has_value && !protected_text {
+                     if let Some(Ok(vp)) = call(proxies.value()).await {
+                         value = call(vp.current_value())
+                             .await
+@@ -907,7 +912,7 @@
+                 }
+                 // Text content is where editable/entry text (the typed string)
+                 // lives; `name` is usually empty for such widgets.
+-                if has_text {
++                if has_text && !protected_text {
+                     if let Some(Ok(tp)) = call(proxies.text()).await {
+                         let count = call(tp.character_count())
+                             .await
+@@ -922,6 +927,17 @@
+                     }
+                 }
+             }
++        }
++
++        // Named editable entries (for example Chrome's address bar) expose
++        // their typed string through Text, not the numeric Value interface.
++        // Preserve the accessible name and existing numeric-value semantics.
++        if value.is_none()
++            && role_lower == "entry"
++            && !protected_text
++            && !text_content.is_empty()
++        {
++            value = Some(text_content.clone());
+         }
+ 
+         // Surface Text content as the display name when the widget has no name.
