@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -15,9 +16,9 @@ from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import httpx2
-import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field
 
 from .desktop_gateway import proxy_desktop
@@ -27,11 +28,15 @@ MODEL = 'gpt-6-luna'
 WORKER = os.environ.get('WORKER_ID', 'ctrlloop-omarchy-20260927-1708-e33048ae')
 generation_tasks = set()
 login_attempts = {}
+database_pool = None
+logger = logging.getLogger('uvicorn.error.desktop')
 
 
 @asynccontextmanager
 async def database():
-    async with await psycopg.AsyncConnection.connect(os.environ['DATABASE_URL'], row_factory=dict_row) as connection:
+    if database_pool is None:
+        raise RuntimeError('Database pool is not running')
+    async with database_pool.connection() as connection:
         yield connection
 
 
@@ -42,17 +47,30 @@ async def event(db, loop_id, stage, message, *, run_id=None, data=None, event_id
 
 @asynccontextmanager
 async def lifespan(app):
+    global database_pool
     if os.environ.get('OPENAI_MODEL', MODEL) != MODEL:
         raise RuntimeError('This MVP pins gpt-6-luna; model substitution is disabled')
     for name in ('DATABASE_URL', 'APP_PASSWORD', 'WORKER_TOKEN', 'APP_ORIGIN', 'OPENAI_API_KEY', 'CUA_CLIENT_ID', 'CUA_CLIENT_SECRET', 'FLEET_NAMESPACE', 'FLEET_SANDBOX'):
         if not os.environ.get(name): raise RuntimeError(f'Missing required setting: {name}')
-    async with database() as db:
-        await db.execute((ROOT / 'src/schema.sql').read_text())
-        await db.execute('INSERT INTO workers(id) VALUES(%s) ON CONFLICT DO NOTHING', (WORKER,))
-        # Interrupted generation is surfaced; never fabricate or silently regenerate.
-        await db.execute("UPDATE loops SET status='error',error='Generation interrupted by server restart; create a new loop.' WHERE status='generating'")
-    yield
-    for task in generation_tasks: task.cancel()
+    database_pool = AsyncConnectionPool(
+        os.environ['DATABASE_URL'], open=False, min_size=2, max_size=8,
+        timeout=5, kwargs={'row_factory': dict_row, 'connect_timeout': 5},
+        name='ctrlloop',
+    )
+    try:
+        await database_pool.open(wait=True, timeout=15)
+        async with database() as db:
+            await db.execute((ROOT / 'src/schema.sql').read_text())
+            await db.execute('INSERT INTO workers(id) VALUES(%s) ON CONFLICT DO NOTHING', (WORKER,))
+            # Deploy while generation is idle; this single-process task cannot resume.
+            await db.execute("UPDATE loops SET status='error',error='Generation interrupted by server restart; create a new loop.' WHERE status='generating'")
+        yield
+    finally:
+        pending = list(generation_tasks)
+        for task in pending: task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await database_pool.close()
+        database_pool = None
 
 
 app = FastAPI(title='CTRL Loop', lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -328,11 +346,17 @@ async def desktop(websocket: WebSocket):
         async with database() as db:
             # Keep the shared ownership lock until input is forwarded. A mode
             # change or worker claim cannot commit between the check and send.
-            row=await (await db.execute('SELECT mode,human_session,active_run FROM workers WHERE id=%s FOR SHARE',(WORKER,))).fetchone()
-            valid=await (await db.execute('SELECT 1 FROM sessions WHERE token_hash=%s AND expires_at>now()', (digest,))).fetchone()
-            yield bool(valid) and row['mode']=='human' and row['human_session']==digest and row['active_run'] is None
+            # One round trip on a pooled connection, only for actual input.
+            # PostgreSQL remains authoritative even during overlapping deployments.
+            row=await (await db.execute('''SELECT w.mode,w.human_session,w.active_run,
+                EXISTS (SELECT 1 FROM sessions WHERE token_hash=%s AND expires_at>now()) AS valid
+                FROM workers w WHERE w.id=%s FOR SHARE OF w''', (digest, WORKER))).fetchone()
+            yield bool(row and row['valid'] and row['mode']=='human'
+                       and row['human_session']==digest and row['active_run'] is None)
     try: await proxy_desktop(websocket,can_input,lambda:session_exists(digest))
-    except Exception:
+    except Exception as error:
+        # Record type only: upstream URLs/headers and session tokens are private.
+        logger.warning('desktop connection setup failed error=%s', type(error).__name__)
         try: await websocket.close(code=1011,reason='Desktop connection unavailable; reconnect to retry')
         except RuntimeError: pass
 

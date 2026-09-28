@@ -1,11 +1,20 @@
 """Exact-desktop WebSocket gateway with server-enforced RFB input ownership."""
 import asyncio
 from contextlib import suppress
+from itertools import groupby
+import json
+import logging
 import os
 import time
+from uuid import uuid4
 
 import httpx2
+from starlette.websockets import WebSocketDisconnect
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed, InvalidStatus
+
+
+logger = logging.getLogger('uvicorn.error.desktop')
 
 
 class FleetToken:
@@ -31,7 +40,7 @@ class FleetToken:
 
 
 class RFBInputFilter:
-    """Parse client RFB 3.8 messages, retaining negotiation and dropping input.
+    """Frame client RFB 3.8 messages and identify input requiring ownership.
 
     The existing WayVNC loopback service uses security type None. Unknown
     messages/security are refused, never blindly forwarded past the handshake.
@@ -40,8 +49,9 @@ class RFBInputFilter:
     def __init__(self):
         self.phase = 'version'
         self.pending = bytearray()
+        self.message_type = None
 
-    def feed(self, packet, allow_input):
+    def feed(self, packet):
         self.pending.extend(packet)
         if len(self.pending) > 2_000_000:
             raise ValueError('RFB client message too large')
@@ -54,6 +64,7 @@ class RFBInputFilter:
                 length = 1
             else:
                 kind = self.pending[0]
+                self.message_type = kind
                 if kind == 0:
                     length = 20
                 elif kind == 2:
@@ -64,7 +75,10 @@ class RFBInputFilter:
                 elif kind == 4:
                     length, input_message = 8, True
                 elif kind == 5:
-                    length, input_message = 6, True
+                    if len(self.pending) < 2: break
+                    # noVNC's extended PointerEvent appends one button byte.
+                    # Treating it as a six-byte event corrupts the next frame.
+                    length, input_message = (7 if self.pending[1] & 0x80 else 6), True
                 elif kind == 6:
                     if len(self.pending) < 8: break
                     length = 8 + abs(int.from_bytes(self.pending[4:8], 'big', signed=True))
@@ -97,8 +111,7 @@ class RFBInputFilter:
                 self.phase = 'messages'
             elif message[0] == 255 and message[1] != 0:
                 raise ValueError('Unsupported extended RFB input message')
-            if not input_message or allow_input:
-                output.append(message)
+            output.append((message, input_message))
         return output
 
 
@@ -109,33 +122,119 @@ async def proxy_desktop(websocket, can_input, session_valid):
     namespace = os.environ['FLEET_NAMESPACE']
     sandbox = os.environ['FLEET_SANDBOX']
     upstream = f'wss://run.cua.ai/api/svc/{namespace}/{sandbox}-vnc/websockify'
-    token = await fleet_token.get()
-    async with connect(upstream, additional_headers={'Authorization': f'Bearer {token}'},
-                       subprotocols=['binary'], max_size=20_000_000, open_timeout=20) as remote:
-        await websocket.accept(subprotocol='binary' if 'binary' in websocket.scope.get('subprotocols', []) else None)
-        parser = RFBInputFilter()
+    connection_id, started = uuid4().hex[:12], time.monotonic()
+    parser, remote, first_task = RFBInputFilter(), None, 'connect'
+    close_code, close_reason, cause = 1011, 'Desktop connection interrupted; reconnect', 'connection_error'
+    details = {}
+    metrics = dict(client_messages=0, server_messages=0, protocol_packets=0,
+                   input_packets=0, input_forwarded=0, input_dropped=0,
+                   permission_checks=0, permission_total_ms=0.0, permission_max_ms=0.0,
+                   upstream_bytes=0, downstream_bytes=0)
+    try:
+        token = await asyncio.wait_for(fleet_token.get(), 20)
+        async with connect(upstream, additional_headers={'Authorization': f'Bearer {token}'},
+                           subprotocols=['binary'], max_size=20_000_000,
+                           open_timeout=20, close_timeout=5) as remote:
+            await asyncio.wait_for(websocket.accept(subprotocol='binary' if 'binary' in websocket.scope.get('subprotocols', []) else None), 5)
+            logger.info(json.dumps({'event': 'desktop_connected', 'connection_id': connection_id,
+                                    'connect_ms': round((time.monotonic()-started)*1000, 2)}))
 
-        async def inbound():
-            while True:
-                message = await websocket.receive_bytes()
-                async with can_input() as allowed:
-                    for packet in parser.feed(message, allowed):
-                        await remote.send(packet)
+            async def send(packet):
+                await asyncio.wait_for(remote.send(packet), 5)
+                metrics['upstream_bytes'] += len(packet)
 
-        async def outbound():
-            async for message in remote:
-                if isinstance(message, bytes):
-                    await websocket.send_bytes(message)
+            async def inbound():
+                while True:
+                    message = await websocket.receive()
+                    if message['type'] == 'websocket.disconnect':
+                        raise WebSocketDisconnect(message.get('code', 1000))
+                    data = message.get('bytes')
+                    if data is None:
+                        raise ValueError('Binary RFB frames are required')
+                    metrics['client_messages'] += 1
+                    # Protocol/frame requests must never wait on the database.
+                    # Adjacent input packets in one frame share one locked check.
+                    for requires_input, packets in groupby(parser.feed(data), key=lambda packet: packet[1]):
+                        if not requires_input:
+                            for packet, _ in packets:
+                                metrics['protocol_packets'] += 1
+                                await send(packet)
+                            continue
+                        async with asyncio.timeout(5):
+                            before = time.monotonic()
+                            metrics['permission_checks'] += 1
+                            async with can_input() as allowed:
+                                elapsed = (time.monotonic()-before)*1000
+                                metrics['permission_total_ms'] += elapsed
+                                metrics['permission_max_ms'] = max(metrics['permission_max_ms'], elapsed)
+                                for packet, _ in packets:
+                                    metrics['input_packets'] += 1
+                                    if allowed:
+                                        await send(packet)
+                                        metrics['input_forwarded'] += 1
+                                    else:
+                                        metrics['input_dropped'] += 1
 
-        async def expiry():
-            while await session_valid():
-                await asyncio.sleep(15)
+            async def outbound():
+                async for message in remote:
+                    if not isinstance(message, bytes):
+                        raise ValueError('Upstream returned a nonbinary RFB frame')
+                    await asyncio.wait_for(websocket.send_bytes(message), 5)
+                    metrics['server_messages'] += 1
+                    metrics['downstream_bytes'] += len(message)
 
-        tasks = [asyncio.create_task(fn()) for fn in (inbound, outbound, expiry)]
-        try:
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for task in tasks: task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            with suppress(RuntimeError, OSError):
-                await websocket.close()
+            async def expiry():
+                while await asyncio.wait_for(session_valid(), 5):
+                    await asyncio.sleep(15)
+
+            first_finished = asyncio.get_running_loop().create_future()
+            def finished(task):
+                if not first_finished.done(): first_finished.set_result(task)
+            tasks = [asyncio.create_task(fn(), name=name) for name, fn in
+                     (('browser_input', inbound), ('upstream_frames', outbound), ('session_expiry', expiry))]
+            for task in tasks: task.add_done_callback(finished)
+            try:
+                completed = await first_finished
+                first_task = completed.get_name()
+                details['upstream_close_code'] = remote.close_code
+                completed.result()  # Surface the originating error before peer cancellation.
+                if first_task == 'session_expiry':
+                    cause, close_code, close_reason = 'session_expired', 1008, 'Desktop session expired; sign in again'
+                else:
+                    cause = 'upstream_closed'
+            finally:
+                for task in tasks: task.cancel()
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for task, result in zip(tasks, results):
+                    if task.get_name() != first_task and isinstance(result, Exception):
+                        logger.warning(json.dumps({'event': 'desktop_peer_error', 'connection_id': connection_id,
+                                                   'task': task.get_name(), 'error_type': type(result).__name__}))
+    except WebSocketDisconnect as error:
+        cause, close_code, close_reason = 'browser_disconnected', 1000, 'Desktop viewer closed'
+        details['browser_close_code'] = error.code
+    except asyncio.CancelledError:
+        cause, close_code, close_reason = 'gateway_shutdown', 1001, 'Desktop gateway restarting; reconnect'
+        raise
+    except Exception as error:
+        details['error_type'] = type(error).__name__
+        if isinstance(error, ValueError) and first_task == 'browser_input':
+            cause, close_code, close_reason = 'rfb_protocol_error', 1008, 'Unsupported desktop protocol message'
+            details.update(parser_phase=parser.phase, message_type=parser.message_type,
+                           buffered_bytes=len(parser.pending))
+        elif isinstance(error, ConnectionClosed):
+            cause = 'upstream_connection_closed'
+            details['upstream_close_code'] = error.rcvd.code if error.rcvd else None
+            details['upstream_sent_close_code'] = error.sent.code if error.sent else None
+        elif isinstance(error, InvalidStatus):
+            cause = 'upstream_handshake_rejected'
+            details['upstream_http_status'] = error.response.status_code
+        elif isinstance(error, TimeoutError):
+            cause = 'gateway_operation_timeout'
+    finally:
+        # Never log tokens, packet contents, keys, clipboard text, or raw errors.
+        record = {'event': 'desktop_closed', 'connection_id': connection_id, 'first_task': first_task,
+                  'cause': cause, 'close_code': close_code, 'duration_ms': round((time.monotonic()-started)*1000, 2),
+                  **details, **{key: round(value, 2) if isinstance(value, float) else value for key, value in metrics.items()}}
+        (logger.info if cause == 'browser_disconnected' else logger.warning)(json.dumps(record))
+        with suppress(RuntimeError, OSError, TimeoutError, WebSocketDisconnect):
+            await asyncio.wait_for(websocket.close(code=close_code, reason=close_reason), 5)

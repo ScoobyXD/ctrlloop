@@ -12,7 +12,8 @@ const stageLabels = {
   observation: "Desktop observation", observed_result: "Observed result", verification: "Result verification",
   completed: "Run completed", error: "Error", failed: "Run failed",
 };
-const state = { session: null, loops: [], detail: null, selectedId: null, creating: false, running: false, changingMode: false, pollBusy: false, rfb: null, viewerGeneration: 0, viewerConnecting: false, fit: true, lastDetailSignature: "", lastListSignature: "" };
+const viewerRetryDelays = [1000, 2000, 4000, 8000, 15000];
+const state = { session: null, sessionGeneration: 0, signingOut: false, loops: [], detail: null, selectedId: null, creating: false, running: false, changingMode: false, pollBusy: false, rfb: null, viewerGeneration: 0, viewerConnecting: false, viewerWanted: false, viewerRetryCount: 0, viewerRetryTimer: null, viewerConnectTimer: null, viewerStableTimer: null, viewerSessionController: null, viewerFailure: "", fit: true, lastDetailSignature: "", lastListSignature: "" };
 let viewerModule;
 
 function escapeHtml(value) {
@@ -36,11 +37,12 @@ function getModel() {
 }
 
 async function api(path, options = {}) {
+  const sessionGeneration = state.sessionGeneration;
   const response = await fetch(path, { credentials: "same-origin", cache: "no-store", ...options, headers: { ...(options.body ? { "Content-Type": "application/json" } : {}), ...(options.headers || {}) } });
   const contentType = response.headers.get("content-type") || "";
   const body = contentType.includes("application/json") ? await response.json() : null;
   if (!response.ok) {
-    if (response.status === 401 && path !== "/api/login") showLogin();
+    if (response.status === 401 && path !== "/api/login" && sessionGeneration === state.sessionGeneration) showLogin();
     const detail = body?.detail ?? body?.error ?? body?.message;
     const message = typeof detail === "string" ? detail : detail ? JSON.stringify(detail) : `Request failed (${response.status}).`;
     const error = new Error(message); error.status = response.status; throw error;
@@ -52,13 +54,16 @@ function setConnection(connected) { $("connection-state").innerHTML = `<i class=
 
 function showLogin() {
   const wasAuthenticated = state.session?.authenticated;
+  state.sessionGeneration += 1;
   state.session = null;
   disconnectViewer();
   $("app").hidden = true; $("login-screen").hidden = false;
   if (wasAuthenticated) { $("login-error").textContent = "Your session ended. Sign in to continue."; $("login-error").hidden = false; }
 }
 async function loadSession() {
+  const generation = state.sessionGeneration;
   const session = await api("/api/session");
+  if (generation !== state.sessionGeneration) return false;
   if (!session?.authenticated) { showLogin(); return false; }
   state.session = session; $("login-screen").hidden = true; $("app").hidden = false;
   renderSession(); setConnection(true); return true;
@@ -157,36 +162,101 @@ function updateDurations() {
 
 function setViewerStatus(label, kind = "") { $("viewer-state").innerHTML = `<i class="status-dot ${kind}"></i>${escapeHtml(label)}`; }
 function viewerPlaceholder(title, message, canReconnect = true) { $("viewer-placeholder").hidden = false; $("viewer-placeholder-title").textContent = title; $("viewer-placeholder-message").textContent = message; $("reconnect-viewer").hidden = !canReconnect; }
-function disconnectViewer() {
+function clearViewerTimer(name) { clearTimeout(state[name]); state[name] = null; }
+function closeViewerConnection() {
   state.viewerGeneration += 1; state.viewerConnecting = false;
+  clearViewerTimer("viewerConnectTimer"); clearViewerTimer("viewerStableTimer");
+  state.viewerSessionController?.abort(); state.viewerSessionController = null;
   const rfb = state.rfb; state.rfb = null;
   if (rfb) { try { rfb.disconnect(); } catch { /* The connection may already be closed. */ } }
+}
+function disconnectViewer() {
+  state.viewerWanted = false; state.viewerRetryCount = 0;
+  clearViewerTimer("viewerRetryTimer"); closeViewerConnection();
   $("desktop-canvas").replaceChildren(); setViewerStatus("Disconnected");
 }
-async function connectViewer() {
-  if (!state.session?.authenticated || state.viewerConnecting) return;
-  disconnectViewer(); state.viewerConnecting = true;
+function scheduleViewerReconnect() {
+  if (!state.viewerWanted || !state.session?.authenticated || state.signingOut || state.rfb || state.viewerConnecting || state.viewerRetryTimer !== null) return;
+  if (state.viewerRetryCount >= viewerRetryDelays.length) {
+    setViewerStatus("Disconnected", "warn");
+    viewerPlaceholder("Desktop connection unavailable", `${state.viewerFailure} Automatic reconnect stopped after ${viewerRetryDelays.length} attempts. Select Reconnect to try again.`);
+    return;
+  }
+  if (document.hidden) {
+    setViewerStatus("Reconnect paused", "warn");
+    viewerPlaceholder("Desktop connection interrupted", "Automatic reconnect will resume when you return to this tab.");
+    return;
+  }
+  const delay = viewerRetryDelays[state.viewerRetryCount];
   const generation = state.viewerGeneration;
-  setViewerStatus("Connecting", "warn"); viewerPlaceholder("Connecting to your desktop", "Opening the authenticated desktop connection…", false);
+  setViewerStatus("Reconnecting", "warn");
+  viewerPlaceholder("Reconnecting to your desktop", `${state.viewerFailure} Retry ${state.viewerRetryCount + 1} of ${viewerRetryDelays.length} in ${delay / 1000} seconds. You can also select Reconnect now.`);
+  state.viewerRetryTimer = setTimeout(() => {
+    if (generation !== state.viewerGeneration) return;
+    state.viewerRetryTimer = null;
+    if (!state.viewerWanted || !state.session?.authenticated || document.hidden) return;
+    state.viewerRetryCount += 1;
+    void connectViewer();
+  }, delay);
+}
+function viewerInterrupted(title, message, retry = true) {
+  closeViewerConnection(); state.viewerFailure = message;
+  if (!retry) state.viewerWanted = false;
+  setViewerStatus(retry ? "Disconnected" : "Access error", retry ? "warn" : "error");
+  viewerPlaceholder(title, message);
+  if (retry) scheduleViewerReconnect();
+}
+async function connectViewer({ manual = false } = {}) {
+  if (state.signingOut) return;
+  if (manual) { state.viewerWanted = true; state.viewerRetryCount = 0; state.viewerFailure = ""; clearViewerTimer("viewerRetryTimer"); }
+  if (!state.viewerWanted || !state.session?.authenticated || state.viewerConnecting || state.rfb) return;
+  if (document.hidden) { scheduleViewerReconnect(); return; }
+  closeViewerConnection(); state.viewerConnecting = true;
+  const generation = state.viewerGeneration;
+  const current = () => generation === state.viewerGeneration && state.viewerWanted && state.session?.authenticated;
+  const controller = new AbortController(); state.viewerSessionController = controller;
+  const attempt = state.viewerRetryCount ? ` Retry ${state.viewerRetryCount} of ${viewerRetryDelays.length}.` : "";
+  setViewerStatus(state.viewerRetryCount ? "Reconnecting" : "Connecting", "warn");
+  viewerPlaceholder("Connecting to your desktop", `Checking your session and opening the desktop connection…${attempt}`, false);
+  state.viewerConnectTimer = setTimeout(() => {
+    if (current()) viewerInterrupted("Desktop connection timed out", "The desktop did not connect within 20 seconds.");
+  }, 20000);
   try {
+    // Every attempt checks the signed-in session; a failed WebSocket is not an authentication signal.
+    const session = await api("/api/session", { signal: controller.signal });
+    if (!current()) return;
+    state.viewerSessionController = null;
+    if (!session?.authenticated) { showLogin(); return; }
+    state.session = session; renderSession(); setConnection(true);
     viewerModule ||= import("/vendor/novnc/core/rfb.js");
     const { default: RFB } = await viewerModule;
-    if (generation !== state.viewerGeneration || !state.session?.authenticated) return;
+    if (!current()) return;
     const url = new URL("/api/desktop", window.location.href); url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const rfb = new RFB($("desktop-canvas"), url.toString(), { shared: true });
     state.rfb = rfb; rfb.viewOnly = state.session?.worker?.can_control !== true || hasActiveRun(); rfb.focusOnClick = !rfb.viewOnly; rfb.scaleViewport = state.fit; rfb.resizeSession = false; rfb.background = "#0c100b";
-    rfb.addEventListener("connect", () => { if (state.rfb !== rfb) return; state.viewerConnecting = false; $("viewer-placeholder").hidden = true; setViewerStatus("Live", "live"); renderControl(); });
-    rfb.addEventListener("disconnect", (event) => { if (state.rfb !== rfb) return; state.rfb = null; state.viewerConnecting = false; setViewerStatus("Disconnected", "warn"); viewerPlaceholder("Desktop connection closed", event.detail?.clean ? "Reconnect to resume watching your desktop." : "The viewer connection was interrupted. Your saved loops are still available."); });
-    rfb.addEventListener("securityfailure", (event) => { if (state.rfb !== rfb) return; state.viewerConnecting = false; setViewerStatus("Access error", "error"); viewerPlaceholder("Desktop access failed", event.detail?.reason || "The desktop gateway could not authenticate this connection."); });
-    rfb.addEventListener("credentialsrequired", () => { if (state.rfb !== rfb) return; disconnectViewer(); setViewerStatus("Configuration needed", "error"); viewerPlaceholder("Desktop authentication required", "The desktop gateway needs server-side credentials. Workspace credentials are never sent to the desktop."); });
+    rfb.addEventListener("connect", () => {
+      if (!current() || state.rfb !== rfb) return;
+      clearViewerTimer("viewerConnectTimer"); state.viewerConnecting = false;
+      $("viewer-placeholder").hidden = true; setViewerStatus("Live", "live"); renderControl();
+      // Brief connect/disconnect flapping must not reset the bounded retry budget.
+      state.viewerStableTimer = setTimeout(() => {
+        if (!current() || state.rfb !== rfb) return;
+        state.viewerStableTimer = null;
+        state.viewerRetryCount = 0; state.viewerFailure = "";
+      }, 30000);
+    });
+    rfb.addEventListener("disconnect", () => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop connection interrupted", "The viewer connection closed. Your saved loops are still available."); });
+    rfb.addEventListener("securityfailure", (event) => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop access failed", event.detail?.reason || "The desktop gateway could not authenticate this connection. Select Reconnect after access is restored.", false); });
+    rfb.addEventListener("credentialsrequired", () => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop authentication required", "The desktop gateway needs server-side credentials. Workspace credentials are never sent to the desktop.", false); });
   } catch (error) {
-    if (generation !== state.viewerGeneration) return;
-    state.viewerConnecting = false; viewerModule = null; setViewerStatus("Unavailable", "error"); viewerPlaceholder("Viewer unavailable", `The desktop viewer could not load: ${error.message}`);
+    if (!current()) return;
+    viewerModule = null;
+    viewerInterrupted("Viewer unavailable", `The desktop connection could not open: ${error.message}`);
   }
 }
 
 async function refresh() {
-  if (state.pollBusy || state.creating || document.hidden || !state.session?.authenticated) return;
+  if (state.pollBusy || state.creating || state.signingOut || document.hidden || !state.session?.authenticated) return;
   state.pollBusy = true;
   try {
     if (!await loadSession()) return;
@@ -195,23 +265,32 @@ async function refresh() {
   finally { state.pollBusy = false; }
 }
 async function boot() {
+  const generation = state.sessionGeneration;
   try {
     if (!await loadSession()) return;
+    if (generation !== state.sessionGeneration) return;
+    void connectViewer({ manual: true });
     await loadLoops();
     if (state.loops.length) await selectLoop(state.loops[0].id);
-    await connectViewer();
   } catch (error) { if (!state.session) { $("login-error").textContent = `Unable to connect: ${error.message}`; $("login-error").hidden = false; } else notice(error.message, true); }
 }
 
 $("login-form").addEventListener("submit", async (event) => {
+  // Discard any unauthenticated session response started before this sign-in.
+  state.sessionGeneration += 1;
   event.preventDefault(); $("login-submit").disabled = true; $("login-submit").textContent = "Opening workspace…"; $("login-error").hidden = true;
   try { await api("/api/login", { method: "POST", body: JSON.stringify({ password: $("password").value }) }); $("password").value = ""; await boot(); }
   catch (error) { $("login-error").textContent = error.message; $("login-error").hidden = false; }
   finally { $("login-submit").disabled = false; $("login-submit").innerHTML = '<span>Open workspace</span><span aria-hidden="true">↗</span>'; }
 });
 $("logout").addEventListener("click", async () => {
+  if (state.signingOut) return;
+  state.signingOut = true;
+  state.sessionGeneration += 1; disconnectViewer();
+  viewerPlaceholder("Desktop disconnected", "Signing out of this workspace…", false);
   try { await api("/api/logout", { method: "POST" }); state.session = null; state.detail = null; state.loops = []; state.selectedId = null; state.lastListSignature = ""; state.lastDetailSignature = ""; showLogin(); $("login-error").hidden = true; }
-  catch (error) { notice(`Sign out failed: ${error.message}`, true); }
+  catch (error) { notice(`Sign out failed: ${error.message}`, true); viewerPlaceholder("Desktop disconnected", "Select Reconnect to resume viewing if you stay signed in."); }
+  finally { state.signingOut = false; }
 });
 $("compose-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const prompt = $("prompt").value.trim(); if (!prompt || state.creating) return;
@@ -245,9 +324,19 @@ $("toggle-control").addEventListener("click", async () => {
 $("fit-view").addEventListener("click", () => { state.fit = !state.fit; if (state.rfb) state.rfb.scaleViewport = state.fit; $("fit-view").setAttribute("aria-pressed", String(state.fit)); $("fit-view").classList.toggle("active", state.fit); $("fit-view").textContent = state.fit ? "Fit" : "1:1"; $("fit-view").title = state.fit ? "Show desktop at actual size" : "Fit desktop to viewer"; });
 $("fullscreen").addEventListener("click", async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else await $("desktop-panel").requestFullscreen(); } catch (error) { notice(`Fullscreen is unavailable: ${error.message}`); } });
 document.addEventListener("fullscreenchange", () => { const text = document.fullscreenElement ? "Exit fullscreen" : "Enter fullscreen"; $("fullscreen").title = text; $("fullscreen").setAttribute("aria-label", text); });
-$("reconnect-viewer").addEventListener("click", connectViewer);
+$("reconnect-viewer").addEventListener("click", () => { void connectViewer({ manual: true }); });
 $("dismiss-notice").addEventListener("click", () => { $("page-notice").hidden = true; });
-document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearViewerTimer("viewerRetryTimer");
+    if (state.viewerConnecting) {
+      // Hiding the tab pauses an attempt; it must not exhaust the last retry.
+      state.viewerRetryCount = Math.max(0, state.viewerRetryCount - 1);
+      closeViewerConnection();
+    }
+  } else { void refresh(); }
+  scheduleViewerReconnect();
+});
 document.addEventListener("keydown", (event) => { if (event.key.toLowerCase() === "n" && !event.ctrlKey && !event.metaKey && !event.altKey && !event.target.closest("input, textarea, [contenteditable], #desktop-canvas") && state.session?.authenticated) { event.preventDefault(); $("new-loop").click(); } });
 window.addEventListener("beforeunload", disconnectViewer);
 setInterval(refresh, 2000);

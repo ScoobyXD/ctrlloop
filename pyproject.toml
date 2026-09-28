@@ -10,7 +10,7 @@ dependencies = [
     "cua-fleet==0.1.17",
     "fastapi>=0.118,<1",
     "uvicorn>=0.37,<1",
-    "psycopg[binary]>=3.2,<4",
+    "psycopg[binary,pool]>=3.2,<4",
     "websockets>=15,<18",
 ]
 

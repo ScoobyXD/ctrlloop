@@ -51,6 +51,22 @@ The viewer starts in **View only**. **Take control** is available only when no r
 
 Signing out releases that session's human ownership. Expired ownership is cleared when session state or ownership is next requested. Closing a browser tab does not automatically return ownership immediately; reopen the website with the same session and return control, or wait for session expiry. External Fleet viewers and separate controller tools are outside this application's ownership coordination; keep them from sending input during worker execution.
 
+## Viewer recovery and performance diagnosis
+
+The follow-up changes below are implemented locally. **Deployment and live takeover/reconnect verification are pending AWS sign-in.** The earlier successful MVP demonstration does not establish that these viewer fixes resolve the subsequently reported 3–4 second interaction lag or disconnections.
+
+The application now reuses a PostgreSQL pool of **2–8 connections**. The gateway forwards RFB negotiation and framebuffer requests without an ownership query; only keyboard, pointer, and clipboard input needs the database ownership check. Adjacent input packets in one browser message share that check. The shared worker-row lock remains held until authorized input is forwarded, so ownership changes and run starts cannot race past it. Signed-in session validity is also checked independently every 15 seconds. The parser now consumes noVNC's **seven-byte extended PointerEvent** when its extension bit is present; treating it as six bytes left an extra byte that could corrupt the following message.
+
+After an unexpected disconnect, the viewer checks `/api/session` before each new connection and makes at most **five automatic retries**, with delays of **1, 2, 4, 8, and 15 seconds**. Each attempt has a **20-second deadline**. The retry budget resets after **30 seconds continuously connected**, so short repeated connections cannot cause an unlimited retry loop. Recovery pauses while the tab is hidden; hiding the tab during setup cancels that attempt without consuming its retry. An established video connection remains open across tab visibility, run status, and human/agent control changes. Logout or an intentional disconnect cancels pending recovery. Expired workspace sessions return to sign-in; explicit RFB security failures or credential requests stop automatic retries. **Reconnect** permits a fresh manual attempt.
+
+Starting sign-in invalidates outstanding session reads from before that sign-in. A delayed unauthenticated response can no longer tear down the viewer opened by a later successful login.
+
+Gateway logs now emit payload-free **`desktop_closed`** records with a connection ID, terminating task, classified cause, close codes, connection duration, input/protocol counts, byte counts, and ownership-check total/maximum duration. Use these records in CloudWatch `/ecs/ctrlloop-mvp` to distinguish protocol rejection, upstream closure, expired sessions, and operation timeouts. They omit packet contents, keyboard/clipboard text, tokens, and raw exception messages. Compare permission timing and close causes during a live reproduction before attributing the remaining delay to the browser, database, or upstream stream.
+
+The pre-deployment read-only baseline at **`2026-09-28T07:14:05Z`** recorded a **81.145 ms median framebuffer response** over eight nonincremental **32 × 32** reads and approximately **24 ms WebSocket ping**. The first framebuffer read took 554.69 ms. Evidence is in the ignored `.local/mvp/latency-live-baseline.json`; guest observations are in `latency-guest-baseline.json`. These small read-only samples do not measure human input-to-visible-result latency or prove the follow-up fix.
+
+A further pre-deployment reproduction held one shared viewer through run **`ef570e1f-8d7d-4650-96f6-0c379cc05296`** and 5.4 seconds afterward. It received **34 framebuffer replies**, median **78 ms**, without an unexpected close. The run stopped with a bounded-action selection error after about 1.58 seconds; successful navigation was not exercised. The probe then closed normally with code **1000**. This did not reproduce the reported loop-triggered disconnect. Evidence is in `.local/mvp/old-app-viewer-during-run.json`; the exact historical disconnect cause remains unconfirmed.
+
 ## Local development
 
 From the repository root:
