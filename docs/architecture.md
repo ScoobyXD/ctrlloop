@@ -4,14 +4,14 @@ The overall goal for our company, [CTRL] Loop, is to propagate ai technology thr
 
 You should be able to run your entire company with 1 laptop, all of Costco, Walmart, Amazon, SpaceX, Tesla, or OpenAI. There will come a point when ai does all the intelligence work and humans only observe or give occasional commands, thus 1 laptop. Or maybe later we'll communicate directly through our minds, then no laptop either.
 
-The current environment makes transitioning slow and painful. Obviously you can't just change everything in one go, and frankly the technology is not totally ready yet, so you need a product that is go-to-market-able. Thankfully, we have a solution that should check all our boxes.
+The current environment makes transitioning slow and painful. Obviously you can't just change everything in one go, and frankly the technology is not totally ready yet, so you need a product that is go-to-market-able. Thankfully, we have a solution that should check all our boxes. 
 
 We need to make a product where users can talk/type to an ai and it outputs an executable workflow you can run over and over again or edit, maybe we call these ctrl loops. Very similar to coding agents, just talk/type and it spits out executable code. This is the holy-grail, this will dramatically increase the scientific and productive outputs and usher in the Exponential Age.
 
 That executable workflow will fundamentally consist of api calls and computer actions (when there are no api's)
 Users at companies should go to our website, login, and from there see, edit, or execute the list of ctrl loops they have or make new ones. The browser acts as a portal between servers where the actual executions are ran and user's interface. User can always upload files or whatever needed to run things in that ctrl loop environment.
 
-Further details on exactly how this will all work, like VMs vs containers, user chrome profiles, editing workflows, how to notify users when workflows need something, etc still need be ironed out.
+Further details on exactly how this will all work, like VMs vs containers, user chrome profiles, editing workflows, how to notify users when workflows need something, etc still need be ironed out. 
 
 
 # Architecture
