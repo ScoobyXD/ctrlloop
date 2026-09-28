@@ -1,8 +1,8 @@
 # [CTRL] Loop MVP
 
-The MVP has a typed-chat website, saved instructions and run history in PostgreSQL, a worker inside the existing Omarchy VM, and an embedded noVNC desktop viewer. The sample request is prefilled as **“I want to see the latest posts on X”**. OpenAI generates the instruction; the worker uses the existing Jev selection rounds and native Cua Driver to execute the supported navigation.
+The MVP has a typed-chat website, saved instructions and run history in PostgreSQL, a worker inside the existing Omarchy VM, and an embedded noVNC desktop viewer. OpenAI generates the saved instruction; the worker uses the existing Jev selection rounds and native Cua Driver to select observed windows and controls. Runs have a full-page report and an authenticated ZIP download of their available evidence.
 
-The live site is [CTRL Loop](https://d1t0sm9jhdinfi.cloudfront.net). The complete saved-instruction demonstration **succeeded**: real OpenAI generation, PostgreSQL persistence, delivery to the existing VM, Jev selection, native Chrome input, and observation of the loaded X root page. The authenticated embedded viewer and ownership controls were also verified. [Acceptance evidence](#acceptance-evidence) records the successful run and the earlier errors; authenticated feed contents were not evaluated.
+The live site is [CTRL Loop](https://d1t0sm9jhdinfi.cloudfront.net). The historical X-navigation demonstration **succeeded**: real OpenAI generation, PostgreSQL persistence, delivery to the existing VM, Jev selection, native Chrome input, and observation of the loaded X root page. The authenticated embedded viewer and ownership controls were also verified. [Acceptance evidence](#acceptance-evidence) records the successful run and the earlier errors; authenticated feed contents were not evaluated.
 
 ## Components and pins
 
@@ -12,7 +12,7 @@ The live site is [CTRL Loop](https://d1t0sm9jhdinfi.cloudfront.net). The complet
 | Application API | [`src/webapp.py`](../src/webapp.py): FastAPI, authentication, instruction generation, delivery, events, and worker ownership |
 | Database | [`src/schema.sql`](../src/schema.sql): `sessions`, `workers`, `loops`, `runs`, and `events` |
 | Worker service | [`src/cloud_worker.py`](../src/cloud_worker.py): outbound HTTPS polling, guest process lock, crash journal, heartbeats, and result delivery |
-| Bounded executor | [`src/worker.py`](../src/worker.py): validates the saved instruction, narrows the permitted native actions, and observes the resulting page |
+| Bounded executor | [`src/worker.py`](../src/worker.py): validates the saved instruction and invokes existing window/control rounds with explicit capability limits |
 | Shared selection pipeline | Existing [`src/pipeline.py`](../src/pipeline.py), [`src/selection.py`](../src/selection.py), [`src/jev_questions.py`](../src/jev_questions.py), and [`src/reporting.py`](../src/reporting.py) |
 | Native transport | Existing [`src/driver.py`](../src/driver.py), now supporting either authenticated Fleet transport or VM loopback using the same native schemas |
 | Desktop gateway | [`src/desktop_gateway.py`](../src/desktop_gateway.py): authenticated same-origin WebSocket proxy for the exact configured sandbox, with server-side RFB input filtering |
@@ -31,11 +31,22 @@ The live run exposed a Linux Driver omission in named entry-field values. The [n
 2. The server saves the returned instruction string, response ID, usage, model, and generation timestamp. Only then does the loop become `ready`. Failed or interrupted generation produces an error; it does not substitute an instruction.
 3. Choose **Run instruction**. The server requires a ready instruction, an online assigned worker, agent ownership, and no queued or running task for that worker. PostgreSQL also enforces one active run per worker.
 4. The guest worker polls over HTTPS. The server dispatches the instruction read from PostgreSQL. The worker journals the run before acknowledging receipt and invoking the executor.
-5. The executor validates the supported navigation, observes real Chrome windows and toolbar controls, and invokes the existing Jev rounds. Jev chooses among the permitted observed controls and selects click or typing. Only the address-field action is allowed to proceed.
-6. Native Driver targets fresh snapshot identities. After the selected address-field click or typing action, the worker reads back the exact saved destination and only then sends Enter. It observes fresh native state until the address and a loaded X document are present, or reports an error.
-7. The worker persists progress and its result through the application API. A successful finish requires `verified_url`; a sent click, unverified input effect, or iteration limit cannot establish success.
+5. The executor observes all visible native windows and their controls, and invokes the existing Jev rounds. The X-only, Chrome-only, English-toolbar, and address-field filters have been removed. Jev still chooses only the existing click or typing action; no planner, action scheme, or new Jev question has been introduced.
+6. Native Driver targets fresh snapshot identities. The web executor permits at most four iterations. It does not invent typing content or generate special navigation key sequences. If Jev chooses typing without prepared text, the run stops with `typing_content_unavailable`. The existing CLI can still receive explicit prepared text.
+7. The worker persists progress and its result through the application API. There is currently no general task-completion verifier, so dispatching an action cannot produce success. Unsupported actions stop as `blocked`; reaching the bounded iteration limit is `unverified`; execution failures remain `error`. A future caller must supply explicit verification before `succeeded` can be accepted.
+8. The worker closes its durable report, uploads the available evidence ZIP to authenticated private storage, and reports the terminal result. The full-page report combines that evidence with the server's saved user request, exact OpenAI request/response, delivery events, and result. If upload fails, the terminal result is still reported. Transient failures retry evidence delivery without replaying desktop actions; permanent archive rejection retains the evidence for repair and releases the worker for later runs.
 
 The browser polls saved-loop detail and session state every two seconds while visible. Activity includes the user request, generation, database save, dispatch, acknowledgment, Jev selection, action dispatch, and observed result or error. Displayed event times are database timestamps in the viewer's local timezone. Worker event data also retains the worker timestamp; expand **Event data** for native evidence, selection rounds, and details.
+
+## Run evidence and timing
+
+**Full report** opens `/reports/runs/{run_id}` (or `/reports/loops/{loop_id}` for generation failures). It includes expandable raw JSON, native observations and command arguments/results, Jev questions/state/probabilities and candidate reductions, screenshots, API-call usage/cost, shared-scale loop charts, a chronological timeline, and downloads. The download joins the existing PostgreSQL loop/run/event records with the worker ZIP; it remains available when execution fails or stops before the pipeline.
+
+The existing worker event array remains `total_run.json`, accompanied by readable per-call Jev input/output files and `screenshots/`. New `events.jsonl` records are flushed and synced as observations occur, rather than waiting for run completion. `delivery.jsonl` records the guest's event outbox attempts. `manifest.json` correlates the server run ID, lists file sizes and hashes, and explicitly identifies missing screenshots, model responses, native dispatch markers, or command responses. HTTP authentication headers and environment credentials are excluded. Observed application content is intentionally part of this private report.
+
+A loop begins immediately before acquiring current state and ends at the last native input command's **transport-call start**. That timestamp is captured after durable intent journaling and is not proof that the remote application received or applied input. `loop_started` and `loop_finished` are authoritative loop boundaries; `loop.cycle` also contains return and reporting work and is not the user's loop duration. Command returns, screenshots, settling waits, report writing, and delivery overhead remain inspectable outside that boundary. Worker durations use one monotonic clock; server timestamps are shown separately and are never subtracted from worker timestamps to imply precise network latency.
+
+A guest restart recovers the available JSONL records and creates a partial ZIP, then retries only event/result/artifact delivery. An intent without its later transport marker or response is labeled uncertain. The durable journal cannot recover bytes that were never captured, and complete loss of the guest before upload can still leave only server evidence. Transient storage failures remain visible as pending upload with the local evidence retained. Invalid or oversized archives remain local with a receipt in the worker state's `failed-evidence/` directory and an explicit repair-required result; they do not block future polling. Recorded screenshots are checked against actual files, so an unexpectedly missing image remains an explicit capture gap. The private report bucket is separate from the seven-day build-source staging bucket; website authentication gates report and file downloads.
 
 ## Access and desktop ownership
 
@@ -53,7 +64,7 @@ Signing out releases that session's human ownership. Expired ownership is cleare
 
 ## Viewer recovery and performance diagnosis
 
-The viewer changes are deployed as **`20260928-viewer-001`**, ECS task definition **`ctrlloop-mvp:2`**, image digest **`sha256:3562084c0092dc93581a708ae26a308c062ce254e3b6d34ef882c7478a05872c`**. The deployment was healthy by **`2026-09-28T17:17Z`**; subsequent readback confirmed one running task, none pending, and HTTP health 200. It reuses the same VM, worker revision `7443318e84165bc5`, native Driver, and Jev questions. No tests were added.
+At the earlier viewer checkpoint, the changes were deployed as **`20260928-viewer-001`**, ECS task definition **`ctrlloop-mvp:2`**, image digest **`sha256:3562084c0092dc93581a708ae26a308c062ce254e3b6d34ef882c7478a05872c`**. That deployment was healthy by **`2026-09-28T17:17Z`**; subsequent readback confirmed one running task, none pending, and HTTP health 200. It reused the same VM, worker revision `7443318e84165bc5`, native Driver, and Jev questions. The later general-executor deployment is recorded under acceptance evidence below. No tests were added.
 
 The application now reuses a PostgreSQL pool of **2–8 connections**. The gateway forwards RFB negotiation and framebuffer requests without an ownership query; only keyboard, pointer, and clipboard input needs the database ownership check. Adjacent input packets in one browser message share that check. The shared worker-row lock remains held until authorized input is forwarded, so ownership changes and run starts cannot race past it. Signed-in session validity is also checked independently every 15 seconds. The parser now consumes noVNC's **seven-byte extended PointerEvent** when its extension bit is present; treating it as six bytes left an extra byte that could corrupt the following message.
 
@@ -122,7 +133,7 @@ Startup applies the idempotent schema in `src/schema.sql` and registers the conf
 
 It creates an isolated application service and database role while reusing the existing development ALB, ECS cluster, and Aurora PostgreSQL cluster. The app runs as one Fargate task with 0.25 vCPU and 1 GiB memory, without a public task IP. A new CloudFront distribution provides HTTPS, disables response caching, forwards session/WebSocket headers, and sends the origin header needed by the isolated ALB listener rule. No new domain is required.
 
-Authenticate the permitted AWS SSO profile and create a separate deployment-tool environment. Runtime dependencies remain in the project lock; boto3 is used only by the deployment tool.
+Authenticate the permitted AWS SSO profile and create a separate deployment-tool environment. Runtime dependencies remain in the project lock; boto3 is also used by the application for private run-artifact storage.
 
 ```powershell
 aws sso login --profile mangorts-dev
@@ -172,15 +183,14 @@ The same VM's effective expiry was extended to **September 30, 2026, 2:19:52 PM 
 
 ## Failure handling and current limits
 
-- **Chrome must already be open** in the assigned graphical session. This executor selects an existing observed Chrome window; it does not launch Chrome, accept its first-run terms, dismiss arbitrary dialogs, or configure a browser profile.
-- Only navigation to the HTTPS **X root** is supported. The instruction must describe that Chrome navigation and contain exactly one valid destination. The executor rejects other destinations, paths, queries, fragments, and ports; it executes no additional requested action. It does not post, purchase, sign in, or read an authenticated feed. The current candidate filter expects the English Chrome accessibility labels.
-- A loaded X page and address must be observed through native Driver. The address field by itself is insufficient. Verification is bounded to 20 observations after committing the URL; failure to observe the page is an error, not completion.
-- Jev sees compact native candidates and the saved instruction. The navigation scope retains Chrome toolbar candidates and excludes page/account/feed controls. Existing window/control selection and action questions remain the source of the decision.
-- Native input is **not automatically replayed** after uncertain delivery or an exception. The guest journal can retry reporting a recorded result; it never repeats the GUI action. A restarted worker marks in-progress runs interrupted and releases stale server ownership after acquiring its guest process lock. Inspect the desktop before starting a new run.
-- The guest service uses a per-user lock across revisions. The server accepts one queued/running task for its assigned worker. This is not a general distributed scheduler, multi-customer isolation system, or high-availability queue.
-- Generation runs in the web process. A server restart marks incomplete generation as an error; create a new loop to retry. Keep the service at its configured single replica rather than scaling this in-process generation mechanism horizontally.
-- The current viewer proxy supports the existing RFB 3.8 service configuration and rejects unknown protocol messages. Fit and fullscreen are display controls; guest-resolution changes are not requested.
-- Full run reports and screenshots stay in the guest report directory. Run events/results in PostgreSQL provide the website's history. Export any needed guest artifacts before the VM expires. Existing Hermes compatibility remains a separate launch path.
+- The executor selects existing observed application windows; it does not include a general launch/planning system, generated typing content, or general completion verification. Removing demo filters does not establish support for every application or request.
+- Jev receives compact native candidates and the saved instruction. Existing authored window/control/action/settling questions, batching, model pins, and request budgets remain unchanged. Native raw observations are retained locally in the report; they are not all sent to Jev.
+- Fresh snapshot targeting, worker authentication, assigned-desktop authorization, and single-controller ownership remain enforced. Native input is **not automatically replayed** after uncertain delivery or exceptions. Recovery retries only evidence and recorded result delivery. Inspect the desktop before starting a new run after interruption.
+- The worker remains bounded to four iterations with existing transport/request limits. Archives are limited to 100 MiB for upload. Evidence that cannot upload remains local and the result explicitly reports the upload problem; local storage and guest lifetime remain finite.
+- The guest service uses a per-user lock across revisions. The server accepts one queued/running task for its assigned worker. This remains a single-workspace scheduler with one application replica.
+- Generation runs in the web process. A server restart marks incomplete generation as an error; create a new loop to retry. Failure reports preserve the available request, response, and error events and identify missing capture.
+- The viewer proxy and its recovery/ownership behavior remain independent of execution. Fit and fullscreen are display controls; guest-resolution changes are not requested.
+- New run archives are uploaded to private durable storage. Earlier runs that lack worker uploads expose the available server record and identify their missing native/Jev/screenshot evidence. Existing Hermes compatibility remains a separate launch path.
 
 ## API surface
 
@@ -196,9 +206,32 @@ The website and worker share one application API and the existing PostgreSQL rec
 | `POST /api/worker/mode` | Cookie-authenticated, origin-checked human/agent ownership transition |
 | `WS /api/desktop` | Cookie-authenticated viewer and ownership-filtered input |
 | `POST /api/worker/poll`, `/heartbeat`, `/recover` | Bearer-authenticated assigned worker delivery, liveness, and interrupted-run recovery |
-| `POST /api/worker/runs/{id}/events`, `/finish` | Bearer-authenticated progress and observed outcome for the worker's active run |
+| `POST /api/worker/runs/{id}/events`, `/finish` | Bearer-authenticated progress and recorded outcome for the assigned worker's run |
+| `POST /api/worker/runs/{id}/artifacts` | Bearer-authenticated, idempotent worker ZIP upload; usable after terminal result for recovery |
+| `GET /api/runs/{id}/report`, `/download` | Authenticated combined run record and downloadable evidence ZIP |
+| `GET /api/loops/{id}/report`, `/download` | Authenticated instruction/generation record, including failures before a run |
+| `GET /api/runs/{id}/files/{path}` | Authenticated individual worker evidence file |
+| `GET /reports/runs/{id}`, `/reports/loops/{id}` | Full-page report interface |
 
 ## Acceptance evidence
+
+### General executor and evidence archive — September 28, 2026
+
+Final app revision **`20260928-run-evidence-004`**, ECS task definition **`ctrlloop-mvp:6`**, reached steady state at **23:45:23 UTC**. Readback at 23:46 UTC verified one running task, no pending tasks, a sole healthy target, HTTP health 200, and deployed report assets identical to the reviewed source. The image digest is `sha256:b78ce9ab5e3b357d2528aaffe256b0a78c53e68aa6b34c4331866b1cd239c2cb`.
+
+The generic worker `c239319d3eaea74a` was verified with saved request `d926493e-fb4f-4055-9bca-806552117406`: “Click the Bold button in the blank LibreOffice Writer document.” Run [`0499cd53-ec33-4328-a441-9965414f1fb5`](https://d1t0sm9jhdinfi.cloudfront.net/reports/runs/0499cd53-ec33-4328-a441-9965414f1fb5) started at **23:30:01.277 UTC** and completed four bounded action loops. Jev selected a native Bold control each time. The outcome is **unverified**: the iteration limit is not a task-completion checker, and the pipeline can repeat an action.
+
+The worker operational duration was **44,962.600 ms** and the complete record through report generation was **47,879.814 ms**. The four current-state-to-last-input-dispatch loop durations were **5,683.406**, **6,090.622**, **6,475.933**, and **7,547.629 ms**; their end timestamps exactly match the final native command dispatch in each loop. Action returns, settling, screenshots and report work outside these boundaries remain separately visible. Each loop used one window-selection round and four control-selection rounds. First control rounds needed four parallel API batches under the existing byte limit; later rounds each needed one call. No Jev question was changed.
+
+The **32 Jev API calls** consumed **668,683 input tokens**, estimated at **$0.028084686** at $0.042/million, with free output. Instruction generation used **117 input / 55 output tokens**, took **3,346.58 ms**, and cost an estimated **$0.0000392**. These are usage estimates, not billed charges. The live report includes each call, group, question, probability and chosen action.
+
+Authenticated readback verified **741 worker events**, exact OpenAI request/response bodies, **8 before/after screenshots**, every worker manifest file hash, and the downloaded ZIP's CRCs. The private worker archive is **8,715,978 bytes**; the combined server/worker download is **9,594,426 bytes**. Its manifest has no capture gaps. Signed-out report, file and download requests returned 401, and S3 uses AES256 encryption. Evidence completeness does not imply task success.
+
+Four older surviving reports were also archived privately, with unavailable historical captures explicitly listed. The prior guest profile and guest-only files were already absent when inspected; restoring services on the same assigned guest did not recover those files. DBeaver was connected to the real `ctrlloop_mvp` database and its tables/data grid were visually verified over TLS. See the [infrastructure and cost audit](infrastructure-costs-20260928.md) for capacity, shared costs, billing limits and polling behavior.
+
+Validation used Python compilation, JavaScript syntax checks, browser rendering, authenticated live integration and archive readback; no tests were added. Desktop and mobile rendering of the actual completed report had no overflow or JavaScript errors. Raw records and call details render on expansion: initial HTML was about 100 KB, and expansion, collapse and reopening preserved all 39 questions in the inspected call. The deployed page also visibly loaded the completed report and expanded that call's questions, probabilities, tokens and cost. The full report JSON still downloads before rendering (about 23.7 MB for this run), so initial load time depends on the connection. The preserved Hermes entrypoint and pinned archived runtime still exist, and its `--help` launch succeeds independently.
+
+### Earlier X-navigation demonstration
 
 Verified deployment checkpoint, **September 27, 2026**:
 

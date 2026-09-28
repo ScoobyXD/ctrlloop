@@ -34,7 +34,7 @@ _IMPORT_FINISHED_NS = perf_counter_ns()
 
 
 async def _run(args, request, text, config, api_key, report):
-    driver = CuaDriver(claim_file=args.claim_file)
+    driver = CuaDriver(claim_file=args.claim_file, report=report)
     result = None
     try:
         with report.span("driver_initialization"):

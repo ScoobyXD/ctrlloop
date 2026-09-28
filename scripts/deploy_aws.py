@@ -263,6 +263,34 @@ print("CTRL Loop dedicated database created and login verified")
             self.record(distribution=dist["Id"], url=f"https://{dist['DomainName']}")
         print("CloudFront HTTPS distribution configured with caching disabled and WebSocket headers")
 
+    def report_storage(self):
+        """Private durable run evidence, separate from expiring build staging."""
+        bucket = f"{NAME}-reports-{ACCOUNT}-{REGION}"
+        s3 = self.client("s3")
+        ensure_call(s3.create_bucket, {"BucketAlreadyOwnedByYou"}, Bucket=bucket,
+                    CreateBucketConfiguration={"LocationConstraint": REGION})
+        s3.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={k: True for k in [
+            "BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"]})
+        s3.put_bucket_ownership_controls(Bucket=bucket, OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]})
+        s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+            {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]})
+        s3.put_bucket_tagging(Bucket=bucket, Tagging={"TagSet": TAGS})
+        s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Sid": "DenyInsecureTransport", "Effect": "Deny", "Principal": "*", "Action": "s3:*",
+            "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+            "Condition": {"Bool": {"aws:SecureTransport": "false"}}}]}))
+        iam = self.client("iam")
+        role_name = f"{NAME}-app"
+        trust = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+            "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+        ensure_call(iam.create_role, {"EntityAlreadyExists"}, RoleName=role_name,
+                    AssumeRolePolicyDocument=json.dumps(trust), Tags=TAGS)
+        iam.put_role_policy(RoleName=role_name, PolicyName="run-evidence", PolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:PutObject"], "Resource": f"arn:aws:s3:::{bucket}/runs/*"}]}))
+        self.record(report_bucket=bucket, task_role=iam.get_role(RoleName=role_name)["Role"]["Arn"])
+        print(json.dumps({"report_bucket": bucket, "public_access": "blocked", "retention": "durable; no automatic expiry"}))
+
     def build(self, revision):
         """Use managed ephemeral CodeBuild so local Docker/WSL is not required."""
         s3 = self.client("s3")
@@ -336,13 +364,16 @@ phases:
             raise RuntimeError("Refusing deployment until the current image build succeeds")
         image = self.client("ecr").describe_images(repositoryName=NAME, imageIds=[{"imageTag": self.state["revision"]}])["imageDetails"][0]
         self.record(image_digest=image["imageDigest"])
+        self.report_storage()
         ecs = self.client("ecs")
         env = {"OPENAI_MODEL": "gpt-6-luna", "APP_ORIGIN": self.state["url"],
                "WORKER_ID": "ctrlloop-omarchy-20260927-1708-e33048ae", "FLEET_NAMESPACE": "ctrlloop-omarchy-20260927-1708",
-               "FLEET_SANDBOX": "ctrlloop-omarchy-20260927-1708-e33048ae", "DEPLOY_REVISION": self.state["revision"]}
+               "FLEET_SANDBOX": "ctrlloop-omarchy-20260927-1708-e33048ae", "DEPLOY_REVISION": self.state["revision"],
+               "REPORT_BUCKET": self.state["report_bucket"], "AWS_DEFAULT_REGION": REGION}
         secret_names = ["DATABASE_URL", "APP_PASSWORD", "SESSION_SECRET", "WORKER_TOKEN", "CUA_CLIENT_ID", "CUA_CLIENT_SECRET"]
         task = ecs.register_task_definition(family=NAME, networkMode="awsvpc", requiresCompatibilities=["FARGATE"], cpu="256", memory="1024",
-            executionRoleArn=self.state["execution_role"], runtimePlatform={"cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX"},
+            executionRoleArn=self.state["execution_role"], taskRoleArn=self.state["task_role"],
+            runtimePlatform={"cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX"},
             containerDefinitions=[{"name": "app", "image": f"{self.state['repository']}@{self.state['image_digest']}", "essential": True,
                 "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                 "environment": [{"name": k, "value": v} for k, v in env.items()],

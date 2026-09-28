@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import tempfile
 from typing import Any
+from time import perf_counter_ns
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
@@ -66,7 +67,7 @@ class CuaDriver:
     """
 
     def __init__(self, claim_file: Path | None = None, *, service: str = "mcp", timeout: float = 60.0,
-                 local_endpoint: str | None = None, local_token: str | None = None) -> None:
+                 local_endpoint: str | None = None, local_token: str | None = None, report=None) -> None:
         if not isinstance(service, str) or not re.fullmatch(r"[a-zA-Z0-9_-]+", service):
             raise ValueError("service must name one Fleet service")
         if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
@@ -103,6 +104,7 @@ class CuaDriver:
         self._claim_lock: Any = None
         self._started = self._closed = self._broken = self._session_started = False
         self._snapshot: dict[str, Any] | None = None
+        self.report = report
 
     def _acquire_claim_lock(self, reference: dict[str, Any] | None = None) -> None:
         if self.local_endpoint:
@@ -225,8 +227,19 @@ class CuaDriver:
         request_id = self._sequence
         if not notification:
             body["id"] = request_id
+        tool = (params or {}).get("name") if method == "tools/call" else None
+        started_ns = self.report.native_sent(request_id, method, params) if self.report else perf_counter_ns()
         try:
             response = await asyncio.wait_for(self._request("POST", body), self.timeout)
+            returned_ns = perf_counter_ns()
+            if self.report:
+                self.report.native_dispatch_record(request_id)
+                # Native dictionaries and image blocks are retained as returned.
+                # Authentication and transport headers are deliberately excluded.
+                self.report.append("native_call_returned", _at_ns=returned_ns, call_id=request_id, method=method, tool=tool,
+                                   status_code=response.status_code, body=response.content,
+                                   duration_ms=(returned_ns-started_ns)/1_000_000,
+                                   response_limit_exceeded=len(response.content) > _RESPONSE_LIMIT)
             if not 200 <= response.status_code < 300:
                 code = ("driver_authorization_denied" if self.local_endpoint else "fleet_authorization_denied") if response.status_code in (401, 403) else "driver_transport_failed"
                 raise DriverError("The Driver request failed; completion is unknown and was not retried.", code=code)
@@ -260,6 +273,12 @@ class CuaDriver:
                 raise DriverError("Driver returned a non-object MCP result.", code="invalid_driver_response")
             return message["result"]
         except BaseException as error:
+            if self.report:
+                self.report.native_dispatch_record(request_id)
+                self.report.append("native_call_error", call_id=request_id, method=method, tool=tool,
+                                   error_type=type(error).__name__, code=getattr(error, "code", None),
+                                   duration_ms=(perf_counter_ns()-started_ns)/1_000_000,
+                                   outcome="delivery_unknown; never replay automatically")
             self._broken = True
             self._snapshot = None
             if isinstance(error, (DriverError, asyncio.CancelledError, KeyboardInterrupt)):

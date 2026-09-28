@@ -1,4 +1,4 @@
-"""Buffer observations and HTTP bytes; save reports on a worker at completion."""
+"""Durable run evidence and monotonic timing, using the existing event format."""
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import hashlib
 import logging
 import math
 import os
@@ -16,6 +17,7 @@ from time import perf_counter_ns, time_ns
 from types import TracebackType
 from typing import Any, Self
 from uuid import uuid4
+from zipfile import ZipFile, ZIP_DEFLATED
 
 import httpx2
 
@@ -55,7 +57,7 @@ def _format_payload_json(body: Any) -> str:
 
 
 class RunReport:
-    """Collect observations in memory and serialize them on a worker at close.
+    """Journal each observation, then render the existing report at close.
 
     Reports intentionally include request and observed UI content. HTTP headers,
     URL credentials/query strings, and exception messages are never recorded by
@@ -65,10 +67,12 @@ class RunReport:
     def __init__(
         self, directory: Path, *, origin_ns: int | None = None,
         origin_wall_ns: int | None = None, origin_label: str = "report_construction",
+        run_id: str | None = None,
     ) -> None:
         self._origin_ns = perf_counter_ns() if origin_ns is None else origin_ns
         self._origin_wall_ns = time_ns() if origin_wall_ns is None else origin_wall_ns
         self.origin_label = origin_label
+        self.run_id = run_id
         self._lock = RLock()
         self._span_count = 0
         # Workers inherit the round context, then replace their own span stack.
@@ -89,10 +93,19 @@ class RunReport:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         self.requests_path = directory / f"run-{stamp}-{uuid4().hex}"
         self.path = self.requests_path / "total_run.json"
+        self.requests_path.mkdir(mode=0o700, parents=True, exist_ok=False)
+        self.journal_path = self.requests_path / "events.jsonl"
+        self._journal = os.fdopen(os.open(self.journal_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab")
+        self._journal_write_ns = 0
+        self._loops: dict[int, dict[str, Any]] = {}
+        self._native_dispatches: dict[int, dict[str, Any]] = {}
         self._events: list[dict[str, Any]] = []
         self._closed = False
         self._close_error: BaseException | None = None
         self._request_count = 0
+        self.append("report_created", run_id=run_id, origin=origin_label,
+                    loop_boundary="current_state_start_to_last_input_command_dispatch",
+                    clock_scope="worker_monotonic; server timestamps are a separate clock")
 
     def _write(self, text: str) -> None:
         started_ns = perf_counter_ns()
@@ -177,7 +190,15 @@ class RunReport:
                 self._elapsed_ms(self._first_request_ns) if self._first_request_ns is not None else None
             ),
             "end_boundary": "operational_end_before_report_generation",
+            "durable_journal_write_duration_ms": self._journal_write_ns / 1_000_000,
         }
+
+    def _serializable(self, saved: dict[str, Any]) -> dict[str, Any]:
+        record = {"timestamp": self._timestamp(saved["_at_ns"]),
+                  **{key: value for key, value in saved.items() if key != "_at_ns"}}
+        if isinstance(record.get("body"), bytes):
+            record.update(_body_fields(record.pop("body")))
+        return record
 
     def append(self, event: str, *, _at_ns: int | None = None, **data: Any) -> None:
         if self._closed:
@@ -197,6 +218,49 @@ class RunReport:
         record = deepcopy(record)
         with self._lock:
             self._events.append(record)
+            started_ns = perf_counter_ns()
+            encoded = json.dumps(self._serializable(record), ensure_ascii=False, allow_nan=False).encode("utf-8")
+            self._journal.write(encoded + b"\n")
+            self._journal.flush()
+            os.fsync(self._journal.fileno())
+            self._journal_write_ns += perf_counter_ns() - started_ns
+
+    def native_sent(self, call_id: int, method: str, params: dict[str, Any] | None) -> int:
+        """Persist intent before transport; this is not proof the input landed."""
+        tool = (params or {}).get("name") if method == "tools/call" else None
+        details = {"call_id": call_id, "method": method, "tool": tool,
+                   "arguments": (params or {}).get("arguments") if tool else params}
+        self.append("native_call_intent", **details, boundary="journaled_before_transport",
+                    delivery="not_yet_dispatched")
+        iteration = self._context().get("iteration")
+        # All synchronous journal work precedes this timestamp. No further file
+        # writes occur before the caller invokes native transport. A crash can
+        # retain intent without a dispatch marker, which recovery labels unknown.
+        at_ns = perf_counter_ns()
+        self._native_dispatches[call_id] = {**details, "_at_ns": at_ns}
+        if iteration in self._loops and tool in {"click", "type_text", "press_key", "hotkey"}:
+            self._loops[iteration].update(last_command_ns=at_ns, last_command_id=call_id, last_command_tool=tool)
+        return at_ns
+
+    def native_dispatch_record(self, call_id: int) -> None:
+        dispatch = self._native_dispatches.pop(call_id, None)
+        if dispatch:
+            self.append("native_call_sent", **dispatch, boundary="transport_call_start",
+                        recorded_after_transport=True, delivery="not_proof_of_input_delivery")
+
+    def finish_loop(self, iteration: int) -> None:
+        loop = self._loops.pop(iteration, None)
+        if loop is None:
+            return
+        ended = loop.get("last_command_ns", perf_counter_ns())
+        self.append("loop_finished", _at_ns=ended, iteration=iteration,
+                    started_elapsed_ms=self._elapsed_ms(loop["started_ns"]),
+                    finished_elapsed_ms=self._elapsed_ms(ended),
+                    duration_ms=(ended-loop["started_ns"])/1_000_000,
+                    last_command_id=loop.get("last_command_id"),
+                    last_command_tool=loop.get("last_command_tool"),
+                    end_boundary="transport_call_start" if "last_command_ns" in loop else "stopped_without_input_command",
+                    completed_action_loop="last_command_ns" in loop)
 
     def _new_span(self, operation: str, data: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -223,10 +287,14 @@ class RunReport:
 
     @contextmanager
     def span(self, operation: str, **data: Any):
-        """Record operation boundaries in memory using a monotonic clock."""
+        """Record durable operation boundaries using a monotonic clock."""
         span = self._new_span(operation, data)
         self.append("timing_started", **span)
         started_ns = perf_counter_ns()
+        if operation == "loop.cycle":
+            self._loops[data["iteration"]] = {"started_ns": started_ns}
+            self.append("loop_started", _at_ns=started_ns, iteration=data["iteration"],
+                        boundary="before_current_state_acquisition")
         token = self._contexts.set((*self._contexts.get(), {**span, "_started_ns": started_ns}))
         failure = None
         try:
@@ -240,6 +308,8 @@ class RunReport:
                 "interrupted" if isinstance(failure, (KeyboardInterrupt, SystemExit)) else "error"
             )
             try:
+                if operation == "loop.cycle":
+                    self.finish_loop(data["iteration"])
                 if operation == "selection.sdk_call":
                     self._finish_pending_requests(span["span_id"], finished_ns, failure)
                 self._finish_span(span, started_ns, finished_ns, status, failure)
@@ -305,10 +375,16 @@ class RunReport:
             raise
         finished_ns = perf_counter_ns()
         timing = self._request_timing(request_id, finished_ns, headers_ns)
+        parsed = _body_fields(content)
+        usage = parsed.get("body", {}).get("usage", {}) if isinstance(parsed.get("body"), dict) else {}
+        input_tokens = usage.get("input_tokens") if isinstance(usage, dict) else None
         self.append(
             "jev_response", _at_ns=finished_ns, request_id=request_id, **timing,
             status_code=response.status_code,
             body=content,
+            input_tokens=input_tokens,
+            input_cost_usd=input_tokens * 0.042 / 1_000_000 if type(input_tokens) is int else None,
+            input_price_per_million_usd=0.042, output_cost_usd=0,
         )
 
     def _request_timing(self, request_id: int | None, finished_ns: int, headers_ns: int) -> dict[str, Any]:
@@ -361,14 +437,14 @@ class RunReport:
         if self._finished_ns is None:
             self._finished_ns = started_ns
         try:
-            # No worker, filesystem work, or payload parsing runs during the loop.
-            # The closed buffer belongs exclusively to this worker until it returns.
+            # The journal already preserves events if final rendering is interrupted.
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="run-report") as worker:
                 worker.submit(self._flush).result()
         except BaseException as error:
             self._close_error = error
             raise
         finally:
+            self._journal.close()
             finished_ns = perf_counter_ns()
             self._completion_timing = {
                 **self._summary(self._finished_ns),
@@ -503,3 +579,113 @@ class RunReport:
         traceback: TracebackType | None,
     ) -> None:
         self.close()
+
+
+def package_report(directory: Path, *, run_id: str, interrupted: bool = False) -> tuple[Path, dict[str, Any]]:
+    """Package only this run's evidence; recover a partial journal after a crash.
+
+    Recovery never opens a Driver connection and cannot replay desktop commands.
+    Server-side model/delivery evidence is joined by the authenticated download.
+    """
+    directory = directory.resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    missing: list[str] = []
+    events: list[dict[str, Any]] = []
+    total = directory / "total_run.json"
+    if total.exists():
+        try:
+            events = json.loads(total.read_text(encoding="utf-8"))
+            if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
+                raise ValueError("Invalid report event array")
+        except (ValueError, OSError):
+            events = []
+            missing.append("Final total_run.json could not be read; recovered durable journal records instead.")
+    if not events:
+        journal = directory / "events.jsonl"
+        if journal.exists():
+            for number, line in enumerate(journal.read_bytes().splitlines(), 1):
+                try:
+                    event = json.loads(line)
+                    if not isinstance(event, dict):
+                        raise ValueError("Invalid event record")
+                    events.append(event)
+                except (ValueError, UnicodeError):
+                    missing.append(f"Journal record {number} is incomplete or invalid, usually from interrupted persistence.")
+        else:
+            missing.append("No worker event journal was created before interruption.")
+        events.sort(key=lambda event: event.get("elapsed_ms", 0))
+        total.write_text(json.dumps(events, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
+    if interrupted:
+        missing.append("Worker restarted before its terminal result was persisted; remaining observations, screenshots and command outcomes are unknown.")
+    if not any(event.get("event") == "run_finished" for event in events):
+        missing.append("No completed worker run_finished record is available.")
+    observed_execution = any(event.get("event") in {"windows_discovered", "window_observed", "controls_observed", "loop_started"}
+                             or (event.get("event") == "timing_started" and event.get("operation") in {"loop.iteration", "loop.cycle"})
+                             for event in events)
+    if observed_execution:
+        if not (directory / "events.jsonl").is_file():
+            missing.append("No durable event journal is available for this earlier desktop execution; only its finalized report was retained.")
+        if not any(event.get("event") in {"native_call_sent", "native_call_intent", "native_call_returned"} for event in events):
+            missing.append("Raw native MCP observations, complete command arguments/results and per-call dispatch timestamps were not captured by this earlier worker.")
+        if not any(event.get("event") == "loop_started" for event in events) or not any(event.get("event") == "loop_finished" for event in events):
+            missing.append("Exact current-state-to-command-dispatch loop boundaries are unavailable; historical cycle timings include later return/verification/reporting work.")
+        if not any(event.get("event") == "screenshot_saved" for event in events) and not any((directory / "screenshots").glob("*.png")):
+            missing.append("No screenshot is available for the observed desktop execution.")
+    native_intents = {event.get("call_id") for event in events if event.get("event") == "native_call_intent"}
+    native_sent = {event.get("call_id") for event in events if event.get("event") == "native_call_sent"}
+    native_returned = {event.get("call_id") for event in events if event.get("event") == "native_call_returned"}
+    for call_id in sorted(native_intents - native_sent, key=str):
+        missing.append(f"Native call {call_id} has durable intent but no captured transport-start marker; dispatch is unknown.")
+    for call_id in sorted((native_intents | native_sent) - native_returned, key=str):
+        missing.append(f"Native call {call_id} has no captured response; delivery may be uncertain.")
+    jev_sent = {event.get("request_id") for event in events if event.get("event") == "jev_request"}
+    jev_returned = {event.get("request_id") for event in events if event.get("event") == "jev_response"}
+    for request_id in sorted(jev_sent - jev_returned, key=str):
+        missing.append(f"Jev API call {request_id} has no complete captured response; token usage and cost are unavailable.")
+    for sequence, event in enumerate(events):
+        if event.get("event") == "screenshot_error":
+            missing.append(f"Screenshot unavailable: loop {event.get('iteration')}, {event.get('phase')} ({event.get('error_type')}).")
+        if event.get("event") == "screenshot_saved":
+            # Historical reports can be copied from another machine. Resolve
+            # only the recorded image basename inside this evidence directory.
+            image_name = Path(str(event.get("path", "")).replace("\\", "/")).name
+            if not image_name or not (directory / "screenshots" / image_name).is_file():
+                missing.append(f"Recorded screenshot file is missing: loop {event.get('iteration')}, {event.get('phase')} ({image_name or 'path unavailable'}).")
+        response_body = event.get("body")
+        response_usage = response_body.get("usage", {}) if isinstance(response_body, dict) else {}
+        input_tokens = event.get("input_tokens")
+        if input_tokens is None and isinstance(response_usage, dict):
+            input_tokens = response_usage.get("input_tokens")
+        if event.get("event") == "jev_response" and input_tokens is None:
+            missing.append(f"Jev API call {event.get('request_id')} returned no captured input-token usage; cost is unknown.")
+        direction = {"jev_request": "input", "jev_response": "output"}.get(event.get("event"))
+        recorded_file = event.get("request_file" if direction == "input" else "response_file")
+        if direction and (not isinstance(recorded_file, str) or not (directory / recorded_file).is_file()):
+            # A crash can happen before close creates the readable per-call files.
+            identity = event.get("request_id")
+            identity = identity if type(identity) is int and identity >= 0 else sequence
+            path = directory / f"recovered_jev_{direction}_{identity:04d}.json"
+            path.write_text(_format_payload_json(event.get("body", {"body_text": event.get("body_text")})), encoding="utf-8")
+    manifest = {
+        "run_id": run_id, "complete": not missing, "missing_capture": missing,
+        "scope": "Available worker evidence; server.json in the combined download includes OpenAI and delivery records.",
+        "loop_boundary": "current_state_start_to_last_input_command_dispatch",
+        "clock_scope": "worker_monotonic; do not subtract timestamps from different machines",
+        "credential_capture": "HTTP authentication headers, worker tokens and environment secrets are excluded",
+        "files": [],
+    }
+    for path in sorted(directory.rglob("*")):
+        if path.is_file() and not path.is_symlink() and path.name != "manifest.json" and not path.name.endswith(".tmp"):
+            content = path.read_bytes()
+            manifest["files"].append({"path": path.relative_to(directory).as_posix(), "size_bytes": len(content),
+                                      "sha256": hashlib.sha256(content).hexdigest()})
+    (directory / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
+    archive = directory.with_suffix(".zip")
+    temporary = archive.with_suffix(".zip.tmp")
+    with ZipFile(temporary, "w", compression=ZIP_DEFLATED) as bundle:
+        os.chmod(temporary, 0o600)
+        for entry in manifest["files"]:
+            bundle.write(directory / entry["path"], entry["path"])
+        bundle.write(directory / "manifest.json", "manifest.json")
+    temporary.replace(archive)
+    return archive, manifest

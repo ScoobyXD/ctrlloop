@@ -1,7 +1,7 @@
 const $ = (id) => document.getElementById(id);
-const samplePrompt = "I want to see the latest posts on X";
+const samplePrompt = "Click the search field in the current application";
 const activeStatuses = new Set(["queued", "pending", "delivering", "delivered", "acknowledged", "running", "processing", "selecting", "executing", "verifying"]);
-const errorStatuses = new Set(["error", "failed", "blocked", "rejected", "cancelled", "canceled", "expired", "interrupted"]);
+const errorStatuses = new Set(["error", "failed", "blocked", "unverified", "rejected", "cancelled", "canceled", "expired", "interrupted"]);
 const stageLabels = {
   user_request: "User request", request: "User request", llm_generation: "LLM generation",
   llm_started: "LLM generation started", llm_completed: "Instruction generated", llm_generated: "Instruction generated", instruction_generated: "Instruction generated",
@@ -136,7 +136,8 @@ function renderEvent(event, index, groupKey) {
 }
 function renderRun(run, index, total) {
   const events = Array.isArray(run.events) ? run.events : [];
-  return `<section class="run-group"><div class="run-summary"><div><span>Run ${total - index}</span><span class="run-id" title="${escapeHtml(run.id)}">${escapeHtml(String(run.id || "").slice(0, 8))}</span>${badge(run.status)}</div><span class="run-duration" data-run-start="${escapeHtml(run.started_at || run.created_at || "")}" data-run-end="${escapeHtml(run.finished_at || "")}" data-run-active="${activeStatuses.has(run.status)}">—</span></div>${events.length ? `<ol class="timeline">${events.map((event, eventIndex) => renderEvent(event, eventIndex, run.id)).join("")}</ol>` : '<p class="no-events">No worker events recorded yet.</p>'}${run.error ? `<div class="inline-error run-error">${escapeHtml(valueText(run.error))}</div>` : ""}</section>`;
+  const links = `<div class="instruction-actions"><a class="button secondary small" href="/reports/runs/${encodeURIComponent(run.id)}" target="_blank" rel="noopener">Full-page report ↗</a><a class="button quiet small" href="/api/runs/${encodeURIComponent(run.id)}/download">Download evidence ZIP ↓</a></div>`;
+  return `<section class="run-group"><div class="run-summary"><div><span>Run ${total - index}</span><span class="run-id" title="${escapeHtml(run.id)}">${escapeHtml(String(run.id || "").slice(0, 8))}</span>${badge(run.status)}</div><span class="run-duration" data-run-start="${escapeHtml(run.started_at || run.created_at || "")}" data-run-end="${escapeHtml(run.finished_at || "")}" data-run-active="${activeStatuses.has(run.status)}">—</span></div>${links}${events.length ? `<ol class="timeline">${events.map((event, eventIndex) => renderEvent(event, eventIndex, run.id)).join("")}</ol>` : '<p class="no-events">No worker events recorded yet.</p>'}${run.error ? `<div class="inline-error run-error">${escapeHtml(valueText(run.error))}</div>` : ""}</section>`;
 }
 function renderDetail() {
   if (!state.detail) return;
@@ -150,6 +151,10 @@ function renderDetail() {
   const model = typeof loop.model === "object" ? loop.model?.id || loop.model?.model : loop.model;
   $("loop-detail").innerHTML = `<div class="detail-heading"><h2>Saved loop</h2>${badge(loop.status)}</div><div class="request-block"><div class="content-label"><span>YOUR REQUEST</span><time datetime="${escapeHtml(loop.created_at || "")}" title="${escapeHtml(formatDate(loop.created_at, { second: "2-digit", timeZoneName: "short" }))}">${escapeHtml(formatDate(loop.created_at))}</time></div><p class="request-text">${escapeHtml(loop.prompt)}</p></div><div class="instruction-block"><div class="content-label"><span>GENERATED INSTRUCTION</span><span>${loop.instruction ? "SAVED" : "PENDING"}</span></div>${loop.instruction ? `<p class="instruction-text">${escapeHtml(loop.instruction)}</p>` : '<p class="instruction-missing">No generated instruction has been saved.</p>'}${model ? `<div class="instruction-meta">${escapeHtml(model)}</div>` : ""}${loop.error ? `<div class="inline-error">${escapeHtml(valueText(loop.error))}</div>` : ""}<div class="instruction-actions"><button id="run-instruction" class="button primary" ${!loop.instruction ? "disabled" : ""}>Run instruction ↗</button><button id="reuse-request" class="button quiet small">Edit request</button></div><p class="run-hint" id="run-control-hint"></p></div><div class="activity-header"><h3>Activity</h3><span>${runs.length} ${runs.length === 1 ? "run" : "runs"} · ${Intl.DateTimeFormat().resolvedOptions().timeZone}</span></div>${loopEvents.length ? `<div class="run-group"><div class="run-summary"><span>Request & instruction</span></div><ol class="timeline">${loopEvents.map((event, index) => renderEvent(event, index, `loop-${loop.id}`)).join("")}</ol></div>` : ""}${runs.map((run, index) => renderRun(run, index, runs.length)).join("")}${!runs.length ? '<p class="no-events">No runs yet. Run the saved instruction to follow delivery, Jev selection, native actions, and the observed result.</p>' : ""}`;
   for (const element of $("loop-detail").querySelectorAll("details[data-event-key]")) element.open = openKeys.has(element.dataset.eventKey);
+  const requestLinks = document.createElement("div");
+  requestLinks.className = "instruction-actions";
+  requestLinks.innerHTML = `<a class="button quiet small" href="/reports/loops/${encodeURIComponent(loop.id)}" target="_blank" rel="noopener">Request & model report ↗</a><a class="button quiet small" href="/api/loops/${encodeURIComponent(loop.id)}/download">Request evidence ZIP ↓</a>`;
+  $("loop-detail").querySelector(".instruction-block").append(requestLinks);
   updateDurations(); renderControl();
 }
 function updateDurations() {

@@ -121,6 +121,8 @@ async def run_pipeline(
     if text is not None and not isinstance(text, str):
         raise ValueError("text must be a string or None.")
     result = PipelineResult(status="no_windows")
+    if report is not None:
+        driver.report = report
     pending_text = text or None
     state = {"original_request": original_request, "iteration": 0, "current_window": None, "last_control": None}
     async def notify(event, **details):
@@ -135,7 +137,9 @@ async def run_pipeline(
         trace = {"iteration": iteration}
         result.iterations.append(trace)
         settling_ms = None
-        with _span(report, "loop.iteration", iteration=iteration):
+        # The encompassing cycle includes return/screenshot overhead. The report
+        # separately closes loop_finished at the last input dispatch timestamp.
+        with _span(report, "loop.cycle", iteration=iteration):
             with _span(report, "window_discovery", stage="windows", tool="list_windows"):
                 discovered = await driver.call("list_windows", {"on_screen_only": True})
             windows = discovered.get("windows")
@@ -211,6 +215,8 @@ async def run_pipeline(
                 report.append("control_selected", control=winner.record, description=winner.description, action=tool, selections=selection.rounds)
             await notify("control_selected", iteration=iteration, control=winner.description, action=tool, rounds=selection.rounds)
             if tool == "type_text" and pending_text is None:
+                if screenshots and report:
+                    trace["screenshots"] = {"before": await report.capture_screenshot(driver, phase="before", iteration=iteration)}
                 return _stop(result, trace, "no_action", "No prepared text is available for this typing operation (missing, empty, or already used).", report)
             arguments = {**target, "delivery_mode": "foreground"}
             if winner.record.get("element_token"):

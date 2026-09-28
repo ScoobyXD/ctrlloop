@@ -52,7 +52,7 @@
                 <div class="panel-heading"><h2><span class="section-number">01</span> Give it a direction</h2><span class="quiet-label">TYPED CHAT</span></div>
                 <form id="compose-form">
                   <label class="sr-only" for="prompt">What would you like your desktop to do?</label>
-                  <textarea id="prompt" name="prompt" rows="3" maxlength="2000" required placeholder="What would you like your desktop to do?">I want to see the latest posts on X</textarea>
+                  <textarea id="prompt" name="prompt" rows="3" maxlength="2000" required placeholder="What would you like your desktop to do?">Click the search field in the current application</textarea>
                   <div class="compose-bottom"><span class="compose-hint">Generate an instruction<br>and save it as a loop.</span><button id="create-loop" class="button primary" type="submit"><span>Create loop</span><span aria-hidden="true">↗</span></button></div>
                 </form>
                 <div class="model-line"><span class="spark" aria-hidden="true">✳</span><span id="model-label">Model details loading</span></div>
@@ -74,7 +74,7 @@
                 <div class="desktop-control-bar"><div class="control-mode"><span id="control-mode-icon" aria-hidden="true">◉</span><div><strong id="control-mode-label">View only</strong><span id="control-mode-description">The agent controls this desktop.</span></div></div><button id="toggle-control" class="button secondary small" disabled>Take control <span aria-hidden="true">↗</span></button></div>
               </section>
               <div class="desktop-meta"><span id="worker-status">Worker status pending</span><span id="worker-last-seen"></span></div>
-              <section class="scope-note"><span aria-hidden="true">↳</span><p>This first demo opens a website in Chrome. Completion requires an observed result. Seeing X open does not mean an authenticated feed was read.</p></section>
+              <section class="scope-note"><span aria-hidden="true">↳</span><p>The worker selects visible windows and controls for click or type actions. General task planning, generated typing content, and task completion checks are not implemented yet. Each run reports its observed outcome and provides an evidence ZIP.</p></section>
               <details class="workspace-details"><summary>Workspace details <span aria-hidden="true">＋</span></summary><dl><div><dt>Assigned worker</dt><dd id="worker-detail-id">—</dd></div><div><dt>Instruction model</dt><dd id="model-detail-id">—</dd></div><div><dt>Selection model</dt><dd id="jev-detail-id">—</dd></div><div><dt>Desktop connection</dt><dd>Authenticated, same-origin gateway</dd></div></dl></details>
             </section>
           </div>
