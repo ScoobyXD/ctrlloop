@@ -243,6 +243,7 @@ class _Viewer:
         policy = None
         tasks = []
         close_code = 1000
+        failure_stage = 'admission'
         try:
             credential = parse_qs(urlsplit(self.websocket.request.path).query)['credential'][0]
             async with connect(self.gate.policy_url,
@@ -265,7 +266,7 @@ class _Viewer:
                     if any(str(initial.get(key, '')) != value for key, value in self.gate.assignment.items()):
                         raise PermissionError('Desktop policy assignment changed')
                     reader, self.writer = await asyncio.open_connection('127.0.0.1', 5902)
-                # Admission consumes the capability once; never include it in
+                # Send the capability only at admission; never include it in
                 # traffic logs, error messages, or subsequent policy exchanges.
                 del credential
                 policy_lock = asyncio.Lock()
@@ -369,11 +370,14 @@ class _Viewer:
                                 if permission.get('allowed') is False and self.has_pressed_input:
                                     self.stop()
 
-                tasks = [asyncio.create_task(fn()) for fn in
-                         (inbound, outbound, watchdog, self.stopped.wait, policy.wait_closed)]
+                tasks = [asyncio.create_task(fn(), name=name) for name, fn in
+                         (('browser_input', inbound), ('desktop_output', outbound),
+                          ('policy_check', watchdog), ('local_stop', self.stopped.wait),
+                          ('policy_closed', policy.wait_closed))]
                 try:
                     done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                     for task in done:
+                        failure_stage = task.get_name()
                         task.result()
                 finally:
                     # Revoke guest transport before policy WebSocket teardown,
@@ -389,7 +393,8 @@ class _Viewer:
             close_code = 1001
         except Exception as error:
             close_code = 1008 if isinstance(error, (PermissionError, ValueError)) else 1011
-            logger.warning('desktop stream closed error_type=%s', type(error).__name__)
+            logger.warning('desktop stream closed stage=%s error_type=%s',
+                           failure_stage, type(error).__name__)
         finally:
             self.stop()
             for task in tasks:
