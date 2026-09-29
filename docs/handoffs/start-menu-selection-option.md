@@ -11,7 +11,7 @@ Implement a selection-only milestone: offer Jev an explicit option named **Open 
 
 ## Context
 
-The current pipeline lists windows, runs a tournament of Jev Choice questions, reads the winning window, then selects one of its controls. Each group has at most ten options. Independent groups are batched into one request where budgets permit; group winners compete in subsequent rounds.
+At the time of this historical handoff, the pipeline listed windows, ran a tournament of Jev Choice questions with at most ten options per group, read the winning window, then selected one of its controls. The current [selection contract](../main-workflow.md#selection-contract) supersedes that fixed group limit. Independent groups are batched into one request where budgets permit; group winners compete in subsequent rounds.
 
 The seven real runs currently saved in `reports/` contain no Start menu or Windows Search entry among their observed windows or first-round window choices. An additional saved report is an offline fixture verification, and one run has both JSONL and formatted JSON copies. A Search menu item in the Notepad++ control choices is unrelated to Windows Search. These reports do not establish whether the driver can expose Start/Search when open. This task explicitly introduces a future route rather than claiming discovery of a real window.
 
@@ -19,7 +19,7 @@ A subsequent separate worktree investigation verified that the open Start menu i
 
 ## Required behavior
 
-- Insert exactly one synthetic option into the initial window-selection candidate list, positioned within the first group. Count it toward the existing ten-option limit and preserve the relative order of real windows.
+- Insert exactly one synthetic option into the initial window-selection candidate list, positioned within the first group. Count it toward that group's size limit and preserve the relative order of real windows.
 - Give it a stable, distinct key and a concise description explaining that opening the Start menu provides access to Windows Search for applications that may not already be open. Do not imply that it guarantees finding the requested application.
 - Advance it through the same tournament as any other candidate. Do not insert another copy in later groups, requests, or rounds. Do not treat a preliminary group win as the final selection.
 - Keep the original user request unchanged as Jev's shared state. Preserve the pinned model, question batching, request budgets, and selection rules.
