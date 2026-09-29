@@ -38,9 +38,9 @@ const kind = parts[1], identity = parts[2];
 const base = `/api/${kind}/${encodeURIComponent(identity)}`;
 let current;
 let sessionGeneration = 0;
-const personName = (person) => person?.display_name || person?.username || "Earlier workspace member";
+const personName = (person) => person?.display_name || person?.username || "Earlier company member";
 function hideRecord() { current = null; lazyContent.clear(); $("report-content").replaceChildren(); $("report-content").hidden = true; }
-function requireLogin() { sessionGeneration+=1; hideRecord(); $("report-login").hidden=false; $("report-loading").hidden=true; $("report-person").textContent="RUN EVIDENCE"; $("report-workspace").hidden=true; $("report-workspace-name").textContent=""; }
+function requireLogin() { sessionGeneration+=1; hideRecord(); $("report-login").hidden=false; $("report-loading").hidden=true; $("report-person").textContent="RUN EVIDENCE"; $("report-company").hidden=true; $("report-company-name").textContent=""; }
 
 async function fetchJSON(path, options={}) {
   const generation=sessionGeneration;
@@ -59,11 +59,11 @@ $("report-login").addEventListener("submit",async(event)=>{
   } catch(error){$("login-error").textContent=error.message;}
   finally{$("report-login-submit").disabled=false;}
 });
-$("report-workspace").addEventListener("change",async()=>{
-  const workspaceId=$("report-workspace").value;sessionGeneration+=1;hideRecord();$("report-workspace").disabled=true;
-  try {await fetchJSON("/api/session/workspace",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({workspace_id:workspaceId})});await load();}
+$("report-company").addEventListener("change",async()=>{
+  const companyId=$("report-company").value;sessionGeneration+=1;hideRecord();$("report-company").disabled=true;
+  try {await fetchJSON("/api/session/workspace",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({workspace_id:companyId})});await load();}
   catch(error){$("report-loading").hidden=false;$("report-loading").textContent=error.message;}
-  finally{$("report-workspace").disabled=false;}
+  finally{$("report-company").disabled=false;}
 });
 
 function loopData(events) {
@@ -77,15 +77,15 @@ function loopData(events) {
     return {iteration:start.iteration,start:start.elapsed_ms,end:finish,extent:Math.max(extent,finish||0),boundary:end,spans:spans.filter(e=>e.iteration===start.iteration),events:events.filter(e=>e.iteration===start.iteration)};
   });
 }
-const colors={windows:"#6eb9be",window:"#8c9cea",focus:"#d9a572",controls:"#69b798",action:"#e58d79",wait:"#bca268",overhead:"#58654f"};
+const colors={windows:"#789cbe",window:"#8f94d7",focus:"#d5b28c",controls:"#a7b4bf",action:"#ff620f",wait:"#d2a450",overhead:"#62605c"};
 function stage(span){
   const op=span.operation;
   if(op==="window_discovery")return {name:"CUA/UIA get windows",key:"windows",color:colors.windows,rank:2};
   if(op==="window_selection")return {name:"Jev window selection overhead",key:"window",color:colors.window,rank:1};
   if(op==="foreground_activation")return {name:"CUA focus",key:"focus",color:colors.focus,rank:2};
   if(op==="control_acquisition")return {name:"CUA/UIA get controls",key:"controls",color:colors.controls,rank:2};
-  if(op==="control_selection")return {name:"Jev control selection overhead",key:"control-overhead",color:"#917ba4",rank:1};
-  if(op==="selection.round")return {name:`Jev ${span.stage==="windows"?"window":"control"} round ${span.round}`,key:`${span.stage}-${span.round}`,color:span.stage==="windows"?colors.window:["#ae83c7","#d18cbb","#9d80dc","#ce80dc"][(span.round-1)%4],rank:4};
+  if(op==="control_selection")return {name:"Jev control selection overhead",key:"control-overhead",color:"#786b82",rank:1};
+  if(op==="selection.round")return {name:`Jev ${span.stage==="windows"?"window":"control"} round ${span.round}`,key:`${span.stage}-${span.round}`,color:span.stage==="windows"?colors.window:["#ac86c3","#d197b7","#8984cf","#c18fc6"][(span.round-1)%4],rank:4};
   if(["action_dispatch","native_action"].includes(op))return {name:"CUA action",key:"action",color:colors.action,rank:3};
   if(op==="settling_wait")return {name:"Settling wait",key:"wait",color:colors.wait,rank:2};
   return null;
@@ -244,11 +244,11 @@ async function load(){
     if(generation!==sessionGeneration)return;
     if(!session?.authenticated){requireLogin();return;}
     $("report-person").textContent=personName(session.user);
-    const memberships=session.memberships||[],picker=$("report-workspace");
+    const memberships=session.memberships||[],picker=$("report-company");
     picker.innerHTML=memberships.map(item=>`<option value="${esc(item.workspace_id)}">${esc(item.name)}</option>`).join("");picker.value=session.workspace?.id||"";picker.hidden=memberships.length<=1;
-    $("report-workspace-name").textContent=memberships.length<=1?session.workspace?.name||"":"";
+    $("report-company-name").textContent=memberships.length<=1?session.workspace?.name||"":"";
     const data=await fetchJSON(`${base}/report`);if(data&&generation===sessionGeneration)render(data);
   }
-  catch(error){if(generation!==sessionGeneration)return;hideRecord();$("report-loading").hidden=false;$("report-loading").textContent=`Could not load this report: ${error.message} You may need to select the workspace that owns it.`;}
+  catch(error){if(generation!==sessionGeneration)return;hideRecord();$("report-loading").hidden=false;$("report-loading").textContent=`Could not load this report: ${error.message} You may need to select the company that owns it.`;}
 }
 void load();

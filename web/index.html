@@ -1,33 +1,30 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#101312">
-    <title>[CTRL] Loop — your desktop, in motion</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23151816'/%3E%3Cpath d='M14 10H9v20h5m12-20h5v20h-5M16 20h8' fill='none' stroke='%23c1f57b' stroke-width='3'/%3E%3C/svg%3E">
-    <link rel="stylesheet" href="/styles.css">
-    <script type="module" src="/app.js"></script>
-  </head>
-  <body>
-    <div id="login-screen" class="login-screen">
-      <div class="login-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="orbit orbit-three"></div><div class="orbit-center">[↳]</div><span class="orbit-label">INTENT → INSTRUCTION → ACTION</span></div>
-      <main class="login-card">
-        <a class="brand" href="/" aria-label="CTRL Loop home"><span class="brand-mark">[CTRL]</span><span>Loop<span class="brand-dot">.</span></span></a>
-        <span class="eyebrow login-eyebrow">YOUR DESKTOP, IN MOTION</span>
-        <h1>A thought.<br>A little action.</h1>
-        <p class="login-description">Turn a request into a saved instruction. Follow every step on your cloud desktop.</p>
-        <form id="login-form">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090909"><title>CtrlLoop — intent into action</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' fill='%23090909'/%3E%3Cpath d='M14 10H9v20h5m12-20h5v20h-5M16 20h8' fill='none' stroke='%23ff641a' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css"><script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <div id="login-screen" class="login-screen">
+    <section class="login-art" aria-hidden="true"><span class="technical-label">CONTROL LOOP / SYSTEM ACCESS</span><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="orbit orbit-three"></div><div class="orbit-center">[↳]</div><span class="orbit-label">OBSERVE → DECIDE → ACT</span></section>
+    <main class="login-card">
+      <a class="brand" href="/" aria-label="CtrlLoop home"><span class="brand-symbol">[↳]</span>ctrl<span>loop</span><i></i></a>
+      <span class="eyebrow">INTENT INTO ACTION</span><h1>Your next<br>move<span class="accent">.</span></h1>
+      <p class="login-description">Sign in to your company. Put your desktop to work.</p>
+              <form id="login-form">
           <label for="username">Username</label>
           <input id="username" name="username" autocomplete="username" required minlength="2" maxlength="64" placeholder="Your username">
           <label for="password">Password</label>
           <input id="password" name="password" type="password" autocomplete="current-password" required placeholder="Enter your password">
           <p id="login-error" class="form-error" role="alert" hidden></p>
-          <button class="button primary login-submit" id="login-submit" type="submit"><span>Open workspace</span><span aria-hidden="true">↗</span></button>
+          <button class="button primary login-submit" id="login-submit" type="submit"><span>Sign in</span><span aria-hidden="true">↗</span></button>
         </form>
         <form id="activation-form" hidden>
           <h2>Activate your account</h2>
-          <p class="login-description">Use the activation code provided by your workspace owner, then choose your own password.</p>
+          <p class="login-description">Use the activation code provided by your company admin, then choose your own password.</p>
           <label for="activation-token">Activation code</label>
           <input id="activation-token" name="token" type="password" autocomplete="off" required spellcheck="false">
           <button id="inspect-activation" type="button" class="button secondary small">Review account</button>
@@ -40,73 +37,56 @@
           <button class="button primary login-submit" id="activation-submit" type="submit" disabled>Activate account ↗</button>
         </form>
         <button id="toggle-activation" class="button quiet auth-toggle" type="button">Have an activation code?</button>
-        <p class="login-note"><span class="tiny-lock" aria-hidden="true">⌑</span> Your identity · Your desktop · Shared workflows</p>
-      </main>
-    </div>
 
-    <div id="app" class="app" hidden>
-      <header class="app-header">
-        <a class="brand" href="/" aria-label="CTRL Loop home"><span class="brand-mark">[CTRL]</span><span>Loop<span class="brand-dot">.</span></span></a>
-        <div class="header-divider"></div><div class="workspace-context"><label for="workspace-picker">WORKSPACE</label><strong id="workspace-name">Loading…</strong><select id="workspace-picker" hidden aria-label="Current workspace"></select></div>
-        <div class="header-end"><div class="signed-in-person"><strong id="user-name">Signed in</strong><span id="user-role"></span></div><span id="connection-state" class="connection-state"><i class="status-dot"></i>Connecting</span><button id="logout" class="button quiet small">Sign out</button></div>
-      </header>
+      <p class="login-note">Your account. Your desktop. Your company.</p>
+    </main>
+  </div>
 
-      <div class="app-layout">
-        <aside class="sidebar" aria-label="Saved loops">
-          <button id="new-loop" class="new-loop"><span aria-hidden="true">＋</span> New loop <span class="shortcut">N</span></button>
-          <div class="sidebar-section-label"><h2>SHARED WORKFLOWS</h2><span id="loop-count">0</span></div>
-          <div id="loop-list" class="loop-list"><p class="list-empty">Loading saved loops…</p></div>
-          <footer class="sidebar-footer"><span class="footer-symbol" aria-hidden="true">↳</span><div><strong>Small actions. Real progress.</strong><p>One instruction at a time.</p></div></footer>
-        </aside>
+  <div id="app" class="app" hidden>
+    <aside class="sidebar" aria-label="CtrlLoop navigation">
+      <a class="brand sidebar-brand" href="#home" aria-label="CtrlLoop home"><span class="brand-symbol">[↳]</span>ctrl<span>loop</span><i></i></a>
+      <div class="company-context"><span class="technical-label">COMPANY</span><strong id="company-name">Loading…</strong><select id="company-picker" hidden aria-label="Current company"></select></div>
+      <button id="new-loop" class="new-loop"><span aria-hidden="true">＋</span> New CtrlLoop <kbd>N</kbd></button>
+      <button id="home-nav" class="nav-item selected" aria-current="page"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m3 9 7-6 7 6v8h-5v-5H8v5H3Z"/></svg>Home<span class="nav-arrow" aria-hidden="true">↗</span></button>
+      <div class="sidebar-section-label"><h2>CTRLLOOPS</h2><span id="loop-count">0</span></div>
+      <div id="loop-list" class="loop-list"><p class="list-empty">Loading CtrlLoops…</p></div>
+      <div class="sidebar-bottom"><button id="company-nav" class="nav-item" hidden><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="6" r="3"/><path d="M2 17v-2a5 5 0 0 1 10 0v2M14 3a3 3 0 0 1 0 6m1 3a4 4 0 0 1 3 4"/></svg>Company members</button><div class="profile"><span id="user-initial" class="avatar" aria-hidden="true">—</span><div class="signed-in-person"><strong id="user-name">Signed in</strong><span id="user-role"></span></div><button id="logout" class="icon-button" aria-label="Sign out" title="Sign out"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 3H3v14h5m-1-7h10m-4-4 4 4-4 4"/></svg></button></div></div>
+    </aside>
 
-        <main class="workspace">
-          <div id="page-notice" class="notice" role="status" hidden><span id="page-notice-text"></span><button id="dismiss-notice" aria-label="Dismiss notification">×</button></div>
-          <div class="workspace-heading"><div><div class="eyebrow">FROM INTENT TO ACTION</div><h1>Your control room<span>.</span></h1><p>Share workflows with your workspace. Run them on your own desktop.</p></div><div class="workspace-coordinate" aria-hidden="true"><span>◌</span> HUMAN + AGENT</div></div>
-          <details id="member-management" class="panel members-panel" hidden>
-            <summary>Workspace members <span id="member-count"></span></summary>
+    <div class="main-shell">
+      <header class="app-header"><button id="toggle-sidebar" class="icon-button mobile-menu" aria-label="Toggle navigation" aria-expanded="false"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14"/></svg></button><div class="breadcrumb"><span id="breadcrumb-company">Company</span><span aria-hidden="true">/</span><strong id="breadcrumb-page">Home</strong></div><div class="header-end"><span id="connection-state" class="connection-state"><i class="status-dot"></i>Connecting</span><time id="system-clock" class="system-clock"></time></div></header>
+      <main id="main-content" class="main-content" tabindex="-1">
+        <div id="page-notice" class="notice" role="status" hidden><span id="page-notice-text"></span><button id="dismiss-notice" aria-label="Dismiss notification">×</button></div>
+        <section id="home-view" class="home-view" aria-label="Home">
+          <div class="home-hero"><div class="hero-copy"><div class="eyebrow"><span class="crosshair" aria-hidden="true">＋</span> THE NEXT MOVE IS YOURS</div><h1>Intent.<br>Into <span>action.</span></h1><p>Give your desktop a direction.<br>Follow every step from here.</p></div>
+            <div class="loop-schematic" aria-hidden="true"><svg viewBox="0 0 360 330"><defs><pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse"><path d="M30 0H0V30" fill="none" stroke="#242424" stroke-width=".6"/></pattern></defs><rect width="360" height="330" fill="url(#grid)"/><g fill="none" stroke="#505050" stroke-width=".8"><path d="M0 165h360M180 0v330"/><circle cx="180" cy="165" r="120"/><circle cx="180" cy="165" r="83" stroke-dasharray="3 6"/><circle cx="180" cy="165" r="43"/><path d="M54 39l252 252M54 291 306 39" stroke="#292929"/></g><g fill="none" stroke="#ff641a"><path d="M180 45a120 120 0 0 1 104 180" stroke-width="2"/><path d="m280 215 4 10 10-5" stroke-width="2"/><circle cx="180" cy="45" r="4" fill="#ff641a"/><path d="M165 149h-8v32h8m30-32h8v32h-8m-23-16h17" stroke-width="3"/></g><g fill="#a4a4a4" font-family="monospace" font-size="10"><text x="193" y="20">01 / OBSERVE</text><text x="230" y="284">02 / DECIDE</text><text x="4" y="178">03 / ACT</text><text x="286" y="319">↺ REPEAT</text></g><g stroke="#ababab"><path d="M1 13V1h12m334 0h12v12M1 317v12h12m334 0h12v-12"/></g></svg><span class="schematic-caption">THE CONTROL LOOP</span></div>
+          </div>
+          <section class="panel compose-panel" id="compose-panel" aria-labelledby="compose-title"><div class="panel-heading"><h2 id="compose-title">What would you like to do?</h2><span class="technical-label">NEW CTRLLOOP</span></div><form id="compose-form"><label class="sr-only" for="prompt">Describe what your desktop should do</label><textarea id="prompt" name="prompt" rows="3" maxlength="2000" required placeholder="e.g. Open the search field in my browser"></textarea><div class="compose-bottom"><span id="compose-hint" class="compose-hint">Describe it once. We’ll prepare the instruction and start.</span><button id="create-loop" class="button primary" type="submit">Start CtrlLoop <span aria-hidden="true">↗</span></button></div></form><div class="compose-foot"><span><i class="status-dot" id="compose-worker-dot"></i><span id="compose-worker">Checking desktop</span><button id="home-desktop" type="button" class="desktop-shortcut">Open desktop ↗</button></span><span class="technical-label">01 REQUEST <b>→</b> 02 PREPARE <b>→</b> 03 EXECUTE</span></div></section>
+          <section class="recent-section"><div class="section-heading"><h2>Recent CtrlLoops</h2><span id="home-loop-count" class="technical-label"></span></div><div id="recent-loops" class="recent-loops"><p class="list-empty">Your first CtrlLoop starts above.</p></div></section>
+          <footer class="page-footer"><span>CTRLLOOP / HUMAN INTENT. COMPUTER ACTION.</span><span id="model-label" hidden></span><span>CTRL + ENTER TO START</span></footer>
+        </section>
+
+        <section id="loop-view" class="loop-view" hidden aria-label="Selected CtrlLoop">
+          <div class="loop-page-heading"><div><div class="eyebrow" id="loop-reference">CTRLLOOP</div><h1 id="loop-title">Loading CtrlLoop…</h1></div><div id="loop-heading-status"></div></div>
+          <div class="loop-tabs" role="tablist" aria-label="CtrlLoop views"><button id="tab-activity" role="tab" aria-selected="true" aria-controls="activity-view" tabindex="0">Activity</button><button id="tab-desktop" role="tab" aria-selected="false" aria-controls="desktop-view" tabindex="-1"><span class="tab-monitor" aria-hidden="true">▣</span> Desktop</button><span class="tab-caption">REQUEST → INSTRUCTION → ACTION</span></div>
+          <section id="activity-view" role="tabpanel" aria-labelledby="tab-activity"><div id="loop-detail" class="detail-panel"><p class="loading-message">Loading CtrlLoop…</p></div></section>
+          <section id="desktop-view" role="tabpanel" aria-labelledby="tab-desktop" hidden>
+            <section id="desktop-panel" class="panel desktop-panel"><div class="panel-heading desktop-heading"><h2>Your live desktop</h2><span id="viewer-state" class="viewer-status"><i class="status-dot"></i>Disconnected</span></div><div class="desktop-toolbar"><div class="desktop-identity"><span class="desktop-icon" aria-hidden="true">▣</span><div><strong id="desktop-owner">Your Omarchy desktop</strong><span id="worker-identity">Waiting for assigned worker</span></div></div><div class="viewer-tools"><button id="fit-view" class="icon-button active" aria-label="Fit desktop to viewer" aria-pressed="true">Fit</button><button id="fullscreen" class="icon-button" title="Enter fullscreen" aria-label="Enter fullscreen"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button></div></div><div class="desktop-display"><div id="desktop-canvas" class="desktop-canvas" aria-label="Remote desktop screen"></div><div id="viewer-placeholder" class="viewer-placeholder"><div class="monitor-symbol" aria-hidden="true">[↳]</div><h3 id="viewer-placeholder-title">Open your desktop</h3><p id="viewer-placeholder-message">The live view connects when you open this tab.</p><button id="reconnect-viewer" class="button secondary small" hidden>Reconnect</button></div></div><div class="desktop-control-bar"><div class="control-mode"><span id="control-mode-icon" aria-hidden="true">◉</span><div><strong id="control-mode-label">View only</strong><span id="control-mode-description">The agent controls this desktop.</span></div></div><button id="toggle-control" class="button secondary small" disabled>Take control ↗</button></div></section>
+            <div class="desktop-meta"><span id="worker-status">Checking worker</span><span id="worker-last-seen"></span></div><p class="desktop-note">This is your assigned desktop. Other company members run CtrlLoops on their own desktops.</p>
+            <details class="system-details"><summary>Connection details</summary><dl><div><dt>Assigned worker</dt><dd id="worker-detail-id">—</dd></div><div><dt>Instruction model</dt><dd id="model-detail-id">—</dd></div><div><dt>Selection model</dt><dd id="jev-detail-id">—</dd></div><div><dt>Connection</dt><dd>Authenticated noVNC viewer</dd></div></dl></details>
+          </section>
+        </section>
+        <section id="company-view" hidden><div class="loop-page-heading"><div><div class="eyebrow">COMPANY</div><h1>People & access</h1></div></div>          <details id="member-management" class="panel members-panel" hidden>
+            <summary>Company members <span id="member-count"></span></summary>
             <div class="members-content"><p class="members-note">Create a personal account for a teammate. Give them the activation code privately; they choose their own password. Desktop assignment is managed separately.</p>
               <div id="member-list" aria-live="polite"></div>
               <form id="member-form" class="member-form"><div><label for="member-username">Username</label><input id="member-username" name="username" required minlength="2" maxlength="64" autocomplete="off" spellcheck="false"></div><div><label for="member-display-name">Display name</label><input id="member-display-name" name="display_name" required maxlength="100" autocomplete="off"></div><button id="create-member" class="button secondary" type="submit">Add member</button></form>
               <p id="member-error" class="form-error" role="alert" hidden></p>
               <div id="activation-receipt" class="activation-receipt" hidden><strong id="activation-receipt-title">Account created</strong><p>Share this code privately with the named teammate. It is shown only once.</p><label for="member-activation-code">Activation code</label><div class="activation-code-row"><input id="member-activation-code" readonly autocomplete="off" spellcheck="false"><button id="copy-activation" type="button" class="button secondary small">Copy code</button></div><p id="activation-expiry"></p><button id="dismiss-activation" type="button" class="button quiet small">I have saved the code</button></div>
             </div>
-          </details>
-
-          <div class="work-grid">
-            <section class="loop-column" aria-label="Loop instructions and activity">
-              <section class="panel compose-panel" id="compose-panel">
-                <div class="panel-heading"><h2><span class="section-number">01</span> Give it a direction</h2><span class="quiet-label">TYPED CHAT</span></div>
-                <form id="compose-form">
-                  <label class="sr-only" for="prompt">What would you like your desktop to do?</label>
-                  <textarea id="prompt" name="prompt" rows="3" maxlength="2000" required placeholder="What would you like your desktop to do?">Click the search field in the current application</textarea>
-                  <div class="compose-bottom"><span class="compose-hint">Generate an instruction<br>and save it as a loop.</span><button id="create-loop" class="button primary" type="submit"><span>Create loop</span><span aria-hidden="true">↗</span></button></div>
-                </form>
-                <div class="model-line"><span class="spark" aria-hidden="true">✳</span><span id="model-label">Model details loading</span></div>
-              </section>
-
-              <section id="loop-detail" class="panel detail-panel" aria-label="Selected loop">
-                <div class="empty-detail"><div class="empty-symbol" aria-hidden="true">↳</div><h2>Start a shared workflow</h2><p>Saved instructions and run history are shared with your workspace. Each person runs them on their own assigned desktop.</p><div class="empty-flow"><span>Request</span><i>→</i><span>Instruction</span><i>→</i><span>Action</span></div></div>
-              </section>
-            </section>
-
-            <section class="desktop-column" aria-label="Cloud desktop">
-              <section id="desktop-panel" class="panel desktop-panel">
-                <div class="panel-heading desktop-heading"><h2><span class="section-number">02</span> Live desktop</h2><span id="viewer-state" class="viewer-status"><i class="status-dot"></i>Disconnected</span></div>
-                <div class="desktop-toolbar"><div class="desktop-identity"><span class="desktop-icon" aria-hidden="true">▣</span><div><strong id="desktop-owner">Your Omarchy desktop</strong><span id="worker-identity">Waiting for assigned worker</span></div></div><div class="viewer-tools"><button id="fit-view" class="icon-button active" title="Fit desktop to viewer" aria-label="Fit desktop to viewer" aria-pressed="true">Fit</button><button id="fullscreen" class="icon-button" title="Enter fullscreen" aria-label="Enter fullscreen"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button></div></div>
-                <div class="desktop-display">
-                  <div id="desktop-canvas" class="desktop-canvas" aria-label="Remote desktop screen"></div>
-                  <div id="viewer-placeholder" class="viewer-placeholder"><div class="monitor-symbol" aria-hidden="true"><span>↳</span></div><h3 id="viewer-placeholder-title">Connecting to your desktop</h3><p id="viewer-placeholder-message">A live view of the assigned workspace will appear here.</p><button id="reconnect-viewer" class="button secondary small" hidden>Reconnect viewer</button></div>
-                </div>
-                <div class="desktop-control-bar"><div class="control-mode"><span id="control-mode-icon" aria-hidden="true">◉</span><div><strong id="control-mode-label">View only</strong><span id="control-mode-description">The agent controls this desktop.</span></div></div><button id="toggle-control" class="button secondary small" disabled>Take control <span aria-hidden="true">↗</span></button></div>
-              </section>
-              <div class="desktop-meta"><span id="worker-status">Worker status pending</span><span id="worker-last-seen"></span></div>
-              <section class="scope-note"><span aria-hidden="true">↳</span><p>The worker selects visible windows and controls for click or type actions. General task planning, generated typing content, and task completion checks are not implemented yet. Each run reports its observed outcome and provides an evidence ZIP.</p></section>
-              <details class="workspace-details"><summary>Workspace details <span aria-hidden="true">＋</span></summary><dl><div><dt>Assigned worker</dt><dd id="worker-detail-id">—</dd></div><div><dt>Instruction model</dt><dd id="model-detail-id">—</dd></div><div><dt>Selection model</dt><dd id="jev-detail-id">—</dd></div><div><dt>Desktop connection</dt><dd>Authenticated, same-origin gateway</dd></div></dl></details>
-            </section>
-          </div>
-          <footer class="workspace-footer"><span>[CTRL] LOOP</span><span>Intent, made visible.</span></footer>
-        </main>
-      </div>
+          </details></section>
+      </main>
     </div>
-  </body>
+  </div>
+</body>
 </html>

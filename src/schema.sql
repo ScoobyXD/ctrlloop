@@ -57,3 +57,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_worker_per_membership ON workers(workspace
     WHERE disabled_at IS NULL;
 CREATE INDEX IF NOT EXISTS loops_workspace_time ON loops(workspace_id, created_at);
 CREATE INDEX IF NOT EXISTS sessions_user_workspace ON sessions(user_id, workspace_id);
+
+-- Queued execution retains its authorizing session until dispatch or interruption.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS request_session_hash text;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS dispatch_before timestamptz;

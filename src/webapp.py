@@ -73,7 +73,8 @@ async def lifespan(app):
         async with database() as db:
             await db.execute((ROOT / 'src/schema.sql').read_text())
             await migrate_legacy_identity(db)
-            # Deploy while generation is idle; this single-process task cannot resume.
+            # Neither unfinished generation nor undispatched execution is replayed.
+            await interrupt_queued_runs(db, 'Server restarted before dispatch. Start again when ready.')
             await db.execute("UPDATE loops SET status='error',error='Generation interrupted by server restart; create a new loop.' WHERE status='generating'")
         yield
     finally:
@@ -140,7 +141,7 @@ async def assigned_worker(db, identity, *, lock=True, required=True):
     return worker
 
 
-async def worker_authorize(request, db):
+async def worker_authorize(request, db, *, lock=True):
     header = request.headers.get('authorization', '')
     if not header.startswith('Bearer ') or len(header) > 600: raise HTTPException(401, 'Invalid worker credential')
     digest = token_hash(header[7:])
@@ -152,16 +153,17 @@ async def worker_authorize(request, db):
         AND m.revoked_at IS NULL AND u.disabled_at IS NULL FOR SHARE OF m,u''', (digest,))).fetchone()
     if not candidate: raise HTTPException(401, 'Invalid worker credential or inactive assignment')
     worker = await (await db.execute('''SELECT * FROM workers WHERE id=%s AND credential_hash=%s
-        AND workspace_id=%s AND assigned_user_id=%s AND disabled_at IS NULL FOR UPDATE''',
+        AND workspace_id=%s AND assigned_user_id=%s AND disabled_at IS NULL''' + (' FOR UPDATE' if lock else ''),
         (candidate['id'], digest, candidate['workspace_id'], candidate['assigned_user_id']))).fetchone()
     if not worker: raise HTTPException(401, 'Worker assignment changed')
     return worker
 
 
-def public_worker(worker, digest=None):
+def public_worker(worker, digest=None, *, queued_run=None):
     if not worker: return None
     age = (datetime.now(timezone.utc)-worker['last_seen']).total_seconds() if worker['last_seen'] else 1e9
     return {key: worker[key] for key in ('id', 'mode', 'last_seen', 'revision', 'active_run', 'fleet_namespace', 'fleet_claim')} | {
+        'queued_run': queued_run,
         'status': 'online' if age < 30 else 'offline',
         'can_control': worker['mode'] == 'human' and worker['human_session'] == digest}
 
@@ -172,6 +174,51 @@ async def release_expired_control(db, worker_id):
         AND m.workspace_id=s.workspace_id JOIN users u ON u.id=s.user_id
         WHERE s.token_hash=workers.human_session AND s.expires_at>now() AND m.revoked_at IS NULL
         AND u.disabled_at IS NULL AND s.workspace_id=workers.workspace_id AND s.user_id=workers.assigned_user_id)''', (worker_id,))
+
+
+async def interrupt_queued_runs(db, message, *, clause='TRUE', params=()):
+    rows = await (await db.execute("""UPDATE runs SET status='interrupted',finished_at=now(),
+        error=%s,request_session_hash=NULL WHERE status='queued' AND """ + clause +
+        ' RETURNING id,loop_id', (message, *params))).fetchall()
+    for row in rows:
+        await event(db, row['loop_id'], 'interrupted', message, run_id=row['id'])
+
+
+async def release_expired_queue(db, worker_id):
+    await interrupt_queued_runs(db, 'Start expired or sign-in is no longer valid. Start again when ready.',
+        clause="""worker_id=%s AND (dispatch_before IS NULL OR dispatch_before<=now()
+            OR NOT EXISTS (SELECT 1 FROM sessions s JOIN loops l ON l.id=runs.loop_id
+                JOIN workers w ON w.id=runs.worker_id
+                WHERE s.token_hash=runs.request_session_hash AND s.expires_at>now()
+                AND s.user_id=runs.initiated_by AND s.workspace_id=l.workspace_id
+                AND w.assigned_user_id=s.user_id AND w.workspace_id=s.workspace_id AND w.disabled_at IS NULL))""",
+        params=(worker_id,))
+
+
+def public_run(run):
+    return {key: value for key, value in run.items()
+            if key not in ('request_session_hash', 'dispatch_before', 'loop_status', 'loop_workspace_id')}
+
+
+async def queue_run(db, loop, principal):
+    # Both create-and-start and explicit reruns use the same reservation checks.
+    worker = await assigned_worker(db, principal)
+    await release_expired_control(db, worker['id'])
+    await release_expired_queue(db, worker['id'])
+    worker = await assigned_worker(db, principal)
+    if worker['mode'] != 'agent': raise HTTPException(409, 'Return desktop control to the worker first')
+    if not worker['last_seen'] or (datetime.now(timezone.utc)-worker['last_seen']).total_seconds()>30:
+        raise HTTPException(409, 'Worker is offline')
+    active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running')", (worker['id'],))).fetchone()
+    if active or worker['active_run']: raise HTTPException(409, 'The desktop already has an active run')
+    run = await (await db.execute("""INSERT INTO runs(id,loop_id,worker_id,initiated_by,request_session_hash,dispatch_before)
+        VALUES(%s,%s,%s,%s,%s,now()+interval '5 minutes') RETURNING *""",
+        (uuid4(),loop['id'],worker['id'],principal['user_id'],principal['session_hash']))).fetchone()
+    run['initiator'] = {key: principal[key] for key in ('username', 'display_name')} | {'id': principal['user_id']}
+    message = ('Desktop reserved; the instruction will run automatically when ready'
+               if loop['status'] == 'generating' else 'Saved instruction queued for its assigned Omarchy worker')
+    await event(db, loop['id'], 'delivery_queued', message, run_id=run['id'])
+    return public_run(run)
 
 
 def throttle(request, identity=''):
@@ -242,6 +289,7 @@ class WorkerDeployment(BaseModel):
 
 class Prompt(BaseModel):
     prompt: str = Field(min_length=1, max_length=2000)
+    start: bool = False
 
 
 class Mode(BaseModel):
@@ -326,6 +374,8 @@ async def logout(request: Request, response: Response):
     async with database() as db:
         # Logging out remains possible after a membership was revoked.
         await db.execute('DELETE FROM sessions WHERE token_hash=%s', (digest,))
+        await interrupt_queued_runs(db, 'Signed out before dispatch. Start again after signing in.',
+                                    clause='request_session_hash=%s', params=(digest,))
         await db.execute("UPDATE workers SET mode='agent',human_session=NULL WHERE human_session=%s", (digest,))
     response.delete_cookie('ctrl_session')
     return {'authenticated': False}
@@ -337,9 +387,12 @@ async def session(request: Request):
         try: identity = await authorize(request, db)
         except HTTPException: return {'authenticated': False}
         worker = await assigned_worker(db, identity, required=False)
+        queued = None
         if worker:
             await release_expired_control(db, worker['id'])
+            await release_expired_queue(db, worker['id'])
             worker = await assigned_worker(db, identity)
+            queued = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status='queued'", (worker['id'],))).fetchone()
         memberships = await (await db.execute('''SELECT m.workspace_id,w.slug,w.name,m.role FROM memberships m
             JOIN workspaces w ON w.id=m.workspace_id WHERE m.user_id=%s AND m.revoked_at IS NULL
             ORDER BY w.name,w.id''', (identity['user_id'],))).fetchall()
@@ -347,7 +400,7 @@ async def session(request: Request):
                 'user': {'id': identity['user_id'], 'username': identity['username'], 'display_name': identity['display_name']},
                 'workspace': {'id': identity['workspace_id'], 'slug': identity['workspace_slug'],
                               'name': identity['workspace_name'], 'role': identity['role']},
-                'memberships': memberships, 'worker': public_worker(worker, identity['session_hash']),
+                'memberships': memberships, 'worker': public_worker(worker, identity['session_hash'], queued_run=queued['id'] if queued else None),
                 'model': MODEL, 'reasoning_effort': 'high', 'jev_model': 'jev-1.13.0'}
 
 
@@ -358,6 +411,8 @@ async def select_workspace(body: WorkspaceSelection, request: Request):
         membership = await (await db.execute('''SELECT 1 FROM memberships WHERE user_id=%s AND workspace_id=%s
             AND revoked_at IS NULL FOR SHARE''', (identity['user_id'], body.workspace_id))).fetchone()
         if not membership: raise HTTPException(403, 'Active workspace membership required')
+        await interrupt_queued_runs(db, 'Company changed before dispatch. Start again in the selected company.',
+                                    clause='request_session_hash=%s', params=(identity['session_hash'],))
         await db.execute("UPDATE workers SET mode='agent',human_session=NULL WHERE human_session=%s", (identity['session_hash'],))
         await db.execute('UPDATE sessions SET workspace_id=%s WHERE token_hash=%s', (body.workspace_id, identity['session_hash']))
     return {'workspace_id': body.workspace_id}
@@ -401,6 +456,9 @@ async def update_membership(user_id: UUID, body: MembershipUpdate, request: Requ
                          (identity['workspace_id'], user_id))
         if not body.active:
             await db.execute('DELETE FROM sessions WHERE workspace_id=%s AND user_id=%s', (identity['workspace_id'], user_id))
+            await interrupt_queued_runs(db, 'Membership revoked before dispatch. No actions were sent.',
+                clause='initiated_by=%s AND loop_id IN (SELECT id FROM loops WHERE workspace_id=%s)',
+                params=(user_id, identity['workspace_id']))
             await db.execute("UPDATE workers SET mode=CASE WHEN mode='human' THEN 'agent' ELSE mode END,human_session=NULL WHERE workspace_id=%s AND assigned_user_id=%s",
                              (identity['workspace_id'], user_id))
     return {'user_id': user_id, 'active': body.active}
@@ -415,6 +473,7 @@ async def change_mode(body: Mode, request: Request):
         digest = identity['session_hash']
         worker = await assigned_worker(db, identity)
         await release_expired_control(db, worker['id'])
+        await release_expired_queue(db, worker['id'])
         worker = await assigned_worker(db, identity)
         if worker['mode'] == 'maintenance': raise HTTPException(409, 'Desktop deployment is in progress')
         active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running')", (worker['id'],))).fetchone()
@@ -447,6 +506,7 @@ async def create_loop(body: Prompt, request: Request):
         row['creator'] = {key: principal[key] for key in ('username', 'display_name')} | {'id': principal['user_id']}
         await event(db, identity, 'user_request', prompt)
         await event(db, identity, 'llm_generation', 'Generating an instruction with gpt-6-luna · high reasoning')
+        row['runs'] = [await queue_run(db, row, principal)] if body.start else []
     task = asyncio.create_task(generate_instruction(identity, prompt)); generation_tasks.add(task); task.add_done_callback(generation_tasks.discard)
     return row
 
@@ -491,6 +551,8 @@ async def generate_instruction(identity, prompt):
             await event(db,identity,'db_saved','Generated instruction committed to PostgreSQL')
     except asyncio.CancelledError:
         async with database() as db:
+            await interrupt_queued_runs(db, 'Generation interrupted before dispatch. No actions were sent.',
+                                        clause='loop_id=%s', params=(identity,))
             await db.execute("UPDATE loops SET status='error',error='Generation interrupted; inspect available request evidence.' WHERE id=%s", (identity,))
             await event(db, identity, 'error', 'Generation interrupted; response capture may be unavailable',
                         data={'error_type': 'CancelledError', 'duration_ms': round((time.monotonic()-started)*1000, 3)})
@@ -498,6 +560,8 @@ async def generate_instruction(identity, prompt):
     except Exception as error:
         message = f'LLM generation failed ({type(error).__name__}); no instruction was fabricated.'
         async with database() as db:
+            await interrupt_queued_runs(db, 'Generation failed before dispatch. No actions were sent.',
+                                        clause='loop_id=%s', params=(identity,))
             await db.execute("UPDATE loops SET status='error',error=%s WHERE id=%s", (message,identity))
             await event(db,identity,'error',message,data={'error_type':type(error).__name__, 'duration_ms':round((time.monotonic()-started)*1000, 3)})
 
@@ -513,6 +577,7 @@ async def loop_detail(identity: UUID, request: Request):
         row['runs'] = await (await db.execute('''SELECT r.*,jsonb_build_object('id',u.id,'username',u.username,'display_name',u.display_name) AS initiator
             FROM runs r LEFT JOIN users u ON u.id=r.initiated_by JOIN workers w ON w.id=r.worker_id
             WHERE r.loop_id=%s AND w.workspace_id=%s ORDER BY r.created_at DESC''', (identity,principal['workspace_id']))).fetchall()
+        row['runs'] = [public_run(run) for run in row['runs']]
         for run in row['runs']:
             run['events'] = await (await db.execute('SELECT * FROM events WHERE run_id=%s ORDER BY created_at',(run['id'],))).fetchall()
         return row
@@ -522,33 +587,53 @@ async def loop_detail(identity: UUID, request: Request):
 async def create_run(identity: UUID, request: Request):
     async with database() as db:
         principal = await authorize(request, db)
-        worker = await assigned_worker(db, principal)
-        if worker['mode'] != 'agent': raise HTTPException(409,'Return desktop control to the worker first')
-        if not worker['last_seen'] or (datetime.now(timezone.utc)-worker['last_seen']).total_seconds()>30: raise HTTPException(409,'Worker is offline')
-        active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running')",(worker['id'],))).fetchone()
-        if active: raise HTTPException(409,'The desktop already has an active run')
-        loop = await (await db.execute('SELECT * FROM loops WHERE id=%s AND workspace_id=%s',(identity,principal['workspace_id']))).fetchone()
-        if not loop or loop['status'] != 'ready': raise HTTPException(409,'A saved instruction is required')
-        run = await (await db.execute('INSERT INTO runs(id,loop_id,worker_id,initiated_by) VALUES(%s,%s,%s,%s) RETURNING *',
-            (uuid4(),identity,worker['id'],principal['user_id']))).fetchone()
-        run['initiator'] = {key: principal[key] for key in ('username', 'display_name')} | {'id': principal['user_id']}
-        await event(db,identity,'delivery_queued','Saved instruction queued for its assigned Omarchy worker',run_id=run['id'])
-        return run
+        loop = await (await db.execute('SELECT * FROM loops WHERE id=%s AND workspace_id=%s', (identity,principal['workspace_id']))).fetchone()
+        if not loop or loop['status'] != 'ready': raise HTTPException(409, 'A saved instruction is required')
+        return await queue_run(db, loop, principal)
 
 
 @app.post('/api/worker/poll')
 async def worker_poll(body: WorkerPoll, request: Request):
     async with database() as db:
+        # Hold membership, then the requesting session, then worker/run locks.
+        # Logout/revocation cannot commit between authorization and dispatch.
+        worker = await worker_authorize(request, db, lock=False)
+        pending = await (await db.execute("""SELECT r.*,l.instruction,l.status AS loop_status,
+            l.workspace_id AS loop_workspace_id FROM runs r JOIN loops l ON l.id=r.loop_id
+            WHERE r.worker_id=%s AND r.status='queued'""", (worker['id'],))).fetchone()
+        valid_session = None
+        if pending and pending['initiated_by'] == worker['assigned_user_id'] and pending['loop_workspace_id'] == worker['workspace_id']:
+            valid_session = await (await db.execute("""SELECT token_hash FROM sessions WHERE token_hash=%s
+                AND user_id=%s AND workspace_id=%s AND expires_at>now() FOR SHARE""",
+                (pending['request_session_hash'],worker['assigned_user_id'],worker['workspace_id']))).fetchone()
         worker = await worker_authorize(request, db)
         await release_expired_control(db, worker['id'])
-        worker = await (await db.execute('UPDATE workers SET last_seen=now(),revision=%s WHERE id=%s RETURNING *',(body.revision,worker['id']))).fetchone()
-        if worker['active_run'] or worker['mode'] != 'agent': return {'run':None}
-        run = await (await db.execute("SELECT r.*,l.instruction FROM runs r JOIN loops l ON l.id=r.loop_id WHERE r.worker_id=%s AND r.initiated_by=%s AND l.workspace_id=%s AND r.status='queued' ORDER BY r.created_at LIMIT 1 FOR UPDATE OF r",(worker['id'],worker['assigned_user_id'],worker['workspace_id']))).fetchone()
-        if not run: return {'run':None}
-        await db.execute("UPDATE runs SET status='running',started_at=now(),revision=%s WHERE id=%s",(body.revision,run['id']))
-        await db.execute('UPDATE workers SET active_run=%s WHERE id=%s',(run['id'],worker['id']))
-        await event(db,run['loop_id'],'delivery_sent','Persisted instruction dispatched to the assigned worker',run_id=run['id'],data={'revision':body.revision,'worker':worker['id']})
-        return {'run':run}
+        worker = await (await db.execute('UPDATE workers SET last_seen=now(),revision=%s WHERE id=%s RETURNING *', (body.revision,worker['id']))).fetchone()
+        if not pending: return {'run': None}
+        # A different/new reservation waits for the next poll; it was not authorized above.
+        run = await (await db.execute("""SELECT r.*,l.instruction,l.status AS loop_status,
+            l.workspace_id AS loop_workspace_id FROM runs r JOIN loops l ON l.id=r.loop_id
+            WHERE r.id=%s AND r.worker_id=%s AND r.status='queued' FOR UPDATE OF r""",
+            (pending['id'],worker['id']))).fetchone()
+        if not run: return {'run': None}
+        authorized = (valid_session and run['request_session_hash'] == valid_session['token_hash']
+                      and run['initiated_by'] == worker['assigned_user_id']
+                      and run['loop_workspace_id'] == worker['workspace_id'])
+        if not authorized or not run['dispatch_before'] or run['dispatch_before'] <= datetime.now(timezone.utc):
+            await interrupt_queued_runs(db, 'Start expired or sign-in is no longer valid. Start again when ready.',
+                                        clause='id=%s', params=(run['id'],))
+            return {'run': None}
+        if run['loop_status'] == 'error':
+            await interrupt_queued_runs(db, 'Generation failed before dispatch. No actions were sent.',
+                                        clause='id=%s', params=(run['id'],))
+            return {'run': None}
+        if worker['active_run'] or worker['mode'] != 'agent' or run['loop_status'] != 'ready' or not run['instruction']:
+            return {'run': None}
+        await db.execute("UPDATE runs SET status='running',started_at=now(),revision=%s,request_session_hash=NULL WHERE id=%s", (body.revision,run['id']))
+        await db.execute('UPDATE workers SET active_run=%s WHERE id=%s', (run['id'],worker['id']))
+        await event(db, run['loop_id'], 'delivery_sent', 'Persisted instruction dispatched to the assigned worker',
+                    run_id=run['id'], data={'revision': body.revision, 'worker': worker['id']})
+        return {'run': public_run(run)}
 
 
 @app.post('/api/worker/heartbeat')
@@ -566,6 +651,7 @@ async def worker_deployment(body: WorkerDeployment, request: Request):
         worker = await worker_authorize(request, db)
         if body.expected_worker_id != worker['id'] or body.environment != os.environ['APP_ENV']:
             raise HTTPException(409, 'Deployment worker or environment does not match the credential')
+        await release_expired_queue(db, worker['id'])
         active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running')", (worker['id'],))).fetchone()
         if active or worker['active_run'] or worker['mode'] == 'human':
             raise HTTPException(409, 'Desktop must be idle under agent control before deployment')
@@ -581,6 +667,8 @@ async def worker_recover(request: Request):
     """Called once after the worker acquires its guest-wide process lock."""
     async with database() as db:
         worker = await worker_authorize(request, db)
+        await interrupt_queued_runs(db, 'Worker restarted before dispatch. Start again when ready.',
+                                    clause='worker_id=%s', params=(worker['id'],))
         rows=await (await db.execute("""UPDATE runs r SET status='interrupted',finished_at=now(),
             error='Worker restarted or delivery was interrupted. Actions were not replayed.' FROM loops l
             WHERE r.loop_id=l.id AND r.worker_id=%s AND r.initiated_by=%s AND l.workspace_id=%s
@@ -715,6 +803,7 @@ async def report_record(identity, request, *, loop_only=False):
                 (identity,principal['workspace_id'],principal['workspace_id']))).fetchone()
             if not run: raise HTTPException(404, 'Run not found')
             loop_id = run['loop_id']
+            run = public_run(run)
         loop = await (await db.execute('''SELECT l.*,jsonb_build_object('id',u.id,'username',u.username,'display_name',u.display_name) AS creator
             FROM loops l LEFT JOIN users u ON u.id=l.created_by WHERE l.id=%s AND l.workspace_id=%s''',
             (loop_id,principal['workspace_id']))).fetchone()
