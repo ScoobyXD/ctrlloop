@@ -129,6 +129,160 @@ export function stepAccounting(report, run = null, stepId = null) {
   return accounting(record, rounds, jevCalls(record, rounds), stepId);
 }
 
+function timingStage(span) {
+  const stages = {
+    window_discovery: ["CUA/UIA get windows", "#789cbe", 2, "Windows"],
+    window_selection: ["Window selection outside captured rounds", "#747aaa", 1, "Window other"],
+    foreground_activation: ["CUA focus", "#d5b28c", 2, "Focus"],
+    control_acquisition: ["CUA/UIA get controls", "#a7b4bf", 2, "Controls"],
+    control_selection: ["Control selection outside captured rounds", "#786b82", 1, "Control other"],
+    action_dispatch: ["CUA action", "#ff620f", 2, "Action"],
+    native_action: ["CUA action", "#ff620f", 3, "Action"],
+    read_text: ["Read observed text", "#70ad98", 2, "Read text"],
+    settling_wait: ["Settling wait", "#d2a450", 2, "Wait"],
+  };
+  if (span.operation === "selection.round") {
+    return { name: `Jev ${span.stage === "windows" ? "window" : "control"} round ${span.round}`, label: `${span.stage === "windows" ? "Window" : "Control"} R${span.round}`, color: span.stage === "windows" ? "#8f94d7" : ["#ac86c3", "#d197b7", "#8984cf", "#c18fc6"][(Math.max(1, span.round) - 1) % 4], rank: 4, jev: true };
+  }
+  const value = stages[span.operation];
+  return value ? { name: value[0], color: value[1], rank: value[2], label: value[3], jev: false } : null;
+}
+
+function timingPieces(record) {
+  const spans = record.events.filter(event => event.event === "timing_finished" && finite(event.started_elapsed_ms) && finite(event.finished_elapsed_ms));
+  const stepSpan = spans.find(event => event.operation === "workbench.step");
+  const stepStart = record.events.find(event => event.event === "step_started");
+  const stepFinish = record.events.find(event => event.event === "step_finished");
+  const start = stepSpan?.started_elapsed_ms ?? stepStart?.elapsed_ms;
+  const end = stepSpan?.finished_elapsed_ms ?? stepFinish?.elapsed_ms;
+  if (!finite(start) || !finite(end) || end <= start) return null;
+  const stages = spans.map(span => ({ span, category: timingStage(span) })).filter(item => item.category);
+  // The round spans sit inside selection spans, and native actions sit inside
+  // dispatch spans. Partition their boundaries so every millisecond appears once.
+  const points = [...new Set([start, end, ...stages.flatMap(({ span }) => [span.started_elapsed_ms, span.finished_elapsed_ms])].filter(point => point >= start && point <= end))].sort((a, b) => a - b);
+  const pieces = [];
+  for (let index = 1; index < points.length; index++) {
+    const left = points[index - 1], right = points[index];
+    if (right <= left) continue;
+    const chosen = stages.filter(({ span }) => span.started_elapsed_ms <= left && span.finished_elapsed_ms >= right).sort((a, b) => b.category.rank - a.category.rank)[0];
+    const category = chosen?.category ?? { name: "Overhead / unaccounted time", label: "Overhead", color: "#62605c", jev: false };
+    const key = category.jev ? `round:${chosen.span.span_id}` : `${category.name}:${chosen?.span.iteration ?? ""}`;
+    const previous = pieces.at(-1);
+    if (previous?.key === key) previous.end = right;
+    else pieces.push({ ...category, key, start: left, end: right, span: chosen?.span });
+  }
+  return { start, end, duration: end - start, pieces };
+}
+
+function timingUsage(piece, calls, rounds, events, totals) {
+  if (piece.total) return { tokens: totals.tokensLabel, dollars: totals.costLabel, note: "Aggregate step usage; individual process timing was not captured." };
+  if (!piece.jev) {
+    const selection = ["window_selection", "control_selection"].includes(piece.span?.operation);
+    const direct = piece.span && !selection;
+    const stage = piece.span?.stage ?? (piece.span?.operation === "window_selection" ? "windows" : "controls");
+    const relevant = selection ? calls.filter(call => call.stage === stage && call.iteration === piece.span.iteration) : calls;
+    const roundSpans = events.filter(event => event.event === "timing_finished" && event.operation === "selection.round" && finite(event.started_elapsed_ms) && finite(event.finished_elapsed_ms));
+    const accounted = !totals.partial && totals.callCount === calls.length && !events.some(event => event.event === "capture_gap") && relevant.every(call => roundSpans.some(span => span.stage === call.stage && span.iteration === call.iteration && span.round === call.round));
+    return direct || accounted
+      ? { tokens: "0", dollars: "$0.00000000", note: "No Jev input tokens for this process." }
+      : { tokens: "Unavailable", dollars: "Unavailable", note: "Missing round timing or usage prevents allocating Jev cost to this interval." };
+  }
+  const span = piece.span;
+  const matches = calls.filter(call => call.stage === span.stage && call.iteration === span.iteration && call.round === span.round);
+  const round = rounds.find(entry => entry.stage === span.stage && entry.iteration === span.iteration && entry.round.round === span.round)?.round;
+  const known = matches.filter(call => finite(call.tokens));
+  const total = known.reduce((sum, call) => sum + call.tokens, 0);
+  const gap = events.some(event => event.event === "capture_gap");
+  const complete = known.length > 0 && known.length === matches.length && !gap;
+  const suffix = complete ? "" : " + unavailable";
+  const reductions = round && finite(round.candidate_count) && finite(round.winner_count)
+    ? `${count(round.candidate_count)} → ${count(round.winner_count)} candidates${finite(round.group_count) ? ` · ${count(round.group_count)} groups` : ""}` : "";
+  return {
+    tokens: known.length ? `${count(total)}${suffix}` : "Unavailable",
+    dollars: known.length ? `${usd(cost(total))}${suffix}` : "Unavailable",
+    note: [`${matches.length || "Unavailable"} captured API calls`, reductions].filter(Boolean).join(" · "),
+  };
+}
+
+/** A compact, initially expanded timing disclosure for an executed step. */
+export function renderStepTiming({ step, stepIndex = 0, run = null, report = null, loading = false, error = "" } = {}) {
+  if (!step) return "";
+  const record = scope(report, run, step.id);
+  if (!record.result && !record.events.some(event => event.event === "step_started" || event.operation === "workbench.step")) return "";
+  const rounds = selectionRounds(record), calls = jevCalls(record, rounds);
+  const totals = accounting(record, rounds, calls, step.id);
+  const capturedChart = timingPieces(record);
+  const chart = capturedChart ?? (finite(totals.durationMs) ? {
+    duration: totals.durationMs,
+    pieces: [{ key: "step-total", name: "Step total · breakdown unavailable", label: "Step total", color: "#62605c", total: true, start: 0, end: totals.durationMs }],
+  } : null);
+  const key = `${record.run?.id ?? "run"}:${step.id}`;
+  const timingId = `wb-timing-${record.run?.id ?? "run"}-${step.id}`.replace(/[^a-zA-Z0-9_-]/g, "-");
+  const infoId = `${timingId}-info`;
+  const startedAt = record.result?.started_at ?? record.run?.created_at;
+  const timestamp = startedAt && !Number.isNaN(new Date(startedAt).getTime())
+    ? `<p class="wb-timing-note wb-timing-timestamp">Ran <time datetime="${esc(startedAt)}" title="${esc(date(startedAt))}">${esc(new Date(startedAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" }))}</time></p>` : "";
+  const stepLabel = `Step ${stepIndex + 1} · ${human(step.action?.tool)}${step.action?.target ? ` ${step.action.target}` : ""}`;
+  const describe = piece => {
+    const usage = timingUsage(piece, calls, rounds, record.events, totals);
+    return `${stepLabel}\n${piece.name}${piece.span?.iteration != null ? ` · loop ${piece.span.iteration}` : ""}\nDuration: ${ms(piece.end - piece.start)}\nJev input tokens: ${usage.tokens}\nInput cost: ${usage.dollars}\n${usage.note}`;
+  };
+  const details = piece => `data-timing-info="${esc(describe(piece))}" aria-describedby="${esc(infoId)}" aria-label="${esc(describe(piece).replaceAll("\n", ". "))}"`;
+  const legend = new Map();
+  for (const piece of chart?.pieces ?? []) {
+    const existing = legend.get(piece.key);
+    if (existing) existing.end += piece.end - piece.start;
+    else legend.set(piece.key, { ...piece, start: 0, end: piece.end - piece.start });
+  }
+  return `<details class="wb-step-timing" data-timing-key="${esc(key)}" open>
+    <summary class="wb-timing-summary" id="${esc(timingId)}-summary">Timing · ${esc(chart ? ms(chart.duration) : totals.durationLabel)}</summary>
+    <div class="wb-timing-chart">
+      ${timestamp}
+      ${chart ? `<div class="wb-timing-track" role="group" aria-label="${esc(stepLabel)} process durations">
+        ${chart.pieces.map((piece, index) => `<button type="button" class="wb-timing-segment" id="${esc(timingId)}-segment-${index}" style="width:${piece.total ? 100 : (piece.end - piece.start) / chart.duration * 100}%;--segment-color:${piece.color}" ${details(piece)}></button>`).join("")}
+      </div><div class="wb-timing-scale"><span>0 ms</span><span>${esc(ms(chart.duration))}</span></div>
+      <div class="wb-timing-legend">${[...legend.values()].map((piece, index) => `<button type="button" id="${esc(timingId)}-legend-${index}" ${details(piece)}><i class="wb-timing-key" style="--segment-color:${piece.color}" aria-hidden="true"></i><span>${esc(piece.label)} · ${esc(ms(piece.end))}</span></button>`).join("")}</div>
+      <div class="wb-timing-info" id="${esc(infoId)}" role="status" hidden></div>` : !loading && !error ? '<p class="wb-timing-note">Process timing details are unavailable in this captured run.</p>' : ""}
+      ${chart && !capturedChart && !loading ? '<p class="wb-timing-note">Step total shown; process breakdown unavailable.</p>' : ""}
+      ${loading ? `<p class="wb-timing-note" role="status">${capturedChart ? "Refreshing captured timings…" : "Loading process timings…"}</p>` : ""}
+      ${error ? `<p class="wb-timing-note wb-timing-error" role="status">${esc(error)}</p><button type="button" class="button quiet small" id="${esc(timingId)}-retry" data-wb="retry-evidence" data-run-id="${esc(record.run?.id)}">Retry evidence</button>` : ""}
+      <p class="wb-timing-note">${esc(totals.callsLabel)} Jev calls · ${esc(totals.tokensLabel)} input tokens · ${esc(totals.costLabel)}</p>
+      ${chart ? '<p class="wb-timing-note">Hover or focus a segment or label. Input cost: $0.042 per million tokens; output is free.</p>' : ""}
+    </div>
+  </details>`;
+}
+
+const timingContainers = new WeakSet();
+
+/** Keep hover and keyboard details within the step's own column. */
+export function bindStepTimings(container) {
+  if (!container || timingContainers.has(container)) return;
+  timingContainers.add(container);
+  const segment = target => target?.closest?.("[data-timing-info]");
+  const show = target => {
+    const button = segment(target);
+    if (!button || !container.contains(button)) return;
+    const info = button.closest(".wb-step-timing")?.querySelector(".wb-timing-info");
+    if (info) { info.textContent = button.dataset.timingInfo; info.hidden = false; }
+  };
+  const hide = event => {
+    const button = segment(event.target);
+    if (!button) return;
+    const disclosure = button.closest(".wb-step-timing");
+    const next = segment(event.relatedTarget);
+    if (next && disclosure?.contains(next)) { show(next); return; }
+    const focused = segment(document.activeElement);
+    if (event.type === "pointerout" && focused && disclosure?.contains(focused)) { show(focused); return; }
+    const info = disclosure?.querySelector(".wb-timing-info");
+    if (info) info.hidden = true;
+  };
+  container.addEventListener("pointerover", event => show(event.target));
+  container.addEventListener("focusin", event => show(event.target));
+  container.addEventListener("click", event => show(event.target));
+  container.addEventListener("pointerout", hide);
+  container.addEventListener("focusout", hide);
+}
+
 function questions(call) {
   const inputs = call.request?.body?.questions ?? call.saved?.questions ?? {};
   const answers = call.response?.body?.answers ?? call.saved?.answers ?? {};

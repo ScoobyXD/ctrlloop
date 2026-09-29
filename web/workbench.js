@@ -1,4 +1,4 @@
-import { renderStepInspector, bindStepInspector, stepAccounting } from './workbench-inspector.js';
+import { renderStepInspector, bindStepInspector, stepAccounting, renderStepTiming, bindStepTimings } from './workbench-inspector.js';
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const active = run => ['queued', 'running', 'paused'].includes(run?.status);
@@ -10,16 +10,29 @@ const duration = ms => Number.isFinite(ms) ? `${Math.round(ms).toLocaleString()}
 // The editor owns drafts only. The existing run API owns execution and its cursor.
 export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefresh}) {
   let detail = null, draft = null, selected = null, busy = false, dirty = false, inspector = false;
-  let error = '', report = null, reportError = '', reportLoading = false, reportKey = '', requestId = null;
+  let error = '', requestId = null;
   let displayedRun = null, signature = '', epoch = 0, startStep = null, record = null, saveTimer = null;
   const drafts = new Map();
+  const reports = new Map();
+  const timingDisclosure = new Map();
 
-  function latestRun() {
+  function personalRuns() {
     const value = session();
     return (detail?.runs || []).filter(run => run.worker_id === value?.worker?.id && run.initiated_by === value?.target_user_id)
-      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0] || null;
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
   }
+  function latestRun() { return personalRuns()[0] || null; }
   function currentRun() { return (detail?.runs || []).find(run => run.id === displayedRun) || latestRun(); }
+  function resultFor(run, id) { return run?.step_results?.find(result => result.step_id === id) || run?.result?.steps?.find(result => result.step_id === id); }
+  function runForStep(step) {
+    if (historical()) return currentRun();
+    // Single-step runs must not erase evidence for the other executed rows.
+    return personalRuns().find(run => {
+      const index = run.steps?.findIndex(item => item.id === step.id) ?? -1;
+      return resultFor(run, step.id) || index >= 0 && (run.step_in_flight === index || active(run) && index >= (run.start_step ?? 0) && index < (run.end_step ?? run.steps.length));
+    }) || currentRun();
+  }
+  function reportState(run) { return reports.get(run?.id) || {}; }
   function historical() { return Boolean(displayedRun); }
   function shownSteps() { return historical() ? currentRun()?.steps || [] : draft?.steps || []; }
   function selectedStep() { return shownSteps().find(step => step.id === selected); }
@@ -50,15 +63,15 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     saveTimer = setTimeout(() => { saveTimer = null; void autosave(); }, 600);
   }
   function changed() { dirty = true; requestId = null; record.error = ''; stash(); scheduleSave(); }
-  function deactivate() { clearTimeout(saveTimer); saveTimer = null; stash(); epoch++; busy = false; reportLoading = false; reportKey = ''; signature = ''; }
-  function reset() { deactivate(); drafts.clear(); record = null; draft = null; detail = null; report = null; reportKey = ''; reportError = ''; reportLoading = false; signature = ''; requestId = null; busy = false; inspector = false; displayedRun = null; host.replaceChildren(); }
+  function deactivate() { clearTimeout(saveTimer); saveTimer = null; stash(); epoch++; busy = false; reports.clear(); signature = ''; }
+  function reset() { deactivate(); drafts.clear(); timingDisclosure.clear(); record = null; draft = null; detail = null; signature = ''; requestId = null; busy = false; inspector = false; displayedRun = null; host.replaceChildren(); }
   function open(next = null) {
     const key = next?.id || 'new';
     if (draft && (detail?.id || 'new') === key) {
-      if (host.hidden) { epoch++; busy = false; reportLoading = false; reportKey = ''; }
+      if (host.hidden) { epoch++; busy = false; reports.clear(); }
       detail = next; render(); scheduleSave(); return;
     }
-    clearTimeout(saveTimer); saveTimer = null; stash(); epoch++; detail = next; displayedRun = null; inspector = false; report = null; reportKey = ''; reportError = ''; reportLoading = false; error = ''; requestId = null; busy = false;
+    clearTimeout(saveTimer); saveTimer = null; stash(); epoch++; detail = next; displayedRun = null; inspector = false; reports.clear(); timingDisclosure.clear(); error = ''; requestId = null; busy = false;
     const storageKey = storageScope() + key;
     let saved = drafts.get(key);
     if (!saved) {
@@ -102,39 +115,44 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     if (!draft) return;
     const run = currentRun(), live = latestRun(), locked = !editable(), worker = session()?.worker, history = historical(), steps = shownSteps();
     const workerState = worker ? [worker.id,worker.mode,worker.status,worker.active_run,worker.queued_run] : null;
-    const stateKey = JSON.stringify([draft,selected,startStep,displayedRun,dirty,busy,Boolean(record?.saving),record?.error,locked,inspector,detail?.runs,workerState,error,reportKey,reportLoading,reportError]);
+    const stateKey = JSON.stringify([draft,selected,startStep,displayedRun,dirty,busy,Boolean(record?.saving),record?.error,locked,inspector,detail?.runs,workerState,error,[...reports].map(([id,value]) => [id,value.key,value.loading,value.error])]);
     if (!force && signature === stateKey) return;
     signature = stateKey;
     const focused = host.contains(document.activeElement) ? document.activeElement : null;
     const focusId = focused?.id, selection = focused && 'selectionStart' in focused ? [focused.selectionStart, focused.selectionEnd] : null;
     const openDetails = new Set([...host.querySelectorAll('details[open]')].map(el => el.dataset.disclosure || el.id).filter(Boolean));
+    for (const element of host.querySelectorAll('[data-timing-key]')) timingDisclosure.set(element.dataset.timingKey, element.open);
+    const previousScroll = host.querySelector('.wb-steps')?.scrollTop ?? 0;
+    const previousRunning = host.querySelector('.wb-steps [aria-busy="true"]')?.dataset.stepId;
     const step = selectedStep();
+    const inspectedRun = step ? runForStep(step) : run;
+    const inspection = reportState(inspectedRun);
     const current = live?.step_in_flight ?? live?.next_step ?? 0;
     const awaiting = active(live), paused = live?.status === 'paused';
     const runnable = !busy && !history && worker?.mode === 'agent' && worker?.status === 'online' && (!worker?.active_run || worker.active_run === live?.id) && (!worker?.queued_run || worker.queued_run === live?.id);
     const canStart = runnable && !awaiting && (!dirty || !locked) && draft.steps.length > 0;
     const canResume = runnable && paused;
     const startIndex = Math.max(0, draft.steps.findIndex(item => item.id === startStep));
-    const resultFor = id => run?.step_results?.find(result => result.step_id === id);
     const edited = item => {
-      const recorded = run?.steps?.find(saved => saved.id === item.id);
+      const recorded = runForStep(item)?.steps?.find(saved => saved.id === item.id);
       return Boolean(recorded && JSON.stringify(recorded.action) !== JSON.stringify(item.action));
     };
     const stepStatus = item => {
       if (edited(item)) return 'edited';
-      const index = run?.steps?.findIndex(saved => saved.id === item.id) ?? -1;
-      return resultFor(item.id)?.status || (run?.steps?.[run.step_in_flight]?.id === item.id ? active(run) ? 'running' : 'interrupted' : index >= 0 && (index < (run.start_step ?? 0) || index >= (run.end_step ?? run.steps.length)) ? 'not run' : 'pending');
+      const source = runForStep(item);
+      const index = source?.steps?.findIndex(saved => saved.id === item.id) ?? -1;
+      if (!resultFor(source,item.id) && source?.status === 'running' && source.control === 'run' && index >= (source.start_step ?? 0) && index < (source.end_step ?? source.steps.length) && index === (source.step_in_flight ?? source.next_step)) return 'running';
+      return resultFor(source,item.id)?.status || (source?.steps?.[source.step_in_flight]?.id === item.id ? source.status === 'running' ? 'running' : active(source) ? source.status : 'interrupted' : index >= 0 && (index < (source.start_step ?? 0) || index >= (source.end_step ?? source.steps.length)) ? 'not run' : 'pending');
     };
     const statusLabel = item => {
       if (edited(item)) return 'edited';
-      const outcome = resultFor(item.id);
+      const source = runForStep(item), outcome = resultFor(source,item.id);
       if (outcome?.status !== 'succeeded') return stepStatus(item) === 'interrupted' ? 'delivery unknown' : stepStatus(item);
-      if ((run?.steps?.find(saved => saved.id === item.id) || item).action.tool === 'read') return 'read';
-      return outcome.result?.pipeline?.action_result?.effect === 'confirmed' ? 'sent' : 'sent · unverified';
+      return 'Complete';
     };
     const finishing = awaiting && live?.step_in_flight == null && live?.next_step >= (live?.end_step ?? live?.steps?.length);
     const runReason = history ? 'Recorded snapshot · choose Current draft in Recorded runs to edit.' : !worker ? 'Assign a desktop before executing.' : worker.mode !== 'agent' ? 'Return desktop control to the agent to execute.' : worker.status !== 'online' ? 'Waiting for your desktop to reconnect.' : finishing ? 'Finishing run and saving evidence…' : live?.control === 'stop' && awaiting ? 'Stopping at the next step boundary…' : paused ? `Paused before step ${current + 1}. Continue, or stop to edit and choose a new starting point.` : live?.control === 'pause' && awaiting ? 'Pausing after the current step…' : live?.status === 'queued' ? 'Queued; waiting for the assigned worker.' : awaiting ? `Executing step ${current + 1} of ${live.steps.length}.` : `Start at step ${startIndex + 1} · uses the desktop as it is now.`;
-    const ownReport = report?.run?.id === run?.id ? report : null;
+    const ownReport = reportState(run).data || null;
     const totals = run ? stepAccounting(ownReport,run) : null;
     const completed = run?.step_results || [];
     const finishedDuration = run?.started_at && run?.finished_at ? Date.parse(run.finished_at) - Date.parse(run.started_at) : null;
@@ -146,14 +164,22 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
       <div class="wb-header-tools">${run && step ? `<button class="button quiet small" data-wb="inspect" aria-expanded="${inspector}" aria-controls="wb-inspector">${inspector ? '▾' : '▸'} Inspect selected step</button>` : ''}
       ${(detail?.runs?.length || 0) ? `<details class="wb-history" data-disclosure="history"><summary>Recorded runs (${detail.runs.length})</summary><div class="wb-history-menu"><label for="wb-run-select">Inspect saved steps</label><select id="wb-run-select"><option value="" ${!displayedRun ? 'selected' : ''}>Current draft</option>${[...detail.runs].sort((a,b) => String(b.created_at).localeCompare(String(a.created_at))).map((item,index) => `<option value="${esc(item.id)}" ${displayedRun === item.id ? 'selected' : ''}>${index === 0 ? 'Most recent · ' : ''}${esc(new Date(item.created_at).toLocaleString())} · ${esc(item.status)}</option>`).join('')}</select></div></details>` : ''}</div>
       ${run ? `<div class="wb-run-meta"><span>${esc(run.status)} · ${completed.filter(item => item.status === 'succeeded').length}/${(run.end_step ?? run.steps?.length ?? steps.length) - (run.start_step ?? 0)} steps</span><span>${esc(runTiming)}</span></div><p class="wb-muted wb-run-accounting">Jev: ${esc(totals.callsLabel)} calls · ${esc(totals.tokensLabel)} input tokens · ${esc(totals.costLabel)}</p>` : ''}</header>
-      <div id="wb-inspector" ${inspector ? '' : 'hidden'}>${inspector && step && run ? renderStepInspector({step: run.steps?.find(s => s.id === step.id) || step,run,report:ownReport,loading:reportLoading,error:reportError,reportURL: scopedURL(`/reports/runs/${encodeURIComponent(run.id)}`),downloadURL: scopedURL(`/api/runs/${encodeURIComponent(run.id)}/download`)}) : ''}${inspector && run && reportError ? '<button class="button quiet small" data-wb="retry-evidence">Retry evidence</button>' : ''}</div>
+      <div id="wb-inspector" ${inspector ? '' : 'hidden'}>${inspector && step && inspectedRun ? renderStepInspector({step: inspectedRun.steps?.find(s => s.id === step.id) || step,run:inspectedRun,report:inspection.data,loading:inspection.loading,error:inspection.error,reportURL: scopedURL(`/reports/runs/${encodeURIComponent(inspectedRun.id)}`),downloadURL: scopedURL(`/api/runs/${encodeURIComponent(inspectedRun.id)}/download`)}) : ''}${inspector && inspection.error ? `<button class="button quiet small" data-wb="retry-evidence" data-run-id="${esc(inspectedRun.id)}">Retry evidence</button>` : ''}</div>
       <label class="sr-only" for="wb-name">Sequence name</label><input id="wb-name" class="wb-name" maxlength="2000" value="${esc(draft.prompt)}" ${locked ? 'disabled' : ''}>
       <div class="wb-controls">${paused ? `<button class="button primary small" data-wb="run" ${canResume ? '' : 'disabled'}>Continue ▷</button><button class="button secondary small" data-wb="step" ${canResume ? '' : 'disabled'}>Next step ↦</button>` : `<button class="button primary small" data-wb="run" ${canStart ? '' : 'disabled'}>Run from this point ▷</button><button class="button secondary small" data-wb="single" ${canStart ? '' : 'disabled'}>Run only this step ↦</button>`}<button class="button quiet small" data-wb="pause" ${awaiting && !paused && !finishing ? '' : 'hidden'} ${!busy && !history && awaiting && !paused && live.control === 'run' ? '' : 'disabled'}>Pause</button><button class="button quiet small" data-wb="stop" ${awaiting && !finishing ? '' : 'hidden'} ${!busy && !history && awaiting && live.control !== 'stop' ? '' : 'disabled'}>Stop</button></div>
       <p class="wb-status" role="status">${esc(busy ? 'Saving command…' : runReason)}</p>
       ${error ? `<p class="inline-error" role="alert">${esc(error)}</p>` : ''}
       ${record?.error ? `<p class="inline-error" role="alert">Couldn’t save to your account. ${esc(record.error)} ${record.local ? 'Your draft is kept on this device.' : 'Keep this page open until you can save.'}</p>` : ''}
       ${run?.error ? `<p class="inline-error" role="status">${esc(run.error)}</p>` : ''}
-      <ol class="wb-steps" aria-label="Sequence steps; use the arrow to set the starting point">${steps.map((item,index) => `<li class="${item.id === selected ? 'selected' : ''} ${!history && item.id === startStep ? 'start-step' : ''}">${!history ? `<button class="wb-start" data-start-step="${esc(item.id)}" aria-label="Start at step ${index + 1}" aria-pressed="${item.id === startStep}" title="Start at step ${index + 1}" ${busy || awaiting ? 'disabled' : ''}>${item.id === startStep ? '➜' : '·'}</button>` : ''}<button class="wb-select" data-select-step="${esc(item.id)}" aria-current="${item.id === selected ? 'step' : 'false'}"><span class="wb-step-number">${String(index + 1).padStart(2,'0')}</span><span class="wb-step-label">${esc(summary(item))}</span><span class="wb-step-state ${esc(stepStatus(item))}">${esc(statusLabel(item))}</span></button></li>`).join('')}</ol>
+      <ol class="wb-steps" aria-label="Sequence steps; use the arrow to set the starting point">${steps.map((item,index) => {
+        const source = runForStep(item), evidence = reportState(source), status = stepStatus(item);
+        const recorded = source?.steps?.find(saved => saved.id === item.id) || item;
+        const unverified = resultFor(source,item.id)?.status === 'succeeded' && recorded.action.tool !== 'read' && resultFor(source,item.id)?.result?.pipeline?.action_result?.effect !== 'confirmed';
+        return `<li data-step-id="${esc(item.id)}" aria-busy="${status === 'running'}" class="${item.id === selected ? 'selected' : ''} ${status === 'running' ? 'is-running' : ''} ${!history && item.id === startStep ? 'start-step' : ''}">
+          <div class="wb-step-row">${!history ? `<button class="wb-start" data-start-step="${esc(item.id)}" aria-label="Start at step ${index + 1}" aria-pressed="${item.id === startStep}" title="Start at step ${index + 1}" ${busy || awaiting ? 'disabled' : ''}>${item.id === startStep ? '➜' : '·'}</button>` : ''}<button class="wb-select" data-select-step="${esc(item.id)}" aria-current="${item.id === selected ? 'step' : 'false'}"><span class="wb-step-number">${String(index + 1).padStart(2,'0')}</span><span class="wb-step-label">${esc(summary(item))}</span><span class="wb-step-state ${esc(status)}">${status === 'running' ? '<span class="wb-step-spinner" aria-hidden="true"></span>' : status === 'succeeded' ? '<span aria-hidden="true">✓</span>' : ''}${esc(statusLabel(item))}${unverified && !edited(item) ? '<span class="wb-step-unverified" title="Command completed; the application effect was not verified">effect unverified</span>' : ''}</span></button></div>
+          ${renderStepTiming({step:recorded,stepIndex:index,run:source,report:evidence.data,loading:evidence.loading,error:evidence.error})}
+        </li>`;
+      }).join('')}</ol>
       ${!history && steps.some(edited) ? '<p class="wb-muted wb-empty">Edited steps apply to the next run. Inspection shows the action recorded in this run.</p>' : ''}
       <div class="wb-list-actions"><button class="button quiet small" data-wb="add" ${locked || draft.steps.length >= 100 ? 'disabled' : ''}>＋ Add step</button><button class="button quiet small" data-wb="save" ${locked || !dirty ? 'disabled' : ''}>Save</button></div>
       ${step ? `<div class="wb-editor"><div class="wb-editor-heading"><h3>Step ${steps.indexOf(step) + 1}</h3><div><button class="icon-button" data-wb="up" aria-label="Move step up" ${locked || steps.indexOf(step) === 0 ? 'disabled' : ''}>↑</button><button class="icon-button" data-wb="down" aria-label="Move step down" ${locked || steps.indexOf(step) === steps.length - 1 ? 'disabled' : ''}>↓</button><button class="icon-button" data-wb="remove" aria-label="Remove step" ${locked ? 'disabled' : ''}>×</button></div></div>
@@ -164,18 +190,30 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
       </div>` : '<p class="wb-muted wb-empty">Add a step to begin.</p>'}
     </section>`;
     for (const element of host.querySelectorAll('details')) if ((element.dataset.disclosure || element.id) && openDetails.has(element.dataset.disclosure || element.id)) element.open = true;
+    for (const element of host.querySelectorAll('[data-timing-key]')) if (timingDisclosure.has(element.dataset.timingKey)) element.open = timingDisclosure.get(element.dataset.timingKey);
+    const list = host.querySelector('.wb-steps');
+    list.scrollTop = previousScroll;
+    const runningRow = list.querySelector('[aria-busy="true"]');
+    if (runningRow && runningRow.dataset.stepId !== previousRunning) {
+      const rowBounds = runningRow.getBoundingClientRect(), listBounds = list.getBoundingClientRect();
+      if (rowBounds.top < listBounds.top || rowBounds.top + 48 > listBounds.bottom) list.scrollTop += rowBounds.top - listBounds.top;
+    }
     bindStepInspector(host.querySelector('#wb-inspector'));
-    if (focusId) { const replacement = host.querySelector(`#${focusId}`); replacement?.focus({preventScroll:true}); if (selection && replacement?.setSelectionRange && !['number','select-one'].includes(replacement.type)) replacement.setSelectionRange(...selection); }
-    if (inspector && run) void loadReport(run);
+    bindStepTimings(host);
+    if (focusId) { const replacement = host.querySelector(`#${CSS.escape(focusId)}`); replacement?.focus({preventScroll:true}); if (selection && replacement?.setSelectionRange && !['number','select-one'].includes(replacement.type)) replacement.setSelectionRange(...selection); }
+    const neededReports = new Map(steps.map(item => runForStep(item)).filter(source => source && (source.step_results?.length || source.result?.steps?.length || source.step_in_flight != null && !active(source))).map(source => [source.id,source]));
+    if (inspector && inspectedRun) neededReports.set(inspectedRun.id,inspectedRun);
+    for (const source of neededReports.values()) void loadReport(source);
     stash();
   }
   async function loadReport(run) {
     const key = `${run.id}:${run.status}:${run.step_results?.length || 0}:${run.result?.capture?.complete ?? ''}:${Boolean(run.result?.artifacts)}`;
-    if (reportKey === key) return;
-    const started = context(); reportKey = key; reportLoading = true; reportError = ''; if (report?.run?.id !== run.id) report = null; render();
-    try { const data = await api(`/api/runs/${encodeURIComponent(run.id)}/report`); if (current(started) && reportKey === key) report = data; }
-    catch (failure) { if (current(started) && reportKey === key) reportError = `Evidence unavailable: ${failure.message}`; }
-    finally { if (current(started) && reportKey === key) { reportLoading = false; render(true); } }
+    if (reportState(run).key === key) return;
+    const started = context(), entry = {key,loading:true,error:'',data:reportState(run).data};
+    reports.set(run.id,entry); render();
+    try { const data = await api(`/api/runs/${encodeURIComponent(run.id)}/report`); if (current(started) && reports.get(run.id) === entry) entry.data = data; }
+    catch (failure) { if (current(started) && reports.get(run.id) === entry) entry.error = `Evidence unavailable: ${failure.message}`; }
+    finally { if (current(started) && reports.get(run.id) === entry) { entry.loading = false; render(true); } }
   }
   function validate(mode) {
     if (!draft.prompt.trim()) throw new Error('Give the sequence a name.');
@@ -285,7 +323,7 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     host.querySelector('[data-wb="save"]').disabled = false;
   });
   host.addEventListener('change', event => {
-    if (event.target.id === 'wb-run-select') { displayedRun = event.target.value; if (!selectedStep()) selected = shownSteps()[0]?.id; reportKey = ''; report = null; inspector = true; render(true); scheduleSave(); return; }
+    if (event.target.id === 'wb-run-select') { displayedRun = event.target.value; if (!selectedStep()) selected = shownSteps()[0]?.id; inspector = true; render(true); scheduleSave(); return; }
     if (event.target.id !== 'wb-tool' || !editable()) return;
     const tool = event.target.value; selectedStep().action = {tool, ...(tool === 'press_key' ? {key:'Enter'} : tool === 'type_text' ? {text:''} : {target:''})};
     changed(); render(true); host.querySelector('#wb-value')?.focus();
@@ -299,7 +337,7 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     const name = button.dataset.wb;
     if (['run','step','single','pause','stop','save'].includes(name)) { void command(name); return; }
     if (name === 'inspect') { inspector = !inspector; render(true); return; }
-    if (name === 'retry-evidence') { reportKey = ''; render(true); return; }
+    if (name === 'retry-evidence') { reports.delete(button.dataset.runId || currentRun()?.id); render(true); return; }
     if (!editable()) return;
     const index = draft.steps.findIndex(step => step.id === selected);
     if (name === 'add') { const step = freshStep(); draft.steps.push(step); selected = step.id; startStep = step.id; }

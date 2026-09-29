@@ -30,7 +30,11 @@ Run controls and the automatically displayed latest run follow the selected pers
 
 ## Results and inspection
 
-A successful native step means its command was sent and returned an acceptable native delivery outcome. **Sent · unverified** means the driver could not verify the application's resulting effect. Sequence completion does not establish that a broad user goal was achieved. Driver refusals, incomplete input, unavailable observations, and transport or execution failures stop the sequence at that step.
+A successful native step means its command was sent and returned an acceptable native delivery outcome. The active row shows a spinner and **running**, then **Complete** after success. **Effect unverified** remains visible when the driver could not verify the application's resulting effect. Sequence completion does not establish that a broad user goal was achieved. Driver refusals, incomplete input, unavailable observations, and transport or execution failures stop the sequence at that step.
+
+Executed rows have a compact **Timing** disclosure, expanded by default. Collapse it to hide the graph; that choice is retained as progress updates arrive. Each horizontal bar divides the recorded step duration into nonoverlapping processes, including window/control acquisition, individual Jev selection rounds, focus, action, settling, and overhead. Hover or keyboard-focus a segment or its legend label to see the step, process duration, input tokens, and dollar cost at **$0.042 per million input tokens**. Missing usage or timing remains explicitly unavailable. Rows that have never run have no timing disclosure.
+
+Running individual steps retains the most recent execution evidence on the other rows for the current person and desktop. Timing includes the recorded run timestamp; editing an action labels its prior outcome **edited**. Selecting a recorded run restricts every row to that exact run. The spinner follows execution independently of the selected editor row.
 
 Read text returns literal text from the selected accessible control and its observed descendants. It displays that text in the inspector with its source and retains the contributing accessibility fields. It does not invent text, run OCR, or assert that inaccessible, truncated, or off-screen content was read. Empty readable output stops the step with an explanation.
 
@@ -55,3 +59,5 @@ This implementation uses the existing Jev model pin and authored questions. Expl
 Local backend verification for selected-range execution included Python compilation/imports and isolated handler checks for starting at step 3, running only step 5, preserving full snapshots and original indices, rejecting incomplete selected steps, completing at the selected boundary, and rejecting completion without the required results. These checks did not use a live database, Jev calls, or assigned Omarchy actions. No automated test files were added.
 
 Browser verification used a local preview with simulated API/run outcomes. It covered moving the start marker, starting at step 3, running only an added step, automatic saving of new and unfinished steps, reload recovery, leaving and returning during pending edits, and header inspection/history controls. No live desktop was connected. JavaScript syntax and diff whitespace checks passed.
+
+The timing UI was also inspected in a local simulated preview with multiple selection rounds, known and missing token usage, direct actions without Jev, and unexecuted rows. Segment details, column containment, collapse persistence during rerendering, and the running-row indicator were checked in the browser. These checks do not establish live worker connectivity or deployment.
