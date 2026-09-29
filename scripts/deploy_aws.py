@@ -647,6 +647,30 @@ phases:
             else:
                 raise RuntimeError("Earlier-schema tasks did not fully stop; service remains in maintenance. Inspect before retrying")
             print(json.dumps({"company_cutover": "legacy_tasks_stopped"}), flush=True)
+            # Bind the compatible task definition while still stopped. Scaling
+            # and replacing the definition in one call can revive the old set.
+            ecs.update_service(cluster=self.cluster, service=self.name,
+                taskDefinition=task["taskDefinitionArn"], desiredCount=0,
+                deploymentConfiguration={"maximumPercent": 200, "minimumHealthyPercent": 0,
+                    "deploymentCircuitBreaker": {"enable": True, "rollback": False}})
+            for attempt in range(90):
+                bound = ecs.describe_services(cluster=self.cluster, services=[self.name])["services"][0]
+                deployments = bound["deployments"]
+                if (bound["taskDefinition"] == task["taskDefinitionArn"]
+                        and not any(bound[key] for key in ("desiredCount", "runningCount", "pendingCount"))
+                        and len(deployments) == 1
+                        and deployments[0]["status"] == "PRIMARY"
+                        and deployments[0]["taskDefinition"] == task["taskDefinitionArn"]
+                        and deployments[0].get("rolloutState") == "COMPLETED"
+                        and not any(deployments[0][key] for key in ("desiredCount", "runningCount", "pendingCount"))):
+                    break
+                time.sleep(2)
+            else:
+                raise RuntimeError("New company definition did not stabilize while stopped; service remains in maintenance")
+            ecs.update_service(cluster=self.cluster, service=self.name, desiredCount=1)
+            self.record(service=self.name, deployed_at=dt.datetime.now(dt.timezone.utc).isoformat())
+            print(json.dumps({"deployment_started": self.state["task_definition"], "url": self.state["url"]}))
+            return
         services = ecs.describe_services(cluster=self.cluster, services=[self.name])["services"]
         if release_only and (len(services) != 1 or services[0]["status"] != "ACTIVE"
                 or len(services[0]["deployments"]) != 1
@@ -654,9 +678,7 @@ phases:
             raise RuntimeError("Service changed during release preparation; coordinate and inspect before retrying")
         if services and services[0]["status"] != "INACTIVE":
             ecs.update_service(cluster=self.cluster, service=self.name, taskDefinition=task["taskDefinitionArn"], desiredCount=1,
-                # The first schema cutover must not bootstrap the drained legacy task set
-                # to satisfy a 100% minimum when desiredCount returns from zero.
-                deploymentConfiguration={"maximumPercent": 200, "minimumHealthyPercent": 0 if company_cutover else 100, "deploymentCircuitBreaker": {"enable": True, "rollback": allow_rollback}})
+                deploymentConfiguration={"maximumPercent": 200, "minimumHealthyPercent": 100, "deploymentCircuitBreaker": {"enable": True, "rollback": allow_rollback}})
         else:
             ecs.create_service(cluster=self.cluster, serviceName=self.name, taskDefinition=task["taskDefinitionArn"], desiredCount=1, launchType="FARGATE",
                 platformVersion="1.4.0", healthCheckGracePeriodSeconds=60,
