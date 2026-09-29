@@ -654,7 +654,9 @@ phases:
             raise RuntimeError("Service changed during release preparation; coordinate and inspect before retrying")
         if services and services[0]["status"] != "INACTIVE":
             ecs.update_service(cluster=self.cluster, service=self.name, taskDefinition=task["taskDefinitionArn"], desiredCount=1,
-                deploymentConfiguration={"maximumPercent": 200, "minimumHealthyPercent": 100, "deploymentCircuitBreaker": {"enable": True, "rollback": allow_rollback}})
+                # The first schema cutover must not bootstrap the drained legacy task set
+                # to satisfy a 100% minimum when desiredCount returns from zero.
+                deploymentConfiguration={"maximumPercent": 200, "minimumHealthyPercent": 0 if company_cutover else 100, "deploymentCircuitBreaker": {"enable": True, "rollback": allow_rollback}})
         else:
             ecs.create_service(cluster=self.cluster, serviceName=self.name, taskDefinition=task["taskDefinitionArn"], desiredCount=1, launchType="FARGATE",
                 platformVersion="1.4.0", healthCheckGracePeriodSeconds=60,
