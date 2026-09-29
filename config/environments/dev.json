@@ -20,7 +20,7 @@
   "openai_secret": "arn:aws:secretsmanager:us-west-1:686458136219:secret:mangorts/dev/openai-api-key-EaABNe",
   "app_secret_name": "ctrlloop/mvp/app",
   "origin_host": "origin.dev.mangorts.com",
-  "requested_domain": "dev.controlloop.io",
+  "requested_domain": "dev.ctrlloop.io",
   "expected_distribution": "EFZQEEWLIM0FZ",
   "expected_url": "https://d1t0sm9jhdinfi.cloudfront.net",
   "bootstrap_legacy_dev": true,

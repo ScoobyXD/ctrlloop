@@ -16,6 +16,7 @@ import sys
 import tarfile
 import subprocess
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from cua_sandbox import Sandbox
 from dotenv import dotenv_values, load_dotenv
@@ -38,7 +39,8 @@ if env.get('CTRLLOOP_API_URL') != target['api_url'] or env.get('CTRLLOOP_WORKER_
     raise SystemExit('Guest configuration differs from the explicit member assignment')
 if phase == 'begin' and env_path != active_path and active_path.exists():
     prior = read_env(active_path)
-    if (prior.get('CTRLLOOP_API_URL') != target['api_url']
+    previous_origin = sys.argv[4] if len(sys.argv)>4 else target['api_url']
+    if (prior.get('CTRLLOOP_API_URL') != previous_origin
         or prior.get('CTRLLOOP_WORKER_ID', target['id']) != target['id']
         or prior.get('CTRLLOOP_ENVIRONMENT', target['environment']) != target['environment']
         or not hmac.compare_digest(prior.get('WORKER_TOKEN', ''), env['WORKER_TOKEN'])):
@@ -77,8 +79,18 @@ def bundle(ref=None):
 async def main(args):
     if args.configure and (args.resume or args.status or args.stage_only):
         raise ValueError('--configure is only valid for a normal deployment')
+    if args.previous_api_url and not args.configure:
+        raise ValueError('--previous-api-url requires --configure')
     load_dotenv(args.fleet_env,interpolate=False)
     config,target,local,reference=load_target(args.environment,args.member)
+    if args.previous_api_url:
+        previous = urlsplit(args.previous_api_url)
+        if (previous.scheme != 'https' or not previous.hostname or previous.path not in ('', '/')
+                or previous.username or previous.password or previous.query or previous.fragment):
+            raise ValueError('Previous application URL must be a credential-free HTTPS origin')
+        assigned_origin = urlsplit(target['api_url'])
+        if (previous.hostname, previous.port or 443) == (assigned_origin.hostname, assigned_origin.port or 443):
+            raise ValueError('Previous application URL must differ from the new assignment origin')
     revision,archive=bundle(args.source_ref)
     remote=f'/home/omarchy/ctrlloop-dev/releases/{revision}'
     async with Sandbox.from_dict(reference) as sandbox:
@@ -162,6 +174,7 @@ WantedBy=default.target
         await sandbox.files.make_dir('/home/omarchy/.config/systemd/user')
         await sandbox.files.write_text(control+'/ctrlloop-worker.service',service)
         begin=phase+' begin'+(' '+shlex.quote(staged_env) if staged_env else '')
+        if args.previous_api_url: begin+=' '+shlex.quote(args.previous_api_url)
         install_env=('install -m 600 '+shlex.quote(staged_env)+' '+shlex.quote(env_path)+'\n'
                      +'rm -f '+shlex.quote(staged_env)+'\n') if staged_env else ''
         setup=f'''set -eu
@@ -211,6 +224,7 @@ if __name__=='__main__':
     parser.add_argument('--jev-env',type=Path)
     parser.add_argument('--source-ref',help='Bundle an exact Git commit/ref without changing this checkout')
     parser.add_argument('--configure',action='store_true',help='Initial administrator setup from dedicated member credential files')
+    parser.add_argument('--previous-api-url',help='With --configure only: require this exact prior HTTPS origin during an explicit origin migration')
     mode=parser.add_mutually_exclusive_group()
     mode.add_argument('--resume',action='store_true',help='Release maintenance only after inspecting a failed deployment')
     mode.add_argument('--status',action='store_true')

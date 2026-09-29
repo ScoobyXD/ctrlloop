@@ -2,7 +2,7 @@
 
 Windows and macOS use the same repository, shared development website and PostgreSQL database. Each person signs in separately and has a separate assigned Omarchy desktop. Workflows and history are shared inside **CTRL Loop Development**; a run always targets the signed-in member's own desktop. Company workspace checks apply to API reads, reports, downloads, worker delivery and desktop input.
 
-The current development URL is <https://d1t0sm9jhdinfi.cloudfront.net>. The requested `dev.controlloop.io` is pending domain confirmation/access; `ctrlloop.io` is a different existing domain. Production is not deployed. See [environment and promotion configuration](environments.md).
+The current development URL is <https://d1t0sm9jhdinfi.cloudfront.net>. The owner selected **`dev.ctrlloop.io`** under the existing domain; certificate/DNS activation and the app-origin cutover are pending renewal of the AWS sign-in session. Production is not deployed. See [environment and promotion configuration](environments.md).
 
 ## Repository setup
 
@@ -52,7 +52,7 @@ The administrator records a member assignment in the existing `workers` table an
 
 These two identity files can accompany onboarding. They contain routing identifiers, not provider or worker credentials. `target.json` must name the actual sandbox, namespace, claim, member, workspace and development origin. The deploy tool compares them with the bound Fleet desktop and the server's worker identity before changing a service.
 
-Independent worker deployment is pending a Fleet credential whose access is verified to be limited to Kevin's namespace, `ctrlloop-omarchy-dev-kevin-20260928`. No such key has been issued here; see [Fleet credential handoff](#fleet-credential-handoff) for the observed 403 and unresolved restriction. The embedded website viewer needs no Fleet key on Kevin's computer.
+Independent worker deployment is pending Kevin's Fleet credential and a successful access check to the existing guest in `ctrlloop-omarchy-dev-kevin-20260928`. The owner has requested unrestricted provider access: leave the optional namespace selection empty, displayed as **All namespaces (no restriction)**, when creating the dedicated key. A namespace-limited key is no longer a prerequisite. See [Fleet credential handoff](#fleet-credential-handoff); the embedded website viewer needs no Fleet key on Kevin's computer.
 
 After the Fleet access prerequisite is resolved and the administrator has configured the VM's dedicated worker/Jev credentials, updates reuse that guest configuration. Kevin does not need the shared database password, app bootstrap password, OpenAI key or another person's worker token:
 
@@ -67,15 +67,35 @@ Deployment checks the exact assignment, takes the guest deployment lock, asks th
 
 Initial setup uses `--configure --jev-env PATH`, plus that member's private `credentials.json`, under administrator control. That file contains the worker's dedicated bearer token. It is not part of a contributor onboarding bundle, source archive, or Git commit. Browser profiles are not copied between members.
 
+When moving the existing owner worker to the selected custom domain, initial configuration also requires `--previous-api-url https://d1t0sm9jhdinfi.cloudfront.net`. That explicit transition still requires the exact existing worker identity and unchanged bearer token; the new origin must match the recorded assignment.
+
 ### Fleet credential handoff
 
-Fleet documents an **Allowed Namespaces** selector. Its official UI passes namespace names directly in `scope`, and the installed SDK accepts `CreateUserApiKeyRequest(name="ctrlloop-kevin-dev", scope=["ctrlloop-omarchy-dev-kevin-20260928"])`. This is the verified request format, not evidence that the resulting credential is restricted. [Fleet credential guide](https://cua.ai/docs/how-to-guides/sandbox/set-up-fleet-credentials), [official UI](https://github.com/trycua/cua/blob/main/libs/fleet/src/pages/UserApiKeys.tsx).
+Sign in as the account that owns the existing pools at [Fleet API keys](https://run.cua.ai/user-keys). Create a dedicated key named `ctrlloop-kevin`, leave **Allowed Namespaces (optional)** empty—the placeholder reads **All namespaces (no restriction)**—and save its one-time client ID/secret privately in ignored `.local/environments/dev/workers/kevin/fleet.env`. The official UI omits the scope restriction when no namespaces are selected. The key acts for its owner; a new personal Cua login does not automatically gain access to another account's pools. [Official Fleet credential setup](https://cua.ai/docs/how-to-guides/sandbox/set-up-fleet-credentials), [UI implementation](https://github.com/trycua/cua/blob/main/libs/fleet/src/pages/UserApiKeys.tsx).
 
-The existing infrastructure credential returned **HTTP 403** from the read-only `list_user_api_keys()` call. Official policy permits key management only through interactive clients (`cyclops-cs-spa`, `cua-cli`, `cua-desktop`); programmatic user keys cannot mint, list or revoke other keys. No creation was attempted. An authorized account's interactive key-management session is required; do not broaden or distribute the existing infrastructure credential to work around the denial. [Key-management policy](https://github.com/trycua/cua/blob/main/libs/fleet/backend/auth/authz_user_keys.rego).
+The existing infrastructure credential returned **HTTP 403** from read-only `list_user_api_keys()`. Fleet's policy reserves key management for interactive clients, so selecting all namespaces does not let an API key create other keys. Use the signed-in key-management page. No new key has been created here. [Key-management policy](https://github.com/trycua/cua/blob/main/libs/fleet/backend/auth/authz_user_keys.rego).
 
-Namespace enforcement remains **unverified**. The reviewed public implementation stores `scope` as a Keycloak client attribute, but the inspected user-key claim mapping and authorization paths do not establish enforcement of that list. Public source may differ from the running service. Do not treat a successful creation response or displayed namespace label as proof of isolation; obtain provider confirmation and verify the effective restriction before issuing a contributor credential. [Key creation](https://github.com/trycua/cua/blob/main/libs/fleet/backend/keycloak/admin.go), [token handling](https://github.com/trycua/cua/blob/main/libs/fleet/backend/auth/middlewares.go), [namespace policy](https://github.com/trycua/cua/blob/main/libs/fleet/backend/auth/authz_namespaces.rego).
+To verify Kevin's credential, clear inherited `FLEETS_TOKEN`, configure `CUA_CLIENT_ID` and `CUA_CLIENT_SECRET`, and run the official guide's read-only token/namespace check. Then run the worker `--status` command above: successful namespace listing alone does not prove access to the already-assigned guest. Keep client secrets and bearer tokens out of output; the SDK key object's string representation includes its secret. Hand the dedicated credential to Kevin privately, separately from the non-secret target/claim files.
 
-Until that is resolved, an authorized administrator can deploy Kevin's reviewed source using the exact member target while keeping infrastructure credentials private. After restricted access is confirmed, hand the dedicated client ID/secret only to Kevin through a private channel and save it in ignored `.local/environments/dev/workers/kevin/fleet.env` with access limited to its owner. Do not print the SDK's returned key object: its string representation includes the secret. Clear any inherited `FLEETS_TOKEN` before using the dedicated OAuth credential, because that variable takes precedence. The non-secret target/claim files can accompany onboarding separately; provider keys, activation codes and guest worker/Jev credentials never belong in a shared source bundle.
+The official Fleet documentation reviewed does not establish an organization/member invitation procedure for sharing the existing pools with Kevin's separate dashboard identity. For that form of access, ask Cua to enable the appropriate account access; do not assume a new personal key shares the owner's pools. The credential guide links [Cua support](https://cua.ai/docs/how-to-guides/sandbox/set-up-fleet-credentials#create-a-fleet-user-api-key) for access problems. Full provider access is separate from CTRL Loop's per-member VM assignment, which remains enforced by the application.
+
+## AWS identities and full account access
+
+Read-only verification on **September 29, 2026 UTC** confirmed that the owner already has IAM Identity Center username **`ScoobyXD`**, display name **Jonathan Kim**, in account **`686458136219`**. The existing `mangorts-dev` profile uses the **`AdministratorAccess`** permission set in **`us-west-1`**. STS reported the corresponding `AWSReservedSSO_AdministratorAccess_9dc9077959c6397f/ScoobyXD` role session; the role has AWS's `AdministratorAccess` managed policy, no permissions boundary and no inline policies. There is no need to create another identity for the owner.
+
+Sign in through the [AWS access portal](https://d-916771bd28.awsapps.com/start). To give Kevin the full account access requested:
+
+1. Open [IAM Identity Center in us-west-1](https://us-west-1.console.aws.amazon.com/singlesignon/home?region=us-west-1), choose **Users → Add user**, and enter Kevin's chosen username, email, first/last name and display name. Choose email setup instructions or a one-time password to deliver privately. [AWS user-creation guide](https://docs.aws.amazon.com/singlesignon/latest/userguide/addusers.html).
+2. Under **AWS accounts**, select account **686458136219**, choose **Assign users or groups**, select Kevin and the existing **AdministratorAccess** permission set, then submit and wait for completion. No custom restrictive permission set is needed for this request. [AWS assignment guide](https://docs.aws.amazon.com/singlesignon/latest/userguide/assignusers.html), [AdministratorAccess policy](https://docs.aws.amazon.com/aws-managed-policy/latest/reference/AdministratorAccess.html).
+3. Kevin signs into the same portal using his own identity. On his computer, configure and verify the CLI profile below, selecting this account and `AdministratorAccess`. [AWS CLI SSO setup](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html).
+
+```text
+aws configure sso --profile mangorts-dev
+aws sso login --profile mangorts-dev
+aws sts get-caller-identity --profile mangorts-dev
+```
+
+The wizard uses start URL `https://d-916771bd28.awsapps.com/start`, SSO region `us-west-1`, registration scope `sso:account:access`, account `686458136219`, and role `AdministratorAccess`. Kevin's identity details and preferred password/invitation delivery are still needed before creating his account. This verification created no users, assignments, invitations or keys. The metadata-only evidence is saved privately at `.local/mvp/aws-self-identity-20260929.json`.
 
 ## Deploy the shared website
 
@@ -90,7 +110,7 @@ uv run --locked python scripts/deploy_aws.py status --environment dev --profile 
 
 `--release-only` uses the existing build project, roles, buckets and service. It does not create IAM roles, rewrite permission policies, reconfigure the build project, create buckets or create another service. Account/resource guards still run. Wait for the requested image's healthy, completed rollout; a successful build alone is not a deployment. Local state is not a distributed deployment lock, so the two operators must coordinate releases.
 
-Kevin's AWS Identity Center username/identity has not been supplied or assigned by this work. The exact permitted resource boundaries are documented in [environments.md](environments.md#kevins-development-deployment-access); do not grant administrator access to make this command work. Production uses a separate explicit reviewed-image promotion path, separate secrets and data, and remains disabled until its configuration is approved.
+Kevin's AWS identity has not yet been supplied or assigned by this work. Follow [AWS identities and full account access](#aws-identities-and-full-account-access) for the requested `AdministratorAccess` assignment. The deployment tool still checks the selected environment and exact resources, even when its operator has full provider privileges. Production uses a separate explicit reviewed-image promotion path, separate secrets and data, and remains disabled until its configuration is approved.
 
 ## Administrator migration and assignment
 

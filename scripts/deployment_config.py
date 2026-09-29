@@ -55,7 +55,7 @@ def load_environment(name: str) -> DeploymentConfig:
         raise ValueError("A specific AWS account is required")
     if not re.fullmatch(r"[a-z][a-z0-9-]{1,25}", data["resource_name"]):
         raise ValueError("Invalid environment resource name")
-    expected_domain = "dev.controlloop.io" if name == "dev" else "controlloop.io"
+    expected_domain = "dev.ctrlloop.io" if name == "dev" else "controlloop.io"
     if data["requested_domain"] != expected_domain:
         raise ValueError("Requested domain must exactly match the configured environment")
     if name == "prod":
