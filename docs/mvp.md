@@ -1,10 +1,10 @@
 # [CTRL] Loop MVP
 
-The application has a shared development website and PostgreSQL database, personal sign-ins, company workspaces, and a separate assigned Omarchy desktop for each member. Workflows and history are shared within a workspace; each run targets its initiator's own worker. OpenAI generates the saved instruction; the worker uses the existing Jev selection rounds and native Cua Driver to select observed windows and controls. Runs have a full-page report and an authenticated ZIP download of their available evidence.
+The application has a shared development website and PostgreSQL database, personal sign-ins, companies, and a separate assigned Omarchy desktop for each member. Workflows and history are shared within a company; each run targets its initiator's own worker. OpenAI generates the saved instruction; the worker uses the existing Jev selection rounds and native Cua Driver to select observed windows and controls. Runs have a full-page report and an authenticated ZIP download of their available evidence.
 
 Use [developer onboarding](developer-onboarding.md) for personal access, worker updates and shared-site releases, and [environment configuration](environments.md) for development resource bindings and the disabled production promotion path. Those guides describe the current implementation and outstanding access prerequisites; deployment checkpoints below record what was actually verified.
 
-The live site is [CTRL Loop](https://d1t0sm9jhdinfi.cloudfront.net). The historical X-navigation demonstration **succeeded**: real OpenAI generation, PostgreSQL persistence, delivery to the existing VM, Jev selection, native Chrome input, and observation of the loaded X root page. The authenticated embedded viewer and ownership controls were also verified. [Acceptance evidence](#acceptance-evidence) records the successful run and the earlier errors; authenticated feed contents were not evaluated.
+The configured development site is [CTRL Loop](https://dev.ctrlloop.io). The historical X-navigation demonstration **succeeded**: real OpenAI generation, PostgreSQL persistence, delivery to the existing VM, Jev selection, native Chrome input, and observation of the loaded X root page. The authenticated embedded viewer and ownership controls were also verified. [Historical acceptance evidence](#historical-acceptance-evidence) records that successful run and earlier errors at the previous origin; it does not establish that company accounts are deployed.
 
 ## Components and pins
 
@@ -12,7 +12,7 @@ The live site is [CTRL Loop](https://d1t0sm9jhdinfi.cloudfront.net). The histori
 | --- | --- |
 | Website | [`web/`](../web/): static HTML, CSS, and JavaScript; no frontend build or external asset CDN |
 | Application API | [`src/webapp.py`](../src/webapp.py): FastAPI, authentication, instruction generation, delivery, events, and worker ownership |
-| Database | [`src/schema.sql`](../src/schema.sql): `users`, `workspaces`, `memberships`, `sessions`, `workers`, `loops`, `runs`, and `events` |
+| Database | [`src/schema.sql`](../src/schema.sql): `companies`, `users`, `sessions`, `workers`, `loops`, `runs`, `events`, `auth_tokens`, and `company_migration_audit` |
 | Worker service | [`src/cloud_worker.py`](../src/cloud_worker.py): outbound HTTPS polling, guest process lock, crash journal, heartbeats, and result delivery |
 | Bounded executor | [`src/worker.py`](../src/worker.py): validates the saved instruction and invokes existing window/control rounds with explicit capability limits |
 | Shared selection pipeline | Existing [`src/pipeline.py`](../src/pipeline.py), [`src/selection.py`](../src/selection.py), [`src/jev_questions.py`](../src/jev_questions.py), and [`src/reporting.py`](../src/reporting.py) |
@@ -29,7 +29,7 @@ The live run exposed a Linux Driver omission in named entry-field values. The [n
 
 ## Request and execution flow
 
-1. Sign in with a personal username/password, select the company workspace, and choose **Create loop**. The server stores the exact user prompt and creator and starts a real LLM request. The response initially has `status: generating`.
+1. Sign in with a personal email/password, open your company, and choose **Create loop**. The server stores the exact user prompt and creator and starts a real LLM request. The response initially has `status: generating`.
 2. The server saves the returned instruction string, response ID, usage, model, and generation timestamp. Only then does the loop become `ready`. Failed or interrupted generation produces an error; it does not substitute an instruction.
 3. Choose **Run instruction**. The server records the initiator and requires a ready instruction, that member's online assigned worker, agent ownership, and no queued or running task for that worker. PostgreSQL also enforces one active run per worker. Missing assignments and deployment maintenance prevent execution while shared workflows remain available.
 4. The guest worker polls over HTTPS. The server dispatches the instruction read from PostgreSQL. The worker journals the run before acknowledging receipt and invoking the executor.
@@ -52,15 +52,15 @@ A guest restart recovers the available JSONL records and creates a partial ZIP, 
 
 ## Access and desktop ownership
 
-Each person has a personal username/password and workspace membership. Members share requests, run history and reports inside their selected company workspace; their desktop and input control bind to their own assigned worker. Owners manage membership and provide single-use activation codes manually. See [personal website access](developer-onboarding.md#personal-website-access) for activation and migration details.
+Each account belongs to exactly one company and signs in with its own verified email and personal password. Signup as **Company admin** creates a new company and a separate company join password; signup as **User** selects an existing company and verifies that join password. Company admins manage their users and future enrollment password. The site provides email verification, login/logout and forgotten-password reset. See [company account flows, security boundaries and email configuration](company-accounts.md).
 
-The initial single-owner deployment used `APP_PASSWORD` and private operator files under `.local/mvp/`. That password now serves only the explicit legacy development migration into the owner's personal identity; it is not a shared runtime login fallback. Current deployment state lives under ignored `.local/environments/{environment}/`; historical evidence remains in `.local/mvp/`. Credential and activation files remain private. See [environment state and bootstrap configuration](environments.md#configuration-and-local-state).
+Platform devadmin is a separate verified-account operator grant and is never a signup role. It permits explicit company/user target context across the product. Ordinary users cannot choose another company or another person's VM. Every company-owned table has its own non-null indexed `company_id`, including sessions, users, workers, loops, runs, events and tokens; composite foreign keys enforce same-company relationships.
 
-Login creates a hashed server-side session and a 12-hour `Secure`, `HttpOnly`, `SameSite=Strict` cookie. Mutating browser requests require the configured origin. Provider keys remain server-side. The guest worker receives its delivery token and Jev key; it does not receive the OpenAI or Fleet credentials.
+Legacy account data needs the [explicit preflight and migration](company-accounts.md#migration-preflight). This source change does not deploy the new flow or migrate the live database. Existing personal credentials and historical evidence are preserved where ownership mappings are resolved; old sessions expire and migrated accounts verify their real email. There is no runtime shared password or default-worker fallback.
 
-The embedded viewer connects to `/api/desktop` on the application's own origin. The backend authenticates its cookie, origin and active membership, obtains the Fleet token server-side, and connects only to the signed-in member's assigned namespace and sandbox. The browser does not need a Cua account or receive a broad provider bearer token.
+The embedded viewer connects to `/api/desktop` on the application's own origin. The backend authenticates its cookie, origin and verified company access, obtains the Fleet token server-side, and connects only to the signed-in member's assigned namespace and sandbox. The browser does not need a Cua account or receive a broad provider bearer token.
 
-The viewer starts in **View only**. **Take control** is available only when no run is queued or running and the worker is not in maintenance. Human control belongs to the exact signed-in browser session; another session of that account remains view-only. **Return to agent** releases ownership before a run can start. JavaScript uses `worker.can_control`, and the WebSocket gateway independently checks membership, assignment, session ownership and active-run state before forwarding keyboard, pointer, or clipboard input. This restriction does not rely on the noVNC `viewOnly` flag alone.
+The viewer starts in **View only**. **Take control** is available only when no run is queued or running and the worker is not in maintenance. Human control belongs to the exact signed-in browser session; another session of that account remains view-only. **Return to agent** releases ownership before a run can start. JavaScript uses `worker.can_control`, and the WebSocket gateway independently checks company access, assignment, session ownership and active-run state before forwarding keyboard, pointer, or clipboard input. This restriction does not rely on the noVNC `viewOnly` flag alone.
 
 Signing out releases that session's human ownership. Expired ownership is cleared when session state or ownership is next requested. Closing a browser tab does not automatically return ownership immediately; reopen the website with the same session and return control, or wait for session expiry. External Fleet viewers and separate controller tools are outside this application's ownership coordination; keep them from sending input during worker execution.
 
@@ -70,7 +70,7 @@ At the earlier viewer checkpoint, the changes were deployed as **`20260928-viewe
 
 The application now reuses a PostgreSQL pool of **2–8 connections**. The gateway forwards RFB negotiation and framebuffer requests without an ownership query; only keyboard, pointer, and clipboard input needs the database ownership check. Adjacent input packets in one browser message share that check. The shared worker-row lock remains held until authorized input is forwarded, so ownership changes and run starts cannot race past it. Signed-in session validity is also checked independently every 15 seconds. The parser now consumes noVNC's **seven-byte extended PointerEvent** when its extension bit is present; treating it as six bytes left an extra byte that could corrupt the following message.
 
-After an unexpected disconnect, the viewer checks `/api/session` before each new connection and makes at most **five automatic retries**, with delays of **1, 2, 4, 8, and 15 seconds**. Each attempt has a **20-second deadline**. The retry budget resets after **30 seconds continuously connected**, so short repeated connections cannot cause an unlimited retry loop. Recovery pauses while the tab is hidden; hiding the tab during setup cancels that attempt without consuming its retry. An established video connection remains open across tab visibility, run status, and human/agent control changes. Logout or an intentional disconnect cancels pending recovery. Expired workspace sessions return to sign-in; explicit RFB security failures or credential requests stop automatic retries. **Reconnect** permits a fresh manual attempt.
+After an unexpected disconnect, the viewer checks `/api/session` before each new connection and makes at most **five automatic retries**, with delays of **1, 2, 4, 8, and 15 seconds**. Each attempt has a **20-second deadline**. The retry budget resets after **30 seconds continuously connected**, so short repeated connections cannot cause an unlimited retry loop. Recovery pauses while the tab is hidden; hiding the tab during setup cancels that attempt without consuming its retry. An established video connection remains open across tab visibility, run status, and human/agent control changes. Logout or an intentional disconnect cancels pending recovery. Expired sessions return to sign-in; explicit RFB security failures or credential requests stop automatic retries. **Reconnect** permits a fresh manual attempt.
 
 Starting sign-in invalidates outstanding session reads from before that sign-in. A delayed unauthenticated response can no longer tear down the viewer opened by a later successful login.
 
@@ -117,7 +117,7 @@ Provide a private, Git-ignored `.env.web` with these application settings. `uvic
 | `CUA_CLIENT_ID`, `CUA_CLIENT_SECRET` | Authorized Fleet service credentials, kept server-side |
 | `REPORT_BUCKET` | Selected environment's private evidence bucket, with authorized server-side AWS access |
 
-Personal credentials, memberships and worker routing come from PostgreSQL. Legacy `APP_PASSWORD`, `WORKER_TOKEN` and Fleet target settings are used only by the explicit development bootstrap described in [environments.md](environments.md#first-development-upgrade); do not use them as an implicit local account setup or copy production state into development.
+Personal/company credentials and assigned worker routing come from PostgreSQL. Configure real SES/SMTP delivery, or explicitly use `EMAIL_PROVIDER=local` with `APP_ENV=dev` for local captured messages. The UI distinguishes capture from sent mail. See [email settings](company-accounts.md#email-delivery); never copy production state into development.
 
 Start the server behind a trusted local HTTPS reverse proxy whose origin matches `APP_ORIGIN`:
 
@@ -125,9 +125,9 @@ Start the server behind a trusted local HTTPS reverse proxy whose origin matches
 uv run --locked uvicorn src.webapp:app --env-file .env.web --host 127.0.0.1 --port 8080 --no-access-log
 ```
 
-Alternatively, supply a locally trusted certificate using uvicorn's `--ssl-keyfile` and `--ssl-certfile` options and set `APP_ORIGIN` to that HTTPS address. Keep keys under an ignored local directory. Secure cookies and same-origin enforcement remain enabled. A static HTTP server can preview the login assets but cannot provide an authenticated workspace.
+Alternatively, supply a locally trusted certificate using uvicorn's `--ssl-keyfile` and `--ssl-certfile` options and set `APP_ORIGIN` to that HTTPS address. Keep keys under an ignored local directory. Secure cookies and same-origin enforcement remain enabled. A static HTTP server can preview the login assets but cannot provide an authenticated company page.
 
-Startup applies the idempotent schema in `src/schema.sql` and performs an explicitly enabled legacy development migration when needed. This requires an existing database owned by the application role; member and worker provisioning use the [administrator setup](developer-onboarding.md#administrator-migration-and-assignment). `/healthz` performs a database query. A local website alone does not make the cloud worker reachable: end-to-end delivery requires the guest's `CTRLLOOP_API_URL` to point to a reachable HTTPS application origin.
+Startup creates `src/schema.sql` for an empty database or validates the current company schema; legacy data requires the explicit administrator migration and mapped real email addresses. Signup creates or joins a company through the website; VM assignment uses the [administrator setup](company-accounts.md#per-user-vm-assignment). `/healthz` performs a database query. A local website alone does not make the cloud worker reachable: end-to-end delivery requires the guest's `CTRLLOOP_API_URL` to point to a reachable HTTPS application origin.
 
 ## AWS deployment
 
@@ -139,9 +139,9 @@ The build uploads an explicit code/dependency/frontend allowlist to private S3 a
 
 Coordinate shared-site releases while instruction generation and desktop runs are idle. Old and new application processes can overlap during an ECS rollout, and startup marks unfinished generation as interrupted. CloudWatch application logs remain under `/ecs/ctrlloop-mvp` with 14-day retention. Infrastructure/bootstrap changes stay under administrator control; `status` is read-only and `database-ready` explicitly completes database initialization.
 
-## Deploy a member's worker
+## Deploy a user's worker
 
-Use [Deploy only your worker](developer-onboarding.md#deploy-only-your-worker). The current command requires an explicit environment and member; the original single-owner `--claim` command and `.local/mvp/worker.json` deployment state are historical. Each member's target, claim and deployment state live under `.local/environments/{environment}/workers/{member}/`. Independent Fleet deployment needs the [dedicated credential and verified guest access](developer-onboarding.md#fleet-credential-handoff); unrestricted provider access is the owner's selected policy.
+Use [Deploy only your worker](developer-onboarding.md#deploy-only-your-worker). Commands require an explicit environment and `--email`; no default worker is selected. Each user's target, claim, credential and deployment state live under `.local/environments/{environment}/workers/{sha256-of-normalized-email}/`. The assignment command prints the directory. Follow [explicit VM assignment](company-accounts.md#per-user-vm-assignment) to bind the company/user and preserve existing worker credentials.
 
 [`scripts/deploy_worker.py`](../scripts/deploy_worker.py) verifies the saved assignment against the exact bound sandbox and server worker identity. It preserves that VM and disk. Normal updates reuse the VM's dedicated credentials; administrator-only initial configuration transfers the worker/Jev credentials separately into a mode-0600 `worker.env`. Deployment takes the guest lock, enters maintenance for that worker, refuses active/unsettled runs or human control, and resumes only after successful startup. A failed deployment remains in maintenance for inspection. `--stage-only` prepares code and dependencies without transferring credentials or starting a worker.
 
@@ -167,17 +167,20 @@ The website and worker share one application API and the existing PostgreSQL rec
 | Method / path | Purpose |
 | --- | --- |
 | `GET /healthz` | Database-backed service health |
-| `POST /api/login`, `POST /api/logout`, `GET /api/session` | Personal session, workspace membership and assigned-worker state |
-| `POST /api/activate/inspect`, `POST /api/activate` | Review a single-use activation code and set a personal password |
-| `POST /api/session/workspace` | Select an active company membership |
-| `GET /api/memberships`, `POST /api/memberships`, `PATCH /api/memberships/{user_id}` | Owner-only member listing, addition and access changes |
+| `GET /api/companies`, `POST /api/signup` | Minimal company enrollment selector; atomic new-company or company-password signup |
+| `POST /api/login`, `POST /api/logout`, `GET /api/session` | Verified email/password session, company and assigned-worker state |
+| `POST /api/verify-email`, `POST /api/resend-verification` | Single-use email verification and resend |
+| `POST /api/forgot-password`, `POST /api/reset-password` | Personal password reset, token consumption and session revocation |
+| `PATCH /api/company` | Company-admin company name and enrollment-password management |
+| `GET /api/company/users`, `PATCH /api/company/users/{user_id}` | Company-admin user listing and access/role changes |
+| `GET /api/admin/companies` | Trusted devadmin cross-company context selection |
 | `GET /api/loops`, `POST /api/loops` | List saved loops or begin real instruction generation |
 | `GET /api/loops/{id}` | Instruction, generation events, runs, and run events |
 | `POST /api/loops/{id}/runs` | Queue the persisted instruction |
 | `POST /api/worker/mode` | Cookie-authenticated, origin-checked human/agent ownership transition |
 | `WS /api/desktop` | Cookie-authenticated viewer and ownership-filtered input |
 | `POST /api/worker/poll`, `/heartbeat`, `/recover` | Bearer-authenticated assigned worker delivery, liveness, and interrupted-run recovery |
-| `POST /api/worker/deployment` | Bearer-authenticated maintenance transition for the exact worker/environment |
+| `POST /api/worker/deployment` | Bearer-authenticated maintenance transition for the exact worker/environment/company/user |
 | `POST /api/worker/runs/{id}/events`, `/finish` | Bearer-authenticated progress and recorded outcome for the assigned worker's run |
 | `POST /api/worker/runs/{id}/artifacts` | Bearer-authenticated, idempotent worker ZIP upload; usable after terminal result for recovery |
 | `GET /api/runs/{id}/report`, `/download` | Authenticated combined run record and downloadable evidence ZIP |
@@ -185,7 +188,9 @@ The website and worker share one application API and the existing PostgreSQL rec
 | `GET /api/runs/{id}/files/{path}` | Authenticated individual worker evidence file |
 | `GET /reports/runs/{id}`, `/reports/loops/{id}` | Full-page report interface |
 
-## Acceptance evidence
+## Historical acceptance evidence
+
+The dated checkpoints below predate the company-account change and do not establish that its signup, email integration, migration, or tenant isolation has been deployed.
 
 ### General executor and evidence archive — September 28, 2026
 
@@ -222,7 +227,7 @@ Verified deployment checkpoint, **September 27, 2026**:
 
 The live `/healthz`, authentication, PostgreSQL connection, and authenticated read endpoints passed checks. Signing in through the deployed website displayed the real Chrome desktop inside its embedded viewer and **Worker · Online**. A separate read-only protocol check completed the RFB 3.8 handshake and read the **1920 × 1080** framebuffer through the application's gateway. This establishes the authenticated desktop viewing path; it does not establish that an instruction was executed.
 
-The task's visual evidence is labeled **“Authenticated CTRL Loop workspace — live embedded Chrome desktop and online assigned worker.”** It shows the product interface and guest desktop, with no provider credentials or private access-file contents. No screenshot containing secrets is included in this document.
+The historical visual evidence shows the authenticated product interface, embedded Chrome desktop, and online assigned worker, with no provider credentials or private access-file contents. No screenshot containing secrets is included in this document.
 
 The user subsequently approved the complete live demonstration; generation/execution authorization and credential-transfer approval are resolved. The application created PostgreSQL loop **`1681e48a-e35c-4c0e-8779-457621abe348`** from the exact sample request. Its real saved instruction is:
 

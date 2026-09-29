@@ -17,29 +17,49 @@
         <span class="eyebrow login-eyebrow">YOUR DESKTOP, IN MOTION</span>
         <h1>A thought.<br>A little action.</h1>
         <p class="login-description">Turn a request into a saved instruction. Follow every step on your cloud desktop.</p>
+        <p id="auth-message" class="auth-message" role="status" hidden></p>
         <form id="login-form">
-          <label for="username">Username</label>
-          <input id="username" name="username" autocomplete="username" required minlength="2" maxlength="64" placeholder="Your username">
-          <label for="password">Password</label>
-          <input id="password" name="password" type="password" autocomplete="current-password" required placeholder="Enter your password">
+          <h2>Sign in</h2>
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" autocomplete="username" required maxlength="254" placeholder="you@company.com">
+          <label for="password">Personal password</label>
+          <div class="password-field"><input id="password" name="password" type="password" autocomplete="current-password" required maxlength="500" placeholder="Enter your password"><button type="button" class="password-toggle" data-password-toggle="password" aria-controls="password" aria-label="Show personal password" aria-pressed="false"></button></div>
           <p id="login-error" class="form-error" role="alert" hidden></p>
-          <button class="button primary login-submit" id="login-submit" type="submit"><span>Open workspace</span><span aria-hidden="true">↗</span></button>
+          <button class="button primary login-submit" id="login-submit" type="submit"><span>Open company</span><span aria-hidden="true">↗</span></button>
+          <div class="auth-links"><button type="button" class="button quiet auth-toggle" data-auth-view="forgot">Forgot password?</button><button type="button" class="button quiet auth-toggle" data-auth-view="resend">Verify email</button></div>
+          <button type="button" class="button quiet auth-toggle" data-auth-view="signup">New here? Create an account</button>
         </form>
-        <form id="activation-form" hidden>
-          <h2>Activate your account</h2>
-          <p class="login-description">Use the activation code provided by your workspace owner, then choose your own password.</p>
-          <label for="activation-token">Activation code</label>
-          <input id="activation-token" name="token" type="password" autocomplete="off" required spellcheck="false">
-          <button id="inspect-activation" type="button" class="button secondary small">Review account</button>
-          <p id="activation-account" class="activation-account" hidden></p>
-          <label for="activation-password">New password</label>
-          <input id="activation-password" type="password" autocomplete="new-password" required minlength="12" maxlength="500" placeholder="At least 12 characters">
-          <label for="activation-confirm">Confirm password</label>
-          <input id="activation-confirm" type="password" autocomplete="new-password" required minlength="12" maxlength="500">
-          <p id="activation-error" class="form-error" role="alert" hidden></p>
-          <button class="button primary login-submit" id="activation-submit" type="submit" disabled>Activate account ↗</button>
+        <form id="signup-form" hidden>
+          <h2>Create your account</h2>
+          <label for="signup-email">Email</label><input id="signup-email" name="email" type="email" autocomplete="username" required maxlength="254" placeholder="you@company.com">
+          <label for="signup-name">Your name</label><input id="signup-name" name="display_name" autocomplete="name" required maxlength="100">
+          <label for="signup-password">Personal password</label><div class="password-field"><input id="signup-password" name="password" type="password" autocomplete="new-password" required minlength="12" maxlength="500" placeholder="At least 12 characters"><button type="button" class="password-toggle" data-password-toggle="signup-password" aria-controls="signup-password" aria-label="Show personal password" aria-pressed="false"></button></div>
+          <label for="signup-role">Account role</label><select id="signup-role" name="role"><option value="user">User — join a company</option><option value="company_admin">Company admin — create a company</option></select>
+          <div id="join-company-fields"><label for="signup-company">Company</label><select id="signup-company" name="company_id" required><option value="">Loading companies…</option></select></div>
+          <div id="new-company-fields" hidden><label for="signup-company-name">New company name</label><input id="signup-company-name" name="company_name" maxlength="100" disabled></div>
+          <label for="signup-company-password" id="company-password-label">Company password</label><div class="password-field"><input id="signup-company-password" name="company_password" type="password" autocomplete="off" required maxlength="500" aria-describedby="company-password-help"><button type="button" class="password-toggle" data-password-toggle="signup-company-password" aria-controls="signup-company-password" aria-label="Show company password" aria-pressed="false"></button></div>
+          <p id="company-password-help" class="field-help">Ask your company admin for this password. It is only used when joining; you sign in with your personal password.</p>
+          <p id="signup-error" class="form-error" role="alert" hidden></p><button id="signup-submit" class="button primary login-submit" type="submit">Create account ↗</button>
+          <button type="button" class="button quiet auth-toggle" data-auth-view="login">Already have an account? Sign in</button>
         </form>
-        <button id="toggle-activation" class="button quiet auth-toggle" type="button">Have an activation code?</button>
+        <form id="forgot-form" hidden>
+          <h2>Reset your personal password</h2><p class="field-help">Enter your account email to request a reset link.</p>
+          <label for="forgot-email">Email</label><input id="forgot-email" name="email" type="email" autocomplete="email" required maxlength="254">
+          <p id="forgot-error" class="form-error" role="alert" hidden></p><button id="forgot-submit" class="button primary login-submit" type="submit">Request reset link ↗</button>
+          <button type="button" class="button quiet auth-toggle" data-auth-view="login">Back to sign in</button>
+        </form>
+        <form id="resend-form" hidden>
+          <h2>Verify your email</h2><p class="field-help">Request a new verification link for your account.</p>
+          <label for="resend-email">Email</label><input id="resend-email" name="email" type="email" autocomplete="email" required maxlength="254">
+          <p id="resend-error" class="form-error" role="alert" hidden></p><button id="resend-submit" class="button primary login-submit" type="submit">Request verification link ↗</button>
+          <button type="button" class="button quiet auth-toggle" data-auth-view="login">Back to sign in</button>
+        </form>
+        <form id="reset-form" hidden>
+          <h2>Choose a new personal password</h2><p class="field-help">This updates your own login password. Your company password stays the same.</p>
+          <label for="reset-password">New personal password</label><div class="password-field"><input id="reset-password" name="password" type="password" autocomplete="new-password" required minlength="12" maxlength="500" placeholder="At least 12 characters"><button type="button" class="password-toggle" data-password-toggle="reset-password" aria-controls="reset-password" aria-label="Show personal password" aria-pressed="false"></button></div>
+          <p id="reset-error" class="form-error" role="alert" hidden></p><button id="reset-submit" class="button primary login-submit" type="submit">Save new password ↗</button>
+          <button type="button" class="button quiet auth-toggle" data-auth-view="forgot">Request another reset link</button>
+        </form>
         <p class="login-note"><span class="tiny-lock" aria-hidden="true">⌑</span> Your identity · Your desktop · Shared workflows</p>
       </main>
     </div>
@@ -47,7 +67,7 @@
     <div id="app" class="app" hidden>
       <header class="app-header">
         <a class="brand" href="/" aria-label="CTRL Loop home"><span class="brand-mark">[CTRL]</span><span>Loop<span class="brand-dot">.</span></span></a>
-        <div class="header-divider"></div><div class="workspace-context"><label for="workspace-picker">WORKSPACE</label><strong id="workspace-name">Loading…</strong><select id="workspace-picker" hidden aria-label="Current workspace"></select></div>
+        <div class="header-divider"></div><div class="company-context"><span class="context-label">COMPANY</span><strong id="company-name">Loading…</strong></div>
         <div class="header-end"><div class="signed-in-person"><strong id="user-name">Signed in</strong><span id="user-role"></span></div><span id="connection-state" class="connection-state"><i class="status-dot"></i>Connecting</span><button id="logout" class="button quiet small">Sign out</button></div>
       </header>
 
@@ -59,16 +79,26 @@
           <footer class="sidebar-footer"><span class="footer-symbol" aria-hidden="true">↳</span><div><strong>Small actions. Real progress.</strong><p>One instruction at a time.</p></div></footer>
         </aside>
 
-        <main class="workspace">
+        <main class="company">
           <div id="page-notice" class="notice" role="status" hidden><span id="page-notice-text"></span><button id="dismiss-notice" aria-label="Dismiss notification">×</button></div>
-          <div class="workspace-heading"><div><div class="eyebrow">FROM INTENT TO ACTION</div><h1>Your control room<span>.</span></h1><p>Share workflows with your workspace. Run them on your own desktop.</p></div><div class="workspace-coordinate" aria-hidden="true"><span>◌</span> HUMAN + AGENT</div></div>
+          <div class="company-heading"><div><div class="eyebrow">FROM INTENT TO ACTION</div><h1>Your control room<span>.</span></h1><p>Share workflows with your company. Run them on your own desktop.</p></div><div class="company-coordinate" aria-hidden="true"><span>◌</span> HUMAN + AGENT</div></div>
+          <section id="admin-context" class="panel admin-context" hidden aria-label="Platform administration context">
+            <div><strong>Devadmin · all companies</strong><p id="admin-context-summary">Choose a company and a person to access their assigned desktop.</p></div>
+            <div class="admin-context-fields"><div><label for="admin-company">Company</label><select id="admin-company"></select></div><div><label for="admin-user">Person / assigned desktop</label><select id="admin-user"><option value="">Choose a person</option></select></div><button id="admin-home" class="button secondary small" type="button">My company &amp; desktop</button></div>
+          </section>
           <details id="member-management" class="panel members-panel" hidden>
-            <summary>Workspace members <span id="member-count"></span></summary>
-            <div class="members-content"><p class="members-note">Create a personal account for a teammate. Give them the activation code privately; they choose their own password. Desktop assignment is managed separately.</p>
+            <summary>Manage company <span id="member-count"></span></summary>
+            <div class="members-content"><p class="members-note">People join this company during signup with its company password. Manage their roles and access here. Desktop assignment is managed separately.</p>
               <div id="member-list" aria-live="polite"></div>
-              <form id="member-form" class="member-form"><div><label for="member-username">Username</label><input id="member-username" name="username" required minlength="2" maxlength="64" autocomplete="off" spellcheck="false"></div><div><label for="member-display-name">Display name</label><input id="member-display-name" name="display_name" required maxlength="100" autocomplete="off"></div><button id="create-member" class="button secondary" type="submit">Add member</button></form>
               <p id="member-error" class="form-error" role="alert" hidden></p>
-              <div id="activation-receipt" class="activation-receipt" hidden><strong id="activation-receipt-title">Account created</strong><p>Share this code privately with the named teammate. It is shown only once.</p><label for="member-activation-code">Activation code</label><div class="activation-code-row"><input id="member-activation-code" readonly autocomplete="off" spellcheck="false"><button id="copy-activation" type="button" class="button secondary small">Copy code</button></div><p id="activation-expiry"></p><button id="dismiss-activation" type="button" class="button quiet small">I have saved the code</button></div>
+              <form id="company-form" class="company-form">
+                <h3>Company settings</h3>
+                <label for="company-setting-name">Company name</label><input id="company-setting-name" name="name" required maxlength="100">
+                <label for="company-setting-password">New company password <span>(optional)</span></label><div class="password-field"><input id="company-setting-password" name="company_password" type="password" autocomplete="new-password" minlength="12" maxlength="500" aria-describedby="company-setting-help"><button type="button" class="password-toggle" data-password-toggle="company-setting-password" aria-controls="company-setting-password" aria-label="Show new company password" aria-pressed="false"></button></div>
+                <p id="company-setting-help" class="field-help">At least 12 characters. Changing this only affects future signups. Existing members keep their accounts and personal passwords.</p>
+                <label for="company-current-password">Your personal password</label><div class="password-field"><input id="company-current-password" name="current_password" type="password" autocomplete="current-password" required maxlength="500"><button type="button" class="password-toggle" data-password-toggle="company-current-password" aria-controls="company-current-password" aria-label="Show personal password" aria-pressed="false"></button></div>
+                <button id="save-company" class="button secondary" type="submit">Save company settings</button><p id="company-error" class="form-error" role="alert" hidden></p>
+              </form>
             </div>
           </details>
 
@@ -85,7 +115,7 @@
               </section>
 
               <section id="loop-detail" class="panel detail-panel" aria-label="Selected loop">
-                <div class="empty-detail"><div class="empty-symbol" aria-hidden="true">↳</div><h2>Start a shared workflow</h2><p>Saved instructions and run history are shared with your workspace. Each person runs them on their own assigned desktop.</p><div class="empty-flow"><span>Request</span><i>→</i><span>Instruction</span><i>→</i><span>Action</span></div></div>
+                <div class="empty-detail"><div class="empty-symbol" aria-hidden="true">↳</div><h2>Start a shared workflow</h2><p>Saved instructions and run history are shared with your company. Each person runs them on their own assigned desktop.</p><div class="empty-flow"><span>Request</span><i>→</i><span>Instruction</span><i>→</i><span>Action</span></div></div>
               </section>
             </section>
 
@@ -95,16 +125,16 @@
                 <div class="desktop-toolbar"><div class="desktop-identity"><span class="desktop-icon" aria-hidden="true">▣</span><div><strong id="desktop-owner">Your Omarchy desktop</strong><span id="worker-identity">Waiting for assigned worker</span></div></div><div class="viewer-tools"><button id="fit-view" class="icon-button active" title="Fit desktop to viewer" aria-label="Fit desktop to viewer" aria-pressed="true">Fit</button><button id="fullscreen" class="icon-button" title="Enter fullscreen" aria-label="Enter fullscreen"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button></div></div>
                 <div class="desktop-display">
                   <div id="desktop-canvas" class="desktop-canvas" aria-label="Remote desktop screen"></div>
-                  <div id="viewer-placeholder" class="viewer-placeholder"><div class="monitor-symbol" aria-hidden="true"><span>↳</span></div><h3 id="viewer-placeholder-title">Connecting to your desktop</h3><p id="viewer-placeholder-message">A live view of the assigned workspace will appear here.</p><button id="reconnect-viewer" class="button secondary small" hidden>Reconnect viewer</button></div>
+                  <div id="viewer-placeholder" class="viewer-placeholder"><div class="monitor-symbol" aria-hidden="true"><span>↳</span></div><h3 id="viewer-placeholder-title">Connecting to your desktop</h3><p id="viewer-placeholder-message">A live view of your assigned desktop will appear here.</p><button id="reconnect-viewer" class="button secondary small" hidden>Reconnect viewer</button></div>
                 </div>
                 <div class="desktop-control-bar"><div class="control-mode"><span id="control-mode-icon" aria-hidden="true">◉</span><div><strong id="control-mode-label">View only</strong><span id="control-mode-description">The agent controls this desktop.</span></div></div><button id="toggle-control" class="button secondary small" disabled>Take control <span aria-hidden="true">↗</span></button></div>
               </section>
               <div class="desktop-meta"><span id="worker-status">Worker status pending</span><span id="worker-last-seen"></span></div>
               <section class="scope-note"><span aria-hidden="true">↳</span><p>The worker selects visible windows and controls for click or type actions. General task planning, generated typing content, and task completion checks are not implemented yet. Each run reports its observed outcome and provides an evidence ZIP.</p></section>
-              <details class="workspace-details"><summary>Workspace details <span aria-hidden="true">＋</span></summary><dl><div><dt>Assigned worker</dt><dd id="worker-detail-id">—</dd></div><div><dt>Instruction model</dt><dd id="model-detail-id">—</dd></div><div><dt>Selection model</dt><dd id="jev-detail-id">—</dd></div><div><dt>Desktop connection</dt><dd>Authenticated, same-origin gateway</dd></div></dl></details>
+              <details class="company-details"><summary>Company details <span aria-hidden="true">＋</span></summary><dl><div><dt>Assigned worker</dt><dd id="worker-detail-id">—</dd></div><div><dt>Instruction model</dt><dd id="model-detail-id">—</dd></div><div><dt>Selection model</dt><dd id="jev-detail-id">—</dd></div><div><dt>Desktop connection</dt><dd>Authenticated, same-origin gateway</dd></div></dl></details>
             </section>
           </div>
-          <footer class="workspace-footer"><span>[CTRL] LOOP</span><span>Intent, made visible.</span></footer>
+          <footer class="company-footer"><span>[CTRL] LOOP</span><span>Intent, made visible.</span></footer>
         </main>
       </div>
     </div>

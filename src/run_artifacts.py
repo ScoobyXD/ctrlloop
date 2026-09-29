@@ -4,17 +4,19 @@ import io
 import json
 import os
 from pathlib import PurePosixPath
+from uuid import UUID
 import zipfile
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
 MAX_EXPANDED_BYTES = 200 * 1024 * 1024
 
 
-def archive_key(identity):
-    return f'runs/{identity}/worker.zip'
+def archive_key(company_id, identity):
+    return f'companies/{UUID(str(company_id))}/runs/{UUID(str(identity))}/worker.zip'
 
 
 def s3():
@@ -54,16 +56,28 @@ def inspect_archive(content, identity):
             'files': files, 'manifest': manifest}
 
 
-def store_archive(identity, content):
+def store_archive(company_id, identity, content):
     bucket = os.environ.get('REPORT_BUCKET')
     if not bucket:
         raise RuntimeError('Private report storage is not configured')
-    s3().put_object(Bucket=bucket, Key=archive_key(identity), Body=content,
+    s3().put_object(Bucket=bucket, Key=archive_key(company_id, identity), Body=content,
                     ContentType='application/zip', ServerSideEncryption='AES256')
 
 
-def load_archive(identity):
-    response = s3().get_object(Bucket=os.environ['REPORT_BUCKET'], Key=archive_key(identity))
+def load_archive(company_id, identity):
+    """Called only after DB authorization of this company's immutable run ID.
+
+    Existing evidence stays readable without copying or deleting old objects.
+    UUID run IDs are globally unique, so the legacy lookup cannot select another
+    company's run. New uploads always use the company-qualified object key.
+    """
+    client = s3()
+    try:
+        response = client.get_object(Bucket=os.environ['REPORT_BUCKET'], Key=archive_key(company_id, identity))
+    except ClientError as error:
+        if error.response.get('Error', {}).get('Code') not in ('NoSuchKey', '404'):
+            raise
+        response = client.get_object(Bucket=os.environ['REPORT_BUCKET'], Key=f'runs/{UUID(str(identity))}/worker.zip')
     try:
         content = response['Body'].read(MAX_ARCHIVE_BYTES + 1)
     finally:

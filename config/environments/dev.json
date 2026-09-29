@@ -7,7 +7,10 @@
   "default_profile": "mangorts-dev",
   "resource_name": "ctrlloop-mvp",
   "vpc": "vpc-091ee99d4afb8bec5",
-  "subnets": ["subnet-0c96aa9cdb41d46f7", "subnet-0d7cdf9a8970301c1"],
+  "subnets": [
+    "subnet-0c96aa9cdb41d46f7",
+    "subnet-0d7cdf9a8970301c1"
+  ],
   "alb_sg": "sg-080dc70b173bd3d6c",
   "db_sg": "sg-085727cf5320e53ac",
   "listener": "arn:aws:elasticloadbalancing:us-west-1:686458136219:listener/app/mangorts-dev-api/e34cd9745d895b7c/bf88b3739c743fca",
@@ -23,15 +26,8 @@
   "requested_domain": "dev.ctrlloop.io",
   "expected_distribution": "EFZQEEWLIM0FZ",
   "expected_url": "https://dev.ctrlloop.io",
-  "bootstrap_legacy_dev": true,
-  "bootstrap_owner_username": "owner",
-  "bootstrap_owner_display_name": "Owner",
-  "bootstrap_workspace_slug": "ctrlloop-development",
-  "bootstrap_workspace_name": "CTRL Loop Development",
-  "bootstrap_worker": {
-    "claim": "omarchy-trial",
-    "id": "ctrlloop-omarchy-20260927-1708-e33048ae",
-    "namespace": "ctrlloop-omarchy-20260927-1708",
-    "sandbox": "ctrlloop-omarchy-20260927-1708-e33048ae"
+  "email": {
+    "provider": null,
+    "from": null
   }
 }

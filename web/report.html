@@ -7,10 +7,10 @@
   <script type="module" src="/report.js"></script>
 </head>
 <body class="report-body">
-  <header class="report-header"><a class="brand" href="/"><span class="brand-mark">[CTRL]</span><span>Loop.</span></a><div class="report-context"><span id="report-person">RUN EVIDENCE</span><label class="sr-only" for="report-workspace">Current workspace</label><select id="report-workspace" hidden></select><span id="report-workspace-name"></span></div><a class="button quiet small" href="/">Back to workspace ↗</a></header>
+  <header class="report-header"><a class="brand" href="/"><span class="brand-mark">[CTRL]</span><span>Loop.</span></a><div class="report-context"><span id="report-person">RUN EVIDENCE</span><span id="report-company-name"></span></div><a class="button quiet small" href="/">Back to company ↗</a></header>
   <main class="report-main">
     <div id="report-loading" role="status">Loading the available run record…</div>
-    <form id="report-login" hidden class="report-card"><h1>Sign in to view this report</h1><label for="report-username">Username</label><input id="report-username" autocomplete="username" required minlength="2" maxlength="64"><label for="report-password">Password</label><input id="report-password" type="password" autocomplete="current-password" required><button id="report-login-submit" class="button primary">Open report</button><a class="button quiet small" href="/">Activate an account ↗</a><p id="login-error" role="alert"></p></form>
+    <form id="report-login" hidden class="report-card"><h1>Sign in to view this report</h1><label for="report-email">Email</label><input id="report-email" name="email" type="email" autocomplete="username" required maxlength="254"><label for="report-password">Password</label><div class="password-field"><input id="report-password" type="password" autocomplete="current-password" required maxlength="500"><button id="report-password-toggle" type="button" class="password-toggle" aria-controls="report-password" aria-label="Show personal password" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></button></div><button id="report-login-submit" class="button primary">Open report</button><a class="button quiet small" href="/">Create an account or reset password ↗</a><p id="login-error" role="alert"></p></form>
     <div id="report-content" hidden></div>
   </main>
 </body>

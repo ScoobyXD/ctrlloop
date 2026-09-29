@@ -67,6 +67,23 @@ def fleet_credentials(path):
     return values
 
 
+def account_email_configuration(config):
+    email = config.raw.get("email", {})
+    provider = email.get("provider")
+    if provider not in ("smtp", "ses") or not email.get("from"):
+        raise RuntimeError("Configure real email.provider (smtp or ses) and email.from before deploying account signup")
+    values = {"EMAIL_PROVIDER": provider, "EMAIL_FROM": email["from"], "AWS_REGION": config["region"]}
+    secret_names = []
+    if provider == "smtp":
+        if not email.get("smtp_host") or email.get("smtp_security", "starttls") not in ("starttls", "ssl"):
+            raise RuntimeError("Configure SMTP host and secure transport before deployment")
+        values.update(SMTP_HOST=email["smtp_host"], SMTP_PORT=str(email.get("smtp_port", 465 if email.get("smtp_security") == "ssl" else 587)),
+                      SMTP_SECURITY=email.get("smtp_security", "starttls"))
+        if email.get("smtp_auth", True):
+            secret_names = ["SMTP_USERNAME", "SMTP_PASSWORD"]
+    return values, secret_names
+
+
 class Deployment:
     def __init__(self, profile, environment):
         self.config = load_environment(environment)
@@ -176,8 +193,6 @@ class Deployment:
                 "ORIGIN_VERIFY": secrets.token_urlsafe(36),
                 **fleet_credentials(fleet_env),
             }
-            if self.config["bootstrap_legacy_dev"]:
-                self.secret.update(APP_PASSWORD=secrets.token_urlsafe(32), WORKER_TOKEN=secrets.token_urlsafe(48))
             self.secret["DATABASE_URL"] = (
                 f"postgresql://{self.db_user}:{quote(self.secret['DATABASE_PASSWORD'], safe='')}"
                 f"@{self.db_host}:5432/{self.db_name}?sslmode=require"
@@ -362,7 +377,14 @@ print("CTRL Loop dedicated database created and login verified")
                     AssumeRolePolicyDocument=json.dumps(trust), Tags=self.tags)
         iam.put_role_policy(RoleName=role_name, PolicyName="run-evidence", PolicyDocument=json.dumps({
             "Version": "2012-10-17", "Statement": [{"Effect": "Allow",
-                "Action": ["s3:GetObject", "s3:PutObject"], "Resource": f"arn:aws:s3:::{bucket}/runs/*"}]}))
+                "Action": ["s3:GetObject", "s3:PutObject"], "Resource": f"arn:aws:s3:::{bucket}/companies/*"},
+                {"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket}/runs/*"},
+                {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{bucket}"}]}))
+        email = self.config.raw.get("email", {})
+        if email.get("provider") == "ses" and email.get("from"):
+            iam.put_role_policy(RoleName=role_name, PolicyName="account-email", PolicyDocument=json.dumps({
+                "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "ses:SendEmail",
+                "Resource": "*", "Condition": {"StringEquals": {"ses:FromAddress": email["from"]}}}]}))
         self.record(report_bucket=bucket, task_role=iam.get_role(RoleName=role_name)["Role"]["Arn"])
         print(json.dumps({"report_bucket": bucket, "public_access": "blocked", "retention": "durable; no automatic expiry"}))
 
@@ -518,7 +540,8 @@ phases:
             raise
         print(json.dumps({"review_manifest": str(path), "revision": revision, "deployed_to_prod": False}))
 
-    def deploy(self, promotion_manifest=None, release_only=False, identity_cutover=False):
+    def deploy(self, promotion_manifest=None, release_only=False, company_cutover=False):
+        email_environment, email_secrets = account_email_configuration(self.config)
         if not self.state.get("database_ready"):
             raise RuntimeError("Database initialization is not verified. Run database-ready after it finishes.")
         if self.config.name == "prod":
@@ -547,20 +570,22 @@ phases:
             current_task = ecs.describe_task_definition(taskDefinition=current["taskDefinition"])["taskDefinition"]
             current_app = next(c for c in current_task["containerDefinitions"] if c["name"] == "app")
             current_env = {item["name"]: item["value"] for item in current_app.get("environment", [])}
-            legacy = current_env.get("APP_ENV") is None
-            if not legacy and current_env["APP_ENV"] != self.config.name:
+            legacy = current_env.get("COMPANY_SCHEMA_VERSION") != "1"
+            if current_env.get("APP_ENV") not in (None, self.config.name):
                 raise RuntimeError("Existing service belongs to a different application environment")
-        if legacy and not identity_cutover:
-            raise RuntimeError("Legacy app requires --identity-cutover to stop old tasks before personal sign-in becomes available")
-        if identity_cutover and (self.config.name != "dev" or not legacy):
-            raise RuntimeError("Identity cutover is only valid for the existing legacy development service")
+        if legacy and not company_cutover:
+            raise RuntimeError("Earlier account schema requires --company-cutover to terminate old tasks before starting company accounts")
+        if legacy and release_only:
+            raise RuntimeError("First company cutover requires the full administrative deployment to update report and email permissions")
+        if company_cutover and not legacy:
+            raise RuntimeError("Company cutover is only valid when replacing an earlier account schema")
         stable_current = bool(current and len(current["deployments"]) == 1
                               and current["deployments"][0].get("rolloutState") == "COMPLETED"
                               and current["deployments"][0]["taskDefinition"] == current["taskDefinition"])
-        if identity_cutover and not stable_current:
-            raise RuntimeError("Inspect and stabilize the existing legacy service before the identity cutover")
+        if company_cutover and not stable_current:
+            raise RuntimeError("Inspect and stabilize the existing service before the company cutover")
         # After a failed first cutover, ECS's last successful deployment can
-        # still be the legacy app. Only a proven stable identity-aware current
+        # still be the legacy app. Only a proven stable company-aware current
         # deployment is a safe automatic rollback target.
         allow_rollback = stable_current and not legacy
         if release_only:
@@ -576,16 +601,8 @@ phases:
                "DEPLOY_REVISION": self.state["revision"],
                "REPORT_BUCKET": self.state["report_bucket"], "AWS_DEFAULT_REGION": self.region}
         secret_names = ["DATABASE_URL", "CUA_CLIENT_ID", "CUA_CLIENT_SECRET"]
-        if self.config["bootstrap_legacy_dev"]:
-            if self.config.name != "dev":
-                raise RuntimeError("Legacy bootstrap is forbidden in production")
-            worker = self.config["bootstrap_worker"]
-            env.update(BOOTSTRAP_LEGACY_DEV="true", WORKER_ID=worker["id"], FLEET_NAMESPACE=worker["namespace"], FLEET_SANDBOX=worker["sandbox"], FLEET_CLAIM=worker["claim"])
-            for key in ("owner_username", "owner_display_name", "workspace_slug", "workspace_name"):
-                env["BOOTSTRAP_" + key.upper()] = self.config["bootstrap_" + key]
-            secret_names += ["APP_PASSWORD", "WORKER_TOKEN"]
-        else:
-            env["BOOTSTRAP_LEGACY_DEV"] = "false"
+        env.update(email_environment, COMPANY_SCHEMA_VERSION="1")
+        secret_names += email_secrets
         task = ecs.register_task_definition(family=self.name, networkMode="awsvpc", requiresCompatibilities=["FARGATE"], cpu="256", memory="1024",
             executionRoleArn=self.state["execution_role"], taskRoleArn=self.state["task_role"],
             runtimePlatform={"cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX"},
@@ -596,9 +613,9 @@ phases:
                 "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": f"/ecs/{self.name}", "awslogs-region": self.region, "awslogs-stream-prefix": "app"}}}],
             tags=self.lower_tags)["taskDefinition"]
         self.record(task_definition=task["taskDefinitionArn"])
-        if identity_cutover:
-            # Old readers accept every valid session cookie and have no company
-            # filter. Draining only ALB targets does not terminate WebSockets.
+        if company_cutover:
+            # Old readers follow the previous account and session contracts.
+            # They must never overlap the new company model. Draining only ALB targets does not terminate WebSockets.
             # Capture even STOPPING tasks, then require complete process exit.
             old_tasks = set()
             for desired_status in ("RUNNING", "STOPPED"):
@@ -607,7 +624,7 @@ phases:
                     old_tasks.update(page["taskArns"])
             ecs.update_service(cluster=self.cluster, service=self.name, desiredCount=0,
                 deploymentConfiguration={"deploymentCircuitBreaker": {"enable": True, "rollback": False}})
-            print(json.dumps({"identity_cutover": "stopping_legacy_tasks", "captured_tasks": len(old_tasks)}), flush=True)
+            print(json.dumps({"company_cutover": "stopping_legacy_tasks", "captured_tasks": len(old_tasks)}), flush=True)
             for attempt in range(90):
                 remaining = []
                 for desired_status in ("RUNNING", "STOPPED"):
@@ -628,8 +645,8 @@ phases:
                     break
                 time.sleep(2)
             else:
-                raise RuntimeError("Legacy tasks did not fully stop; service remains in maintenance. Inspect before retrying")
-            print(json.dumps({"identity_cutover": "legacy_tasks_stopped"}), flush=True)
+                raise RuntimeError("Earlier-schema tasks did not fully stop; service remains in maintenance. Inspect before retrying")
+            print(json.dumps({"company_cutover": "legacy_tasks_stopped"}), flush=True)
         services = ecs.describe_services(cluster=self.cluster, services=[self.name])["services"]
         if release_only and (len(services) != 1 or services[0]["status"] != "ACTIVE"
                 or len(services[0]["deployments"]) != 1
@@ -698,12 +715,12 @@ def main():
     parser.add_argument("--reviewed-by")
     parser.add_argument("--review-reference")
     parser.add_argument("--release-only", action="store_true", help="Build/deploy using existing resources; no IAM, bucket, project or service creation")
-    parser.add_argument("--identity-cutover", action="store_true", help="First dev upgrade only: stop every legacy task before starting personal identity support")
+    parser.add_argument("--company-cutover", action="store_true", help="First company upgrade only: stop every earlier-schema task before starting company accounts")
     args = parser.parse_args()
     if args.release_only and args.command not in ("build", "deploy"):
         parser.error("--release-only is only valid for build or deploy")
-    if args.identity_cutover and (args.command != "deploy" or args.environment != "dev"):
-        parser.error("--identity-cutover is only valid for deploy --environment dev")
+    if args.company_cutover and args.command != "deploy":
+        parser.error("--company-cutover is only valid for deploy")
     config = load_environment(args.environment)
     if args.command == "plan":
         print(json.dumps({"configuration": config.raw, "state_path": str(config.state_path), "credentials_printed": False}, indent=2))
@@ -734,7 +751,7 @@ def main():
     elif args.command == "build":
         deployment.build(args.revision, args.release_only)
     elif args.command == "deploy":
-        deployment.deploy(args.promotion_manifest, args.release_only, args.identity_cutover)
+        deployment.deploy(args.promotion_manifest, args.release_only, args.company_cutover)
     elif args.command == "promotion-manifest":
         deployment.promotion_manifest(args.revision, args.reviewed_by, args.review_reference)
     else:

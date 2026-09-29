@@ -62,7 +62,7 @@ Status: planning only. This section records the current product direction and pr
 
 The first milestone is one useful workflow for a pilot customer that completes this whole experience:
 
-1. Sign into our website and see the workspace's saved ctrl loops.
+1. Sign into our website and see the company's saved ctrl loops.
 2. Describe a workflow through text or voice, and refine the generated workflow in the browser.
 3. Review and save an identifiable workflow version in PostgreSQL.
 4. Provide inputs, upload required files, connect the necessary accounts, and start a run.
@@ -80,7 +80,7 @@ These are module boundaries first. They do not require separate repositories, du
 | --- | --- | --- |
 | Website and workflow-building experience | User's browser | Text/voice input, model interaction, workflow editing, saved-loop list, inputs, run controls, and results. |
 | Builder model | External voice/reasoning model API | Generate or revise workflow source; it does not need the Omarchy desktop. |
-| Application backend / run manager | Our cloud application, outside execution VMs | Authenticate users, authorize workspace access, store versions, assign workers, track runs, and surface requests for input. |
+| Application backend / run manager | Our cloud application, outside execution VMs | Authenticate users, authorize company access, store versions, assign workers, track runs, and surface requests for input. |
 | Workflow executor, including the existing `ctrlloop` GUI logic | Assigned cloud worker; initially an Omarchy VM | Execute the saved workflow's API operations and observe/select/act cycles, and report progress and results. |
 | Jev inference | TypeSafe's API | Answer the existing selection questions called by the worker; we do not host the Jev model in the VM. |
 | Native Cua Driver and desktop applications | The same desktop VM | Observe and control that VM's Chrome and other applications. |
@@ -115,7 +115,7 @@ The model request arrow describes the browser-based builder experience, not a de
 
 ## Worker and lifecycle scope for the MVP
 
-Start with one private Linux desktop worker for the pilot workspace and a separate dedicated development worker. Reuse the pilot desktop across runs while its supported lifetime permits. Only one GUI executor or human controller may send input to a desktop at a time; additional concurrent GUI work needs another isolated desktop.
+Start with one private Linux desktop worker for the pilot company and a separate dedicated development worker. Reuse the pilot desktop across runs while its supported lifetime permits. Only one GUI executor or human controller may send input to a desktop at a time; additional concurrent GUI work needs another isolated desktop.
 
 For the first mixed API/GUI workflow, both kinds of operation can run in the same worker. API-only workflows should eventually be able to run without allocating a desktop. A separate container worker pool, sophisticated autoscaling, and one permanent VM per customer are not prerequisites for the first milestone.
 
@@ -137,7 +137,7 @@ When a workflow needs information, a login, approval of a consequential action, 
 
 PostgreSQL holds workflow definitions, versions, ownership, run metadata, and references to outputs. Uploaded files, screenshots, and generated artifacts should live in authorized durable file/object storage with references in the database; the exact storage provider and retention policy remain open. Copy required inputs into the assigned worker and return important results before that worker is removed.
 
-Browser profiles, account sessions, and desktop preferences need a private persistence strategy associated with the correct workspace/user. This is a requirement for retained environments, not a capability already delivered by the trial. Preserving a profile does not guarantee that an external website will never require another login.
+Browser profiles, account sessions, and desktop preferences need a private persistence strategy associated with the correct company/user. This is a requirement for retained environments, not a capability already delivered by the trial. Preserving a profile does not guarantee that an external website will never require another login.
 
 Use protected account-connection/secret storage and grant a worker only what its assigned run needs. Do not place broad Fleet management keys in generated workflows or the customer's browser. The credential provider, user login flow, recovery procedure, and profile portability mechanism have not been selected. Separate different customers' execution state and account access.
 

@@ -14,7 +14,7 @@ const stageLabels = {
 };
 const viewerRetryDelays = [1000, 2000, 4000, 8000, 15000];
 const state = { session: null, sessionGeneration: 0, signingOut: false, loops: [], detail: null, selectedId: null, creating: false, running: false, changingMode: false, pollBusy: false, rfb: null, viewerGeneration: 0, viewerConnecting: false, viewerWanted: false, viewerRetryCount: 0, viewerRetryTimer: null, viewerConnectTimer: null, viewerStableTimer: null, viewerSessionController: null, viewerFailure: "", fit: true, lastDetailSignature: "", lastListSignature: "" };
-Object.assign(state, { switchingWorkspace: false, members: [], savingMember: false, inspectedToken: null, activationBusy: false });
+Object.assign(state, { switchingCompany: false, members: [], savingMember: false, savingCompany: false, authBusy: false, authView: "login", resetToken: null, companies: [], companyContext: null, userContext: null });
 const emptyDetail = $("loop-detail").innerHTML;
 let viewerModule;
 
@@ -31,16 +31,28 @@ function statusClass(status) { return errorStatuses.has(status) ? "error" : acti
 function badge(status) { return `<span class="badge ${statusClass(status)}">${escapeHtml(humanize(status))}</span>`; }
 function getRuns() { return Array.isArray(state.detail?.runs) ? state.detail.runs : []; }
 function hasActiveRun() { return Boolean(state.session?.worker?.active_run) || getRuns().some((run) => run.worker_id === state.session?.worker?.id && activeStatuses.has(run.status)); }
-function personName(person) { return person?.display_name || person?.username || "Earlier workspace member"; }
-function clearActivationReceipt() { $("activation-receipt").hidden = true; $("member-activation-code").value = ""; $("activation-expiry").textContent = ""; $("create-member").disabled = state.savingMember; }
-function resetWorkspaceView() {
+function personName(person) { return person?.display_name || person?.email || "Earlier company member"; }
+function canManageCompany() { return state.session?.user?.is_devadmin === true || state.session?.company?.role === "company_admin"; }
+function contextHeaders() {
+  if (!state.session?.user?.is_devadmin) return {};
+  return { ...(state.companyContext ? { "X-Company-ID": state.companyContext } : {}), ...(state.userContext ? { "X-User-ID": state.userContext } : {}) };
+}
+function scopedURL(path) {
+  const url = new URL(path, location.origin);
+  if (state.session?.user?.is_devadmin) {
+    if (state.companyContext) url.searchParams.set("company_id", state.companyContext);
+    if (state.userContext) url.searchParams.set("user_id", state.userContext);
+  }
+  return url.pathname + url.search;
+}
+function resetCompanyView() {
   disconnectViewer(); state.loops = []; state.detail = null; state.selectedId = null; state.members = [];
-  state.creating = false; state.running = false; state.changingMode = false; state.savingMember = false; state.viewerFailure = "";
-  $("create-loop").disabled = state.switchingWorkspace; $("create-loop").innerHTML = '<span>Create loop</span><span aria-hidden="true">↗</span>'; $("prompt").disabled = false;
+  state.creating = false; state.running = false; state.changingMode = false; state.savingMember = false; state.savingCompany = false; $("save-company").disabled = false; state.viewerFailure = "";
+  $("create-loop").disabled = state.switchingCompany; $("create-loop").innerHTML = '<span>Create loop</span><span aria-hidden="true">↗</span>'; $("prompt").disabled = false;
   state.lastListSignature = ""; state.lastDetailSignature = "";
   $("loop-detail").innerHTML = emptyDetail; $("member-list").replaceChildren(); $("member-count").textContent = "";
   $("member-management").open = false; $("member-error").hidden = true; $("page-notice").hidden = true;
-  clearActivationReceipt(); renderLoops();
+  $("company-form").reset(); delete $("company-form").dataset.companyId; $("company-error").hidden = true; renderLoops();
 }
 function getModel() {
   const raw = state.session?.model;
@@ -51,11 +63,11 @@ function getModel() {
 
 async function api(path, options = {}) {
   const sessionGeneration = state.sessionGeneration;
-  const response = await fetch(path, { credentials: "same-origin", cache: "no-store", ...options, headers: { ...(options.body ? { "Content-Type": "application/json" } : {}), ...(options.headers || {}) } });
+  const response = await fetch(path, { credentials: "same-origin", cache: "no-store", ...options, headers: { ...(options.body ? { "Content-Type": "application/json" } : {}), ...contextHeaders(), ...(options.headers || {}) } });
   const contentType = response.headers.get("content-type") || "";
   const body = contentType.includes("application/json") ? await response.json() : null;
   if (!response.ok) {
-    if (response.status === 401 && !["/api/login", "/api/activate", "/api/activate/inspect"].includes(path) && sessionGeneration === state.sessionGeneration) showLogin();
+    if (response.status === 401 && !["/api/login", "/api/signup", "/api/verify-email", "/api/resend-verification", "/api/forgot-password", "/api/reset-password"].includes(path) && sessionGeneration === state.sessionGeneration) showLogin();
     const detail = body?.detail ?? body?.error ?? body?.message;
     const message = typeof detail === "string" ? detail : Array.isArray(detail) ? detail.map(issue => issue.msg || "Invalid input").join("; ") : `Request failed (${response.status}).`;
     const error = new Error(message); error.status = response.status; throw error;
@@ -63,24 +75,27 @@ async function api(path, options = {}) {
   return body;
 }
 function notice(message, isError = false) { $("page-notice-text").textContent = message; $("page-notice").hidden = false; $("page-notice").classList.toggle("error", isError); }
-function setConnection(connected) { $("connection-state").innerHTML = `<i class="status-dot ${connected ? "live" : "warn"}"></i>${connected ? "Workspace connected" : "Connection interrupted"}`; }
+function setConnection(connected) { $("connection-state").innerHTML = `<i class="status-dot ${connected ? "live" : "warn"}"></i>${connected ? "Company connected" : "Connection interrupted"}`; }
 
 function showLogin() {
   const wasAuthenticated = state.session?.authenticated;
   state.sessionGeneration += 1;
-  state.session = null;
-  resetWorkspaceView();
+  state.session = null; state.companyContext = null; state.userContext = null; state.companies = [];
+  resetCompanyView();
   $("app").hidden = true; $("login-screen").hidden = false;
   if (wasAuthenticated) { $("login-error").textContent = "Your session ended. Sign in to continue."; $("login-error").hidden = false; }
 }
 function adoptSession(session) {
   if (!session?.authenticated) { showLogin(); return false; }
   const previous = state.session;
-  if (previous?.authenticated && (previous.user?.id !== session.user?.id || previous.workspace?.id !== session.workspace?.id || previous.worker?.id !== session.worker?.id)) {
-    // A session check from any caller must invalidate old workspace requests.
-    state.sessionGeneration += 1; resetWorkspaceView();
+  if (previous?.authenticated && (previous.user?.id !== session.user?.id || previous.company?.id !== session.company?.id || previous.worker?.id !== session.worker?.id || previous.target_user_id !== session.target_user_id)) {
+    // A session check from any caller must invalidate old company requests.
+    state.sessionGeneration += 1; resetCompanyView();
   }
-  state.session = session; $("login-screen").hidden = true; $("app").hidden = false;
+  state.session = session;
+  state.companyContext = session.user?.is_devadmin ? session.company?.id || null : null;
+  state.userContext = session.user?.is_devadmin ? session.target_user_id || null : null;
+  $("login-screen").hidden = true; $("app").hidden = false;
   renderSession(); setConnection(true); return true;
 }
 async function loadSession() {
@@ -92,35 +107,39 @@ async function loadSession() {
 function renderSession() {
   const worker = state.session?.worker;
   const user = state.session?.user;
-  const workspace = state.session?.workspace;
-  const memberships = state.session?.memberships || [];
+  const company = state.session?.company;
   const model = getModel();
   $("user-name").textContent = personName(user);
-  $("user-name").title = user?.username ? `@${user.username}` : "";
-  $("user-role").textContent = workspace?.role ? humanize(workspace.role) : "";
-  $("workspace-name").textContent = workspace?.name || "No workspace";
-  $("workspace-name").hidden = memberships.length > 1;
-  const picker = $("workspace-picker");
-  const options = memberships.map(item => `<option value="${escapeHtml(item.workspace_id)}">${escapeHtml(item.name)}</option>`).join("");
-  if (picker.dataset.options !== options) { picker.innerHTML = options; picker.dataset.options = options; }
-  picker.value = workspace?.id || ""; picker.hidden = memberships.length <= 1;
-  picker.disabled = state.switchingWorkspace || state.creating || state.running || state.changingMode || state.savingMember;
-  $("member-management").hidden = workspace?.role !== "owner";
-  if (workspace?.role !== "owner") { $("member-management").open = false; clearActivationReceipt(); }
-  $("desktop-owner").textContent = `${personName(user)}’s desktop`;
+  $("user-name").title = user?.email || "";
+  $("user-role").textContent = user?.is_devadmin ? "Platform devadmin" : humanize(company?.role);
+  $("company-name").textContent = company?.name || "No company";
+  $("member-management").hidden = !canManageCompany();
+  if (!canManageCompany()) $("member-management").open = false;
+  if ($("company-form").dataset.companyId !== company?.id) { $("company-setting-name").value = company?.name || ""; $("company-form").dataset.companyId = company?.id || ""; }
+  $("admin-context").hidden = !user?.is_devadmin;
+  const contextBusy = state.switchingCompany || state.creating || state.running || state.changingMode || state.savingMember || state.savingCompany;
+  $("admin-company").disabled = contextBusy;
+  $("admin-user").disabled = contextBusy;
+  $("admin-home").disabled = contextBusy;
+  $("admin-company").value = company?.id || "";
+  $("admin-user").value = state.session?.target_user_id || "";
+  const target = state.members.find(member => String(member.user_id) === String(state.session?.target_user_id));
+  const targetName = target ? personName(target) : state.session?.target_user_id === user?.id ? personName(user) : state.session?.target_user_id ? "Selected person" : "No person selected";
+  $("admin-context-summary").textContent = `${company?.name || "Company"} · ${targetName}. Actions use this company and the selected person’s assigned desktop.`;
+  $("desktop-owner").textContent = user?.is_devadmin ? `${targetName}’s desktop` : `${personName(user)}’s desktop`;
   $("model-label").textContent = model.label;
   $("model-detail-id").textContent = model.label;
   $("jev-detail-id").textContent = state.session?.jev_model || worker?.jev_model || "Not reported";
-  $("worker-identity").textContent = worker?.id || "Desktop provisioning pending";
+  $("worker-identity").textContent = worker?.id || "No desktop assigned";
   $("worker-detail-id").textContent = worker?.id || "Not assigned yet";
-  $("worker-status").textContent = worker ? `Your worker · ${humanize(worker.status)}${worker.mode === "maintenance" ? " · Worker deployment in progress" : ""}` : "No desktop assigned to your account";
+  $("worker-status").textContent = worker ? `Your worker · ${humanize(worker.status)}${worker.mode === "maintenance" ? " · Worker deployment in progress" : ""}` : "No desktop assigned to the selected account";
   $("worker-last-seen").textContent = worker?.last_seen ? `Last seen ${formatTime(worker.last_seen)}` : "";
   $("worker-last-seen").title = worker?.last_seen ? formatDate(worker.last_seen, { second: "2-digit", timeZoneName: "short" }) : "";
   $("fit-view").disabled = !worker; $("fullscreen").disabled = !worker;
   if (!worker) {
     if (state.rfb || state.viewerConnecting || state.viewerWanted) disconnectViewer();
-    setViewerStatus("Provisioning pending", "warn");
-    viewerPlaceholder("Your desktop is not assigned yet", "You can create and browse shared workflows now. Your workspace owner will arrange a desktop before you can run them.", false);
+    setViewerStatus("No desktop assigned", "warn");
+    viewerPlaceholder(user?.is_devadmin && !state.session?.target_user_id ? "Choose a person to view their desktop" : "No desktop assigned to this account", "You can create and browse company workflows now. Desktop assignment is managed separately; choosing a company does not provision a VM.", false);
   }
   renderControl();
 }
@@ -130,7 +149,7 @@ function renderControl() {
   const agent = state.session?.worker?.mode === "agent";
   const canControl = state.session?.worker?.can_control === true;
   const active = hasActiveRun();
-  const disabled = !state.session?.worker?.id || (!human && !agent) || state.changingMode || state.switchingWorkspace || active || (human && !canControl);
+  const disabled = !state.session?.worker?.id || (!human && !agent) || state.changingMode || state.switchingCompany || active || (human && !canControl);
   $("control-mode-label").textContent = maintenance ? "Deployment in progress" : canControl ? "You have control" : "View only";
   $("control-mode-description").textContent = !state.session?.worker ? "Waiting for a desktop to be assigned to you." : maintenance ? "Runs and control will resume after worker deployment." : canControl ? "Return control when you're ready to run a loop." : human ? "Another session of your account controls this desktop." : active ? "The agent is running. Takeover is locked." : "The agent controls your desktop.";
   $("control-mode-icon").textContent = canControl ? "↖" : "◉";
@@ -140,11 +159,11 @@ function renderControl() {
   if (state.rfb) { state.rfb.viewOnly = !human || !canControl || active; state.rfb.focusOnClick = human && canControl && !active; }
   const runButton = $("run-instruction");
   if (runButton) {
-    runButton.disabled = state.switchingWorkspace || state.running || active || !agent || !state.detail?.instruction || state.detail?.status !== "ready" || state.session?.worker?.status !== "online";
+    runButton.disabled = state.switchingCompany || state.running || active || !agent || !state.detail?.instruction || state.detail?.status !== "ready" || state.session?.worker?.status !== "online";
     runButton.textContent = state.running ? "Starting…" : active ? "Run in progress" : getRuns().length ? "Run again ↗" : "Run instruction ↗";
   }
   const hint = $("run-control-hint");
-  if (hint) { hint.textContent = human ? canControl ? "Return control to the agent to run this instruction." : "Your other session must return desktop control before a run can start." : !state.session?.worker?.id ? "Desktop provisioning pending. You can run this shared workflow once a desktop is assigned to you." : state.session?.worker?.status !== "online" ? "Waiting for your assigned worker to come online." : state.detail?.status === "generating" ? "Waiting for the model to generate and save an instruction." : "This shared instruction will run on your own assigned desktop."; }
+  if (hint) { hint.textContent = human ? canControl ? "Return control to the agent to run this instruction." : "Your other session must return desktop control before a run can start." : !state.session?.worker?.id ? "A desktop must be assigned to the selected account before running this workflow." : state.session?.worker?.status !== "online" ? "Waiting for your assigned worker to come online." : state.detail?.status === "generating" ? "Waiting for the model to generate and save an instruction." : "This instruction will run on the assigned desktop shown here."; }
   if (hint && maintenance) hint.textContent = "Worker deployment in progress. Run and control access will resume when deployment completes.";
 }
 
@@ -160,7 +179,7 @@ function renderLoops() {
   if (signature === state.lastListSignature) return;
   state.lastListSignature = signature;
   $("loop-count").textContent = String(state.loops.length);
-  if (!state.loops.length) { $("loop-list").innerHTML = '<p class="list-empty">Shared workflows live here.<br>Create one for your workspace.</p>'; return; }
+  if (!state.loops.length) { $("loop-list").innerHTML = '<p class="list-empty">Shared workflows live here.<br>Create one for your company.</p>'; return; }
   $("loop-list").innerHTML = state.loops.map((loop) => `<button class="loop-list-item ${String(loop.id) === String(state.selectedId) ? "selected" : ""}" data-loop-id="${escapeHtml(loop.id)}" ${String(loop.id) === String(state.selectedId) ? 'aria-current="true"' : ""}><span class="list-title">${escapeHtml(loop.prompt || "Untitled loop")}</span><span class="list-item-meta"><i class="status-dot ${errorStatuses.has(loop.status) ? "error" : activeStatuses.has(loop.status) ? "warn" : ""}"></i>${escapeHtml(humanize(loop.status))}<time title="${escapeHtml(formatDate(loop.created_at, { second: "2-digit" }))}">${escapeHtml(validDate(loop.created_at)?.toLocaleDateString(undefined, { month: "short", day: "numeric" }) || "—")}</time></span></button>`).join("");
   [...$("loop-list").children].forEach((item, index) => {
     const author = document.createElement("span"); author.className = "list-author";
@@ -189,7 +208,7 @@ function renderEvent(event, index, groupKey) {
 }
 function renderRun(run, index, total) {
   const events = Array.isArray(run.events) ? run.events : [];
-  const links = `<p class="workflow-attribution">Started by ${escapeHtml(personName(run.initiator))}${run.worker_id ? ` · Desktop ${escapeHtml(run.worker_id)}` : ""}</p><div class="instruction-actions"><a class="button secondary small" href="/reports/runs/${encodeURIComponent(run.id)}" target="_blank" rel="noopener">Full-page report ↗</a><a class="button quiet small" href="/api/runs/${encodeURIComponent(run.id)}/download">Download evidence ZIP ↓</a></div>`;
+  const links = `<p class="workflow-attribution">Started by ${escapeHtml(personName(run.initiator))}${run.worker_id ? ` · Desktop ${escapeHtml(run.worker_id)}` : ""}</p><div class="instruction-actions"><a class="button secondary small" href="${escapeHtml(scopedURL(`/reports/runs/${encodeURIComponent(run.id)}`))}" target="_blank" rel="noopener">Full-page report ↗</a><a class="button quiet small" href="${escapeHtml(scopedURL(`/api/runs/${encodeURIComponent(run.id)}/download`))}">Download evidence ZIP ↓</a></div>`;
   return `<section class="run-group"><div class="run-summary"><div><span>Run ${total - index}</span><span class="run-id" title="${escapeHtml(run.id)}">${escapeHtml(String(run.id || "").slice(0, 8))}</span>${badge(run.status)}</div><span class="run-duration" data-run-start="${escapeHtml(run.started_at || run.created_at || "")}" data-run-end="${escapeHtml(run.finished_at || "")}" data-run-active="${activeStatuses.has(run.status)}">—</span></div>${links}${events.length ? `<ol class="timeline">${events.map((event, eventIndex) => renderEvent(event, eventIndex, run.id)).join("")}</ol>` : '<p class="no-events">No worker events recorded yet.</p>'}${run.error ? `<div class="inline-error run-error">${escapeHtml(valueText(run.error))}</div>` : ""}</section>`;
 }
 function renderDetail() {
@@ -210,7 +229,7 @@ function renderDetail() {
   $("loop-detail").querySelector(".request-block").append(attribution);
   const requestLinks = document.createElement("div");
   requestLinks.className = "instruction-actions";
-  requestLinks.innerHTML = `<a class="button quiet small" href="/reports/loops/${encodeURIComponent(loop.id)}" target="_blank" rel="noopener">Request & model report ↗</a><a class="button quiet small" href="/api/loops/${encodeURIComponent(loop.id)}/download">Request evidence ZIP ↓</a>`;
+  requestLinks.innerHTML = `<a class="button quiet small" href="${escapeHtml(scopedURL(`/reports/loops/${encodeURIComponent(loop.id)}`))}" target="_blank" rel="noopener">Request & model report ↗</a><a class="button quiet small" href="${escapeHtml(scopedURL(`/api/loops/${encodeURIComponent(loop.id)}/download`))}">Request evidence ZIP ↓</a>`;
   $("loop-detail").querySelector(".instruction-block").append(requestLinks);
   updateDurations(); renderControl();
 }
@@ -238,7 +257,7 @@ function disconnectViewer() {
   $("desktop-canvas").replaceChildren(); setViewerStatus("Disconnected");
 }
 function scheduleViewerReconnect() {
-  if (!state.viewerWanted || !state.session?.authenticated || !state.session?.worker?.id || state.switchingWorkspace || state.signingOut || state.rfb || state.viewerConnecting || state.viewerRetryTimer !== null) return;
+  if (!state.viewerWanted || !state.session?.authenticated || !state.session?.worker?.id || state.switchingCompany || state.signingOut || state.rfb || state.viewerConnecting || state.viewerRetryTimer !== null) return;
   if (state.viewerRetryCount >= viewerRetryDelays.length) {
     setViewerStatus("Disconnected", "warn");
     viewerPlaceholder("Desktop connection unavailable", `${state.viewerFailure} Automatic reconnect stopped after ${viewerRetryDelays.length} attempts. Select Reconnect to try again.`);
@@ -269,7 +288,7 @@ function viewerInterrupted(title, message, retry = true) {
   if (retry) scheduleViewerReconnect();
 }
 async function connectViewer({ manual = false } = {}) {
-  if (state.signingOut || state.switchingWorkspace || !state.session?.worker?.id) return;
+  if (state.signingOut || state.switchingCompany || !state.session?.worker?.id) return;
   if (manual) { state.viewerWanted = true; state.viewerRetryCount = 0; state.viewerFailure = ""; clearViewerTimer("viewerRetryTimer"); }
   if (!state.viewerWanted || !state.session?.authenticated || state.viewerConnecting || state.rfb) return;
   if (document.hidden) { scheduleViewerReconnect(); return; }
@@ -298,7 +317,7 @@ async function connectViewer({ manual = false } = {}) {
     viewerModule ||= import("/vendor/novnc/core/rfb.js");
     const { default: RFB } = await viewerModule;
     if (!current()) return;
-    const url = new URL("/api/desktop", window.location.href); url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = new URL(scopedURL("/api/desktop"), window.location.href); url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const rfb = new RFB($("desktop-canvas"), url.toString(), { shared: true });
     state.rfb = rfb; rfb.viewOnly = state.session?.worker?.mode !== "human" || state.session?.worker?.can_control !== true || hasActiveRun(); rfb.focusOnClick = !rfb.viewOnly; rfb.scaleViewport = state.fit; rfb.resizeSession = false; rfb.background = "#0c100b";
     rfb.addEventListener("connect", () => {
@@ -314,7 +333,7 @@ async function connectViewer({ manual = false } = {}) {
     });
     rfb.addEventListener("disconnect", () => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop connection interrupted", "The viewer connection closed. Your saved loops are still available."); });
     rfb.addEventListener("securityfailure", (event) => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop access failed", event.detail?.reason || "The desktop gateway could not authenticate this connection. Select Reconnect after access is restored.", false); });
-    rfb.addEventListener("credentialsrequired", () => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop authentication required", "The desktop gateway needs server-side credentials. Workspace credentials are never sent to the desktop.", false); });
+    rfb.addEventListener("credentialsrequired", () => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop authentication required", "The desktop gateway needs server-side credentials. Company credentials are never sent to the desktop.", false); });
   } catch (error) {
     if (!current()) return;
     viewerModule = null;
@@ -323,7 +342,7 @@ async function connectViewer({ manual = false } = {}) {
 }
 
 async function refresh() {
-  if (state.pollBusy || state.creating || state.signingOut || state.switchingWorkspace || document.hidden || !state.session?.authenticated) return;
+  if (state.pollBusy || state.creating || state.signingOut || state.switchingCompany || document.hidden || !state.session?.authenticated) return;
   state.pollBusy = true;
   try {
     if (!await loadSession()) return;
@@ -338,137 +357,212 @@ async function boot() {
     if (!await loadSession()) return;
     if (generation !== state.sessionGeneration) return;
     void connectViewer({ manual: true });
-    await loadLoops();
+    await Promise.all([loadLoops(), loadAdminCompanies()]);
+    if (canManageCompany()) await loadMembers();
     if (state.loops.length) await selectLoop(state.loops[0].id);
   } catch (error) { if (!state.session) { $("login-error").textContent = `Unable to connect: ${error.message}`; $("login-error").hidden = false; } else notice(error.message, true); }
 }
 
-$("login-form").addEventListener("submit", async (event) => {
-  // Discard any unauthenticated session response started before this sign-in.
-  state.sessionGeneration += 1;
-  event.preventDefault(); $("login-submit").disabled = true; $("login-submit").textContent = "Opening workspace…"; $("login-error").hidden = true;
-  try { await api("/api/login", { method: "POST", body: JSON.stringify({ username: $("username").value.trim(), password: $("password").value }) }); $("password").value = ""; await boot(); }
-  catch (error) { $("login-error").textContent = error.message; $("login-error").hidden = false; }
-  finally { $("login-submit").disabled = false; $("login-submit").innerHTML = '<span>Open workspace</span><span aria-hidden="true">↗</span>'; }
-});
-function showActivation(active) {
-  $("login-form").hidden = active; $("activation-form").hidden = !active;
-  $("toggle-activation").textContent = active ? "Already activated? Sign in" : "Have an activation code?";
-  $("login-error").hidden = true; $("activation-error").hidden = true;
-  if (!active) {
-    $("activation-form").reset(); state.inspectedToken = null;
-    $("activation-account").hidden = true; $("activation-submit").disabled = true;
+const eyeIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>';
+for (const button of document.querySelectorAll("[data-password-toggle]")) {
+  button.innerHTML = eyeIcon;
+  button.addEventListener("click", () => {
+    const input = $(button.dataset.passwordToggle), reveal = input.type === "password";
+    input.type = reveal ? "text" : "password";
+    button.setAttribute("aria-pressed", String(reveal));
+    button.setAttribute("aria-label", button.getAttribute("aria-label").replace(reveal ? "Show" : "Hide", reveal ? "Hide" : "Show"));
+  });
+}
+function authMessage(message, isError = false) {
+  $("auth-message").textContent = message; $("auth-message").hidden = !message; $("auth-message").classList.toggle("error", isError);
+}
+function deliveryMessage(result) {
+  const message = result?.message || "Request received.";
+  if (result?.email_delivery === "local" && !/captured locally/i.test(message)) return `${message} Email was captured locally for development; it was not sent to your inbox. Ask the operator for the local message.`;
+  if (result?.email_delivery === "unavailable" && !/unavailable|not configured|not sent/i.test(message)) return `${message} Email delivery is unavailable. Contact your operator to configure the email provider, then request a new link.`;
+  return message;
+}
+function showAuth(view, message = "") {
+  state.authView = view; $("login-screen").dataset.authView = view;
+  for (const name of ["login", "signup", "forgot", "resend", "reset"]) {
+    $(`${name}-form`).hidden = name !== view;
+    $(`${name}-error`).hidden = true;
   }
+  authMessage(message);
+  if (view === "signup" && $("signup-role").value === "user") void loadPublicCompanies();
 }
-$("toggle-activation").addEventListener("click", () => { if (!state.activationBusy) showActivation($("activation-form").hidden); });
-$("activation-token").addEventListener("input", () => {
-  state.inspectedToken = null; $("activation-account").hidden = true; $("activation-submit").disabled = true;
+for (const button of document.querySelectorAll("[data-auth-view]")) button.addEventListener("click", () => {
+  if (state.authBusy) return;
+  const email = $("email").value.trim() || $("signup-email").value.trim();
+  if (email && ["forgot", "resend"].includes(button.dataset.authView)) $(`${button.dataset.authView}-email`).value = email;
+  showAuth(button.dataset.authView);
 });
-async function inspectActivation() {
-  const token = $("activation-token").value.trim();
-  if (!token || state.activationBusy) return;
-  state.activationBusy = true; $("inspect-activation").disabled = true; $("activation-error").hidden = true;
-  state.inspectedToken = null; $("activation-submit").disabled = true;
-  try {
-    const result = await api("/api/activate/inspect", { method: "POST", body: JSON.stringify({ token }) });
-    if (token !== $("activation-token").value.trim()) return;
-    state.inspectedToken = token;
-    $("activation-account").textContent = `Activate ${personName(result.user)} (@${result.user.username}) in ${(result.workspaces || []).map(item => item.name).join(", ")}. Code expires ${formatDate(result.expires_at)}.`;
-    $("activation-account").hidden = false; $("activation-submit").disabled = false;
-  } catch (error) { $("activation-error").textContent = error.message; $("activation-error").hidden = false; }
-  finally { state.activationBusy = false; $("inspect-activation").disabled = false; }
+async function submitAuth(name, action) {
+  if (state.authBusy) return;
+  state.authBusy = true;
+  const button = $(`${name}-submit`), label = button.innerHTML;
+  button.disabled = true; button.textContent = "Please wait…"; $(`${name}-error`).hidden = true; authMessage("");
+  try { await action(); }
+  catch (error) { $(`${name}-error`).textContent = error.message; $(`${name}-error`).hidden = false; }
+  finally { state.authBusy = false; button.disabled = false; button.innerHTML = label; }
 }
-$("inspect-activation").addEventListener("click", inspectActivation);
-$("activation-form").addEventListener("submit", async (event) => {
-  event.preventDefault(); if (state.activationBusy) return;
-  const token = $("activation-token").value.trim(), password = $("activation-password").value;
-  if (!token || token !== state.inspectedToken) { $("activation-error").textContent = "Review the account for this code before activating."; $("activation-error").hidden = false; return; }
-  if (password !== $("activation-confirm").value) { $("activation-error").textContent = "The passwords do not match."; $("activation-error").hidden = false; return; }
-  state.activationBusy = true; state.sessionGeneration += 1;
-  $("activation-submit").disabled = true; $("activation-submit").textContent = "Activating…"; $("activation-error").hidden = true;
+async function loadPublicCompanies() {
+  const picker = $("signup-company"), selected = picker.value;
   try {
-    await api("/api/activate", { method: "POST", body: JSON.stringify({ token, password }) });
-    showActivation(false); await boot();
-  } catch (error) { $("activation-error").textContent = error.message; $("activation-error").hidden = false; }
-  finally { state.activationBusy = false; $("activation-submit").disabled = !state.inspectedToken; $("activation-submit").textContent = "Activate account ↗"; }
+    const result = await api("/api/companies");
+    picker.innerHTML = '<option value="">Choose your company</option>' + (result.companies || []).map(company => `<option value="${escapeHtml(company.id)}">${escapeHtml(company.name)}</option>`).join("");
+    if (selected) picker.value = selected;
+    if (!(result.companies || []).length) picker.innerHTML = '<option value="">No companies available yet</option>';
+  } catch (error) { if ($("signup-role").value !== "user") return; picker.innerHTML = '<option value="">Companies unavailable — try again</option>'; $("signup-error").textContent = `Could not load companies: ${error.message}`; $("signup-error").hidden = false; }
+}
+function updateSignupRole() {
+  const admin = $("signup-role").value === "company_admin";
+  $("join-company-fields").hidden = admin; $("new-company-fields").hidden = !admin;
+  $("signup-company").disabled = admin; $("signup-company").required = !admin;
+  $("signup-company-name").disabled = !admin; $("signup-company-name").required = admin;
+  $("signup-company-password").minLength = admin ? 12 : 1;
+  $("signup-company-password").autocomplete = admin ? "new-password" : "off";
+  $("company-password-label").textContent = admin ? "Set a company password" : "Company password";
+  $("company-password-help").textContent = admin ? "Use a separate password of at least 12 characters. Share it with people who should join your new company. Each person signs in with their own personal password." : "Ask your company admin for this password. It is only used when joining; you sign in with your personal password.";
+}
+$("signup-role").addEventListener("change", () => { updateSignupRole(); $("signup-error").hidden = true; if ($("signup-role").value === "user") void loadPublicCompanies(); });
+$("login-form").addEventListener("submit", event => {
+  event.preventDefault();
+  void submitAuth("login", async () => {
+    state.sessionGeneration += 1;
+    await api("/api/login", { method: "POST", body: JSON.stringify({ email: $("email").value.trim(), password: $("password").value }) });
+    $("password").value = ""; await boot();
+  });
 });
-$("workspace-picker").addEventListener("change", async () => {
-  const workspaceId = $("workspace-picker").value;
-  if (state.switchingWorkspace || state.creating || state.running || state.changingMode || state.savingMember || workspaceId === state.session?.workspace?.id) { renderSession(); return; }
-  state.switchingWorkspace = true; state.sessionGeneration += 1; resetWorkspaceView(); renderSession();
-  $("create-loop").disabled = true;
+$("signup-form").addEventListener("submit", event => {
+  event.preventDefault();
+  void submitAuth("signup", async () => {
+    const role = $("signup-role").value;
+    const email = $("signup-email").value.trim();
+    const body = { email, display_name: $("signup-name").value.trim(), password: $("signup-password").value, role, company_password: $("signup-company-password").value, ...(role === "company_admin" ? { company_name: $("signup-company-name").value.trim() } : { company_id: $("signup-company").value }) };
+    const result = await api("/api/signup", { method: "POST", body: JSON.stringify(body) });
+    $("signup-form").reset(); updateSignupRole(); $("email").value = email; $("resend-email").value = email;
+    showAuth("login", deliveryMessage(result));
+  });
+});
+for (const [name, path] of [["forgot", "/api/forgot-password"], ["resend", "/api/resend-verification"]]) {
+  $(`${name}-form`).addEventListener("submit", event => {
+    event.preventDefault();
+    void submitAuth(name, async () => {
+      const result = await api(path, { method: "POST", body: JSON.stringify({ email: $(`${name}-email`).value.trim() }) });
+      authMessage(deliveryMessage(result));
+    });
+  });
+}
+$("reset-form").addEventListener("submit", event => {
+  event.preventDefault();
+  void submitAuth("reset", async () => {
+    if (!state.resetToken) throw new Error("This reset link is missing or has already been used. Request another link.");
+    const result = await api("/api/reset-password", { method: "POST", body: JSON.stringify({ token: state.resetToken, password: $("reset-password").value }) });
+    state.resetToken = null; $("reset-form").reset(); showAuth("login", result.message || "Your password was updated. Sign in with your new password.");
+  });
+});
+async function loadAdminCompanies() {
+  if (!state.session?.user?.is_devadmin) return;
+  const generation = state.sessionGeneration;
+  const result = await api("/api/admin/companies");
+  if (generation !== state.sessionGeneration) return;
+  state.companies = result.companies || [];
+  $("admin-company").innerHTML = state.companies.map(company => `<option value="${escapeHtml(company.id)}">${escapeHtml(company.name)}</option>`).join("");
+  renderSession();
+}
+async function switchContext(companyId, userId) {
+  if (!state.session?.user?.is_devadmin || state.switchingCompany || state.creating || state.running || state.changingMode || state.savingMember || state.savingCompany) { renderSession(); return; }
+  const previous = { companyId: state.companyContext, userId: state.userContext };
+  state.switchingCompany = true; state.sessionGeneration += 1; resetCompanyView();
+  state.companyContext = companyId; state.userContext = userId || null;
+  $("create-loop").disabled = true; renderSession();
   try {
-    await api("/api/session/workspace", { method: "POST", body: JSON.stringify({ workspace_id: workspaceId }) });
-    state.session = null; await boot();
-  } catch (error) { if (error.status !== 401) notice(`Could not switch workspace: ${error.message}`, true); }
-  finally {
-    state.switchingWorkspace = false; $("create-loop").disabled = false;
+    if (!await loadSession()) return;
+    await Promise.all([loadLoops(), loadMembers()]);
+  } catch (error) {
+    state.companyContext = previous.companyId; state.userContext = previous.userId;
+    if (state.session) {
+      try { await loadSession(); await Promise.all([loadLoops(), loadMembers()]); } catch { /* Keep the desktop closed when recovery fails. */ }
+      notice(`Could not change administration context: ${error.message}`, true);
+    }
+  } finally {
+    state.switchingCompany = false; $("create-loop").disabled = false;
     if (state.session) { renderSession(); void connectViewer({ manual: true }); }
   }
-});
+}
+$("admin-company").addEventListener("change", () => void switchContext($("admin-company").value, null));
+$("admin-user").addEventListener("change", () => void switchContext(state.session?.company?.id, $("admin-user").value));
+$("admin-home").addEventListener("click", () => void switchContext(state.session?.home_company_id, state.session?.user?.id));
 async function loadMembers() {
-  if (state.session?.workspace?.role !== "owner") return;
+  if (!canManageCompany()) return;
   const generation = state.sessionGeneration;
   try {
-    const response = await api("/api/memberships");
+    const response = await api("/api/company/users");
     if (generation !== state.sessionGeneration) return;
-    state.members = response.members || []; renderMembers();
+    state.members = response.users || []; renderMembers();
+    $("admin-user").innerHTML = '<option value="">Choose a person</option>' + state.members.map(member => `<option value="${escapeHtml(member.user_id)}">${escapeHtml(personName(member))} · ${escapeHtml(member.email)}${member.worker ? "" : " · no desktop"}</option>`).join("");
+    renderSession();
   } catch (error) { if (generation === state.sessionGeneration && error.status !== 401) { $("member-error").textContent = error.message; $("member-error").hidden = false; } }
 }
 function renderMembers() {
   $("member-count").textContent = `${state.members.length} ${state.members.length === 1 ? "person" : "people"}`;
-  $("member-list").innerHTML = state.members.length ? `<div class="member-table-wrap"><table class="member-table"><thead><tr><th>Person</th><th>Membership</th><th>Personal desktop</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${state.members.map(member => `<tr><td><strong>${escapeHtml(personName(member))}</strong><span>@${escapeHtml(member.username)}${member.user_id === state.session?.user?.id ? " · You" : ""}</span></td><td>${escapeHtml(humanize(member.role))}<span>${escapeHtml(humanize(member.status))}</span></td><td>${member.worker ? `${escapeHtml(member.worker.id)}<span>${escapeHtml(humanize(member.worker.status))}</span>` : '<span>Provisioning pending</span>'}</td><td>${member.user_id !== state.session?.user?.id && member.role !== "owner" ? `<button type="button" class="button quiet small" data-membership-user="${escapeHtml(member.user_id)}" data-membership-active="${member.status === "revoked"}" ${state.savingMember ? "disabled" : ""}>${member.status === "revoked" ? "Restore access" : "Revoke access"}</button>` : ""}</td></tr>`).join("")}</tbody></table></div>` : '<p class="members-note">No members returned.</p>';
+  $("member-list").innerHTML = state.members.length ? `<div class="member-table-wrap"><table class="member-table"><thead><tr><th>Person</th><th>Role / access</th><th>Personal desktop</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${state.members.map(member => {
+    const self = String(member.user_id) === String(state.session?.user?.id), disabled = member.status === "disabled", frozen = state.savingMember || state.switchingCompany;
+    return `<tr><td><strong>${escapeHtml(personName(member))}</strong><span>${escapeHtml(member.email)}${self ? " · You" : ""}</span></td><td>${self ? escapeHtml(humanize(member.role)) : `<select class="member-role" data-role-user="${escapeHtml(member.user_id)}" aria-label="Role for ${escapeHtml(personName(member))}" ${frozen ? "disabled" : ""}><option value="user" ${member.role === "user" ? "selected" : ""}>User</option><option value="company_admin" ${member.role === "company_admin" ? "selected" : ""}>Company admin</option></select>`}<span>${escapeHtml(member.status === "pending" ? "Email verification pending" : humanize(member.status))}</span></td><td>${member.worker ? `${escapeHtml(member.worker.id)}<span>${escapeHtml(humanize(member.worker.status))}</span>` : '<span>No desktop assigned</span>'}</td><td>${!self ? `<button type="button" class="button quiet small" data-member-user="${escapeHtml(member.user_id)}" data-member-active="${disabled}" ${frozen ? "disabled" : ""}>${disabled ? "Restore access" : "Disable access"}</button>` : ""}</td></tr>`;
+  }).join("")}</tbody></table></div>` : '<p class="members-note">No people returned.</p>';
 }
 $("member-management").addEventListener("toggle", () => { if ($("member-management").open) void loadMembers(); });
-$("member-form").addEventListener("submit", async (event) => {
-  event.preventDefault(); if (state.savingMember || state.switchingWorkspace || !$("activation-receipt").hidden) return;
-  state.savingMember = true; $("create-member").disabled = true; $("member-error").hidden = true; renderSession();
-  const generation = state.sessionGeneration;
-  try {
-    const result = await api("/api/memberships", { method: "POST", body: JSON.stringify({ username: $("member-username").value.trim(), display_name: $("member-display-name").value.trim() }) });
-    if (generation !== state.sessionGeneration) return;
-    $("member-form").reset(); clearActivationReceipt();
-    if (result.activation_token) {
-      $("activation-receipt-title").textContent = `Activation for ${personName(result.member)}`;
-      $("member-activation-code").value = result.activation_token;
-      $("activation-expiry").textContent = `Expires ${formatDate(result.activation_expires_at)}. Open this site and choose “Have an activation code?” to use it.`;
-      $("copy-activation").textContent = "Copy code"; $("activation-receipt").hidden = false;
-    } else notice("Membership added. This person can sign in with their existing username and password.");
-    await loadMembers();
-  } catch (error) { if (generation === state.sessionGeneration && error.status !== 401) { $("member-error").textContent = error.message; $("member-error").hidden = false; } }
-  finally { if (generation === state.sessionGeneration) { state.savingMember = false; $("create-member").disabled = !$("activation-receipt").hidden; if (state.session) { renderSession(); renderMembers(); } } }
-});
-$("member-list").addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-membership-user]");
-  if (!button || state.savingMember || state.switchingWorkspace) return;
+async function updateMember(userId, body) {
+  if (state.savingMember || state.switchingCompany || String(userId) === String(state.session?.user?.id)) return;
   state.savingMember = true; $("member-error").hidden = true; renderMembers(); renderSession();
   const generation = state.sessionGeneration;
   try {
-    await api(`/api/memberships/${encodeURIComponent(button.dataset.membershipUser)}`, { method: "PATCH", body: JSON.stringify({ active: button.dataset.membershipActive === "true" }) });
-    if (generation === state.sessionGeneration) await loadMembers();
+    await api(`/api/company/users/${encodeURIComponent(userId)}`, { method: "PATCH", body: JSON.stringify(body) });
+    if (generation === state.sessionGeneration) {
+      if (body.active === false && String(userId) === String(state.userContext)) { state.userContext = null; disconnectViewer(); }
+      await loadSession(); await loadMembers();
+    }
   } catch (error) { if (generation === state.sessionGeneration && error.status !== 401) { $("member-error").textContent = error.message; $("member-error").hidden = false; } }
   finally { if (generation === state.sessionGeneration) { state.savingMember = false; if (state.session) { renderMembers(); renderSession(); } } }
+}
+$("member-list").addEventListener("click", event => {
+  const button = event.target.closest("[data-member-user]");
+  if (button) void updateMember(button.dataset.memberUser, { active: button.dataset.memberActive === "true" });
 });
-$("copy-activation").addEventListener("click", async () => {
-  try { await navigator.clipboard.writeText($("member-activation-code").value); $("copy-activation").textContent = "Copied"; }
-  catch { $("member-activation-code").focus(); $("member-activation-code").select(); $("copy-activation").textContent = "Select and copy"; }
+$("member-list").addEventListener("change", event => {
+  const picker = event.target.closest("[data-role-user]");
+  if (picker) void updateMember(picker.dataset.roleUser, { role: picker.value });
 });
-$("dismiss-activation").addEventListener("click", clearActivationReceipt);
+$("company-form").addEventListener("submit", async event => {
+  event.preventDefault(); if (state.savingCompany || state.switchingCompany) return;
+  state.savingCompany = true; $("save-company").disabled = true; $("company-error").hidden = true; renderSession();
+  const generation = state.sessionGeneration;
+  try {
+    const body = { name: $("company-setting-name").value.trim(), current_password: $("company-current-password").value };
+    if ($("company-setting-password").value) body.company_password = $("company-setting-password").value;
+    await api("/api/company", { method: "PATCH", body: JSON.stringify(body) });
+    if (generation !== state.sessionGeneration) return;
+    $("company-current-password").value = ""; $("company-setting-password").value = ""; delete $("company-form").dataset.companyId;
+    await loadSession(); await loadAdminCompanies(); notice("Company settings saved. Existing members and their personal passwords are unchanged.");
+  } catch (error) { if (generation === state.sessionGeneration && error.status !== 401) { $("company-error").textContent = error.message; $("company-error").hidden = false; } }
+  finally { if (generation === state.sessionGeneration) { state.savingCompany = false; $("save-company").disabled = false; if (state.session) renderSession(); } }
+});
 $("logout").addEventListener("click", async () => {
   if (state.signingOut) return;
   state.signingOut = true;
   state.sessionGeneration += 1; disconnectViewer();
-  viewerPlaceholder("Desktop disconnected", "Signing out of this workspace…", false);
+  viewerPlaceholder("Desktop disconnected", "Signing out of this company…", false);
   try { await api("/api/logout", { method: "POST" }); state.session = null; state.detail = null; state.loops = []; state.selectedId = null; state.lastListSignature = ""; state.lastDetailSignature = ""; showLogin(); $("login-error").hidden = true; }
   catch (error) { notice(`Sign out failed: ${error.message}`, true); viewerPlaceholder("Desktop disconnected", "Select Reconnect to resume viewing if you stay signed in."); }
   finally { state.signingOut = false; }
 });
 $("compose-form").addEventListener("submit", async (event) => {
-  event.preventDefault(); const prompt = $("prompt").value.trim(); if (!prompt || state.creating || state.switchingWorkspace) return;
+  event.preventDefault(); const prompt = $("prompt").value.trim(); if (!prompt || state.creating || state.switchingCompany) return;
   const generation = state.sessionGeneration;
   state.creating = true; $("create-loop").disabled = true; $("create-loop").textContent = "Generating…"; $("prompt").disabled = true; $("page-notice").hidden = true;
   const previousDetail = state.detail; state.detail = null; state.selectedId = null; state.lastDetailSignature = ""; renderLoops();
-  $("loop-detail").innerHTML = '<div class="pending-panel" role="status"><span class="spinner" aria-hidden="true"></span><h2>Turning intent into instruction</h2><p>Waiting for the language model. The returned instruction will be saved to your workspace.</p></div>';
+  $("loop-detail").innerHTML = '<div class="pending-panel" role="status"><span class="spinner" aria-hidden="true"></span><h2>Turning intent into instruction</h2><p>Waiting for the language model. The returned instruction will be saved to your company.</p></div>';
   try {
     const loop = await api("/api/loops", { method: "POST", body: JSON.stringify({ prompt }) });
     if (generation !== state.sessionGeneration) return;
@@ -480,7 +574,7 @@ $("compose-form").addEventListener("submit", async (event) => {
 $("loop-list").addEventListener("click", (event) => { const item = event.target.closest("[data-loop-id]"); if (item && !state.creating) selectLoop(item.dataset.loopId); });
 $("loop-detail").addEventListener("click", async (event) => {
   if (event.target.closest("#reuse-request")) { $("prompt").value = state.detail?.prompt || ""; $("prompt").focus(); $("compose-panel").scrollIntoView({ behavior: "smooth", block: "nearest" }); return; }
-  if (!event.target.closest("#run-instruction") || state.switchingWorkspace || state.running || hasActiveRun() || state.session?.worker?.mode !== "agent" || state.session?.worker?.status !== "online" || !state.detail?.instruction) return;
+  if (!event.target.closest("#run-instruction") || state.switchingCompany || state.running || hasActiveRun() || state.session?.worker?.mode !== "agent" || state.session?.worker?.status !== "online" || !state.detail?.instruction) return;
   const id = state.detail.id, generation = state.sessionGeneration; state.running = true; renderControl(); $("page-notice").hidden = true;
   try { await api(`/api/loops/${encodeURIComponent(id)}/runs`, { method: "POST" }); if (generation === state.sessionGeneration) await Promise.all([loadDetail(id), loadLoops(), loadSession()]); }
   catch (error) { if (generation === state.sessionGeneration && error.status !== 401) notice(`Couldn't start this run: ${error.message}`, true); }
@@ -488,7 +582,7 @@ $("loop-detail").addEventListener("click", async (event) => {
 });
 $("new-loop").addEventListener("click", () => { $("prompt").value = samplePrompt; $("prompt").focus(); $("prompt").select(); $("compose-panel").scrollIntoView({ behavior: "smooth", block: "nearest" }); });
 $("toggle-control").addEventListener("click", async () => {
-  if (state.changingMode || state.switchingWorkspace || !["agent", "human"].includes(state.session?.worker?.mode)) return;
+  if (state.changingMode || state.switchingCompany || !["agent", "human"].includes(state.session?.worker?.mode)) return;
   const generation = state.sessionGeneration;
   state.changingMode = true; renderControl();
   try { await api("/api/worker/mode", { method: "POST", body: JSON.stringify({ mode: state.session?.worker?.mode === "human" ? "agent" : "human" }) }); if (generation === state.sessionGeneration) await loadSession(); }
@@ -515,8 +609,21 @@ document.addEventListener("keydown", (event) => { if (event.key.toLowerCase() ==
 window.addEventListener("beforeunload", disconnectViewer);
 setInterval(refresh, 2000);
 setInterval(updateDurations, 1000);
-const activationFragment = new URLSearchParams(location.hash.slice(1)).get("activate");
-if (activationFragment) {
+function handleAuthFragment() {
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  const verificationToken = fragment.get("verify"), resetToken = fragment.get("reset");
+  if (!verificationToken && !resetToken) return false;
   history.replaceState(null, "", location.pathname + location.search);
-  showActivation(true); $("activation-token").value = activationFragment; void inspectActivation();
-} else boot();
+  showLogin(); state.resetToken = resetToken;
+  if (resetToken) { state.authBusy = false; showAuth("reset"); return true; }
+  showAuth("login", "Verifying your email…");
+  const generation = state.sessionGeneration;
+  state.authBusy = true; $("login-submit").disabled = true;
+  api("/api/verify-email", { method: "POST", body: JSON.stringify({ token: verificationToken }) })
+    .then(result => { if (generation === state.sessionGeneration) showAuth("login", result.message || "Your email is verified. Sign in to continue."); })
+    .catch(error => { if (generation === state.sessionGeneration) { showAuth("resend"); authMessage(error.message, true); } })
+    .finally(() => { if (generation === state.sessionGeneration) { state.authBusy = false; $("login-submit").disabled = false; } });
+  return true;
+}
+window.addEventListener("hashchange", handleAuthFragment);
+if (!handleAuthFragment()) boot();

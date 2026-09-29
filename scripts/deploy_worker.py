@@ -1,7 +1,7 @@
-"""Deploy an allowlisted revision only to the recorded member's Fleet desktop.
+"""Deploy an allowlisted revision only to the recorded user's Fleet desktop.
 
 Normal updates reuse the guest's dedicated credentials. Initial --configure
-reads only that member's delivery credential and the authorized local Jev key.
+reads only that user's delivery credential and the authorized local Jev key.
 The guest service never receives Fleet credentials or OpenAI credentials.
 """
 import argparse
@@ -36,7 +36,7 @@ def read_env(path):
     return env
 env = read_env(env_path)
 if env.get('CTRLLOOP_API_URL') != target['api_url'] or env.get('CTRLLOOP_WORKER_ID') != target['id'] or env.get('CTRLLOOP_ENVIRONMENT') != target['environment']:
-    raise SystemExit('Guest configuration differs from the explicit member assignment')
+    raise SystemExit('Guest configuration differs from the explicit user assignment')
 if phase == 'begin' and env_path != active_path and active_path.exists():
     prior = read_env(active_path)
     previous_origin = sys.argv[4] if len(sys.argv)>4 else target['api_url']
@@ -45,13 +45,14 @@ if phase == 'begin' and env_path != active_path and active_path.exists():
         or prior.get('CTRLLOOP_ENVIRONMENT', target['environment']) != target['environment']
         or not hmac.compare_digest(prior.get('WORKER_TOKEN', ''), env['WORKER_TOKEN'])):
         raise SystemExit('Refusing to replace credentials for a different existing worker')
-payload = {'phase':phase, 'expected_worker_id':target['id'], 'environment':target['environment']}
+payload = {'phase':phase, 'expected_worker_id':target['id'], 'environment':target['environment'], 'company_id':target['company_id'], 'assigned_user_id':target['assigned_user_id']}
 request = urllib.request.Request(env['CTRLLOOP_API_URL']+'/api/worker/deployment',data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+env['WORKER_TOKEN'],'Content-Type':'application/json'})
 try:
     with urllib.request.urlopen(request,timeout=30) as response: result=json.load(response)
 except urllib.error.HTTPError as error:
     raise SystemExit('Deployment authorization refused with HTTP '+str(error.code)) from None
-if result.get('worker_id')!=target['id'] or result.get('environment')!=target['environment']:
+if (result.get('worker_id')!=target['id'] or result.get('environment')!=target['environment']
+        or result.get('company_id')!=target['company_id'] or result.get('assigned_user_id')!=target['assigned_user_id']):
     raise SystemExit('Server assignment mismatch; inspect maintenance state')
 print('Worker deployment phase: '+phase)
 '''
@@ -82,7 +83,7 @@ async def main(args):
     if args.previous_api_url and not args.configure:
         raise ValueError('--previous-api-url requires --configure')
     load_dotenv(args.fleet_env,interpolate=False)
-    config,target,local,reference=load_target(args.environment,args.member)
+    config,target,local,reference=load_target(args.environment,args.email)
     if args.previous_api_url:
         previous = urlsplit(args.previous_api_url)
         if (previous.scheme != 'https' or not previous.hostname or previous.path not in ('', '/')
@@ -94,7 +95,7 @@ async def main(args):
     revision,archive=bundle(args.source_ref)
     remote=f'/home/omarchy/ctrlloop-dev/releases/{revision}'
     async with Sandbox.from_dict(reference) as sandbox:
-        if sandbox.name!=target['id']:raise RuntimeError('Refusing a sandbox outside the recorded member assignment')
+        if sandbox.name!=target['id']:raise RuntimeError('Refusing a sandbox outside the recorded user assignment')
         if args.status:
             r=await sandbox.shell.run('systemctl --user show ctrlloop-worker -p ActiveState -p SubState -p MainPID -p ExecMainStatus -p FragmentPath')
             print(r.stdout);return
@@ -125,7 +126,8 @@ uv sync --locked --no-dev --python 3.12
         if args.configure:
             if not args.jev_env:raise ValueError('--configure requires --jev-env')
             private=json.loads((local/'credentials.json').read_text())
-            if private['worker_id']!=target['id'] or private['environment']!=args.environment:
+            if (private['worker_id']!=target['id'] or private['environment']!=args.environment
+                    or private.get('company_id')!=target['company_id'] or private.get('assigned_user_id')!=target['assigned_user_id']):
                 raise ValueError('Dedicated credentials do not match this worker and environment')
             jev=dotenv_values(args.jev_env,interpolate=False).get('TYPESAFE_API_KEY')
             if not jev:raise RuntimeError('TYPESAFE_API_KEY is missing')
@@ -199,7 +201,7 @@ systemctl --user is-active ctrlloop-worker
         prefix=control+'/deploy'
         runner=f'bash {shlex.quote(control+"/setup.sh")} > {shlex.quote(prefix+".log")} 2>&1; printf "%s" "$?" > {shlex.quote(prefix+".status")}'
         await sandbox.shell.run(runner,background=True)
-        result={'revision':revision,'source_ref':args.source_ref,'environment':args.environment,'member':args.member,'remote':remote,'sandbox':sandbox.name,'deployed_at':datetime.now(timezone.utc).isoformat(),'status':'installing','guest_log':prefix+'.log'}
+        result={'revision':revision,'source_ref':args.source_ref,'environment':args.environment,'email':args.email,'remote':remote,'sandbox':sandbox.name,'deployed_at':datetime.now(timezone.utc).isoformat(),'status':'installing','guest_log':prefix+'.log'}
         save_private(local/'deployment.json',result)
         print(json.dumps(result))
         for _ in range(60):
@@ -220,10 +222,10 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fleet-env',type=Path,required=True)
     parser.add_argument('--environment',choices=('dev','prod'),required=True)
-    parser.add_argument('--member',required=True)
+    parser.add_argument('--email',required=True)
     parser.add_argument('--jev-env',type=Path)
     parser.add_argument('--source-ref',help='Bundle an exact Git commit/ref without changing this checkout')
-    parser.add_argument('--configure',action='store_true',help='Initial administrator setup from dedicated member credential files')
+    parser.add_argument('--configure',action='store_true',help='Initial administrator setup from dedicated user credential files')
     parser.add_argument('--previous-api-url',help='With --configure only: require this exact prior HTTPS origin during an explicit origin migration')
     mode=parser.add_mutually_exclusive_group()
     mode.add_argument('--resume',action='store_true',help='Release maintenance only after inspecting a failed deployment')
