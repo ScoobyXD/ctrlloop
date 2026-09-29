@@ -17,7 +17,7 @@ The configured development site is [CTRL Loop](https://dev.ctrlloop.io). The his
 | Bounded executor | [`src/worker.py`](../src/worker.py): validates the saved instruction and invokes existing window/control rounds with explicit capability limits |
 | Shared selection pipeline | Existing [`src/pipeline.py`](../src/pipeline.py), [`src/selection.py`](../src/selection.py), [`src/jev_questions.py`](../src/jev_questions.py), and [`src/reporting.py`](../src/reporting.py) |
 | Native transport | Existing [`src/driver.py`](../src/driver.py), now supporting either authenticated Fleet transport or VM loopback using the same native schemas |
-| Desktop gateway | [`src/desktop_gateway.py`](../src/desktop_gateway.py): authenticated same-origin WebSocket proxy for the exact configured sandbox, with server-side RFB input filtering |
+| Desktop streaming | [`src/desktop_gateway.py`](../src/desktop_gateway.py) issues short-lived Fleet URLs; [`src/desktop_stream.py`](../src/desktop_stream.py) enforces access and RFB input ownership inside the assigned guest. [Direct Fleet streaming](direct-fleet-streaming.md) keeps frames off the application relay. |
 
 The instruction model is **`gpt-6-luna`**, using the OpenAI Responses API with **`reasoning.effort = high`** and `store = false`. The server refuses a different `OPENAI_MODEL`. Model access was checked separately; [model-access.md](model-access.md) records that check and its scope.
 

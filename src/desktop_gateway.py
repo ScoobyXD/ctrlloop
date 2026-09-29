@@ -1,43 +1,17 @@
-"""Exact-desktop WebSocket gateway with server-enforced RFB input ownership."""
-import asyncio
-from contextlib import suppress
-from itertools import groupby
-import json
-import logging
-import os
-import re
-import time
-from uuid import uuid4
+"""Fleet viewer credentials and the shared RFB input framing contract.
 
-import httpx2
-from starlette.websockets import WebSocketDisconnect
-from websockets.asyncio.client import connect
-from websockets.exceptions import ConnectionClosed, InvalidStatus
+Pixels are relayed only inside the assigned guest (desktop_stream.py).
+"""
+from contextlib import asynccontextmanager
+import asyncio
+import logging
+import re
+from urllib.parse import urlsplit, urlencode
 
 
 logger = logging.getLogger('uvicorn.error.desktop')
-
-
-class FleetToken:
-    def __init__(self):
-        self.value = None
-        self.expiry = 0
-        self.lock = asyncio.Lock()
-
-    async def get(self):
-        async with self.lock:
-            if self.value and self.expiry > time.monotonic() + 60:
-                return self.value
-            async with httpx2.AsyncClient(timeout=20) as client:
-                response = await client.post(
-                    'https://auth.cua.ai/realms/cyclops-cs/protocol/openid-connect/token',
-                    data={'grant_type': 'client_credentials', 'client_id': os.environ['CUA_CLIENT_ID'],
-                          'client_secret': os.environ['CUA_CLIENT_SECRET']})
-                response.raise_for_status()
-                payload = response.json()
-            self.value = payload['access_token']
-            self.expiry = time.monotonic() + payload.get('expires_in', 300)
-            return self.value
+STREAM_PROTOCOL = 'ctrlloop-direct-v1'
+SIGNED_URL_SECONDS = 120
 
 
 class RFBInputFilter:
@@ -116,129 +90,54 @@ class RFBInputFilter:
         return output
 
 
-fleet_token = FleetToken()
+@asynccontextmanager
+async def desktop_connection(worker, environment):
+    """Use Fleet's existing signed-service API; never create/release a claim.
 
+    An issuance failure revokes its URL. Successful URLs expire at Fleet after
+    two minutes; the guest separately enforces ongoing CtrlLoop authorization.
+    """
+    from cua_sandbox import Sandbox
 
-async def proxy_desktop(websocket, can_input, session_valid, *, namespace, sandbox):
-    # Targets come only from the authenticated member's database assignment.
-    if not all(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,199}', value) for value in (namespace, sandbox)):
+    namespace, claim = worker['fleet_namespace'], worker['fleet_claim']
+    if not all(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,199}', value or '')
+               for value in (namespace, claim, worker['id'])):
         raise ValueError('Invalid assigned Fleet desktop')
-    upstream = f'wss://run.cua.ai/api/svc/{namespace}/{sandbox}-vnc/websockify'
-    connection_id, started = uuid4().hex[:12], time.monotonic()
-    parser, remote, first_task = RFBInputFilter(), None, 'connect'
-    close_code, close_reason, cause = 1011, 'Desktop connection interrupted; reconnect', 'connection_error'
-    details = {}
-    metrics = dict(client_messages=0, server_messages=0, protocol_packets=0,
-                   input_packets=0, input_forwarded=0, input_dropped=0,
-                   permission_checks=0, permission_total_ms=0.0, permission_max_ms=0.0,
-                   upstream_bytes=0, downstream_bytes=0)
-    try:
-        token = await asyncio.wait_for(fleet_token.get(), 20)
-        async with connect(upstream, additional_headers={'Authorization': f'Bearer {token}'},
-                           subprotocols=['binary'], max_size=20_000_000,
-                           open_timeout=20, close_timeout=5) as remote:
-            await asyncio.wait_for(websocket.accept(subprotocol='binary' if 'binary' in websocket.scope.get('subprotocols', []) else None), 5)
-            logger.info(json.dumps({'event': 'desktop_connected', 'connection_id': connection_id,
-                                    'connect_ms': round((time.monotonic()-started)*1000, 2)}))
-
-            async def send(packet):
-                await asyncio.wait_for(remote.send(packet), 5)
-                metrics['upstream_bytes'] += len(packet)
-
-            async def inbound():
-                while True:
-                    message = await websocket.receive()
-                    if message['type'] == 'websocket.disconnect':
-                        raise WebSocketDisconnect(message.get('code', 1000))
-                    data = message.get('bytes')
-                    if data is None:
-                        raise ValueError('Binary RFB frames are required')
-                    metrics['client_messages'] += 1
-                    # Protocol/frame requests must never wait on the database.
-                    # Adjacent input packets in one frame share one locked check.
-                    for requires_input, packets in groupby(parser.feed(data), key=lambda packet: packet[1]):
-                        if not requires_input:
-                            for packet, _ in packets:
-                                metrics['protocol_packets'] += 1
-                                await send(packet)
-                            continue
-                        async with asyncio.timeout(5):
-                            before = time.monotonic()
-                            metrics['permission_checks'] += 1
-                            async with can_input() as allowed:
-                                elapsed = (time.monotonic()-before)*1000
-                                metrics['permission_total_ms'] += elapsed
-                                metrics['permission_max_ms'] = max(metrics['permission_max_ms'], elapsed)
-                                for packet, _ in packets:
-                                    metrics['input_packets'] += 1
-                                    if allowed:
-                                        await send(packet)
-                                        metrics['input_forwarded'] += 1
-                                    else:
-                                        metrics['input_dropped'] += 1
-
-            async def outbound():
-                async for message in remote:
-                    if not isinstance(message, bytes):
-                        raise ValueError('Upstream returned a nonbinary RFB frame')
-                    await asyncio.wait_for(websocket.send_bytes(message), 5)
-                    metrics['server_messages'] += 1
-                    metrics['downstream_bytes'] += len(message)
-
-            async def expiry():
-                while await asyncio.wait_for(session_valid(), 5):
-                    await asyncio.sleep(15)
-
-            first_finished = asyncio.get_running_loop().create_future()
-            def finished(task):
-                if not first_finished.done(): first_finished.set_result(task)
-            tasks = [asyncio.create_task(fn(), name=name) for name, fn in
-                     (('browser_input', inbound), ('upstream_frames', outbound), ('session_expiry', expiry))]
-            for task in tasks: task.add_done_callback(finished)
+    reference = {'version': 1, 'provider': 'fleet', 'namespace': namespace,
+                 'pool': namespace, 'claim': claim, 'service': 'vnc'}
+    async with Sandbox.from_dict(reference) as sandbox:
+        if sandbox.name != worker['id']:
+            raise PermissionError('Fleet claim no longer matches the assigned desktop')
+        # Check BEFORE issuing any bearer URL. An old unguarded websockify
+        # bridge must never receive credentials intended for the policy gate.
+        response = await sandbox.services.request('vnc', method='GET', path='/health')
+        response.raise_for_status()
+        health = response.json()
+        expected = {'protocol': STREAM_PROTOCOL, 'worker_id': worker['id'],
+                    'environment': environment, 'company_id': str(worker['company_id']),
+                    'assigned_user_id': str(worker['assigned_user_id'])}
+        if not isinstance(health, dict) or any(health.get(key) != value for key, value in expected.items()):
+            raise PermissionError('The assigned desktop needs the direct streaming worker')
+        signed = await sandbox.services.create_signed_url(
+            'vnc', expires_in_seconds=SIGNED_URL_SECONDS, label='CtrlLoop viewer')
+        try:
+            if (signed.namespace != namespace or signed.claim != claim or signed.sandbox != worker['id']
+                    or signed.service != 'vnc' or signed.revoked_at):
+                raise PermissionError('Fleet returned a different signed service assignment')
+            parsed = urlsplit(signed.url)
+            # Treat Fleet's token as opaque; signed formats may contain dots.
+            match = re.fullmatch(r'/api/signed-svc/([A-Za-z0-9._~-]{20,2048})/', parsed.path)
+            if (parsed.scheme != 'https' or parsed.netloc != 'run.cua.ai' or not match
+                    or parsed.query or parsed.fragment):
+                raise ValueError('Unexpected Fleet signed service origin or path')
+            credential = match[1]
+            # Fleet strips its routing prefix. Reuse the SAME capability so the
+            # guest can resolve its session binding, instead of minting another.
+            url = 'wss://run.cua.ai' + parsed.path + 'websockify?' + urlencode({'credential': credential})
+            yield signed, credential, url
+        except BaseException:
             try:
-                completed = await first_finished
-                first_task = completed.get_name()
-                details['upstream_close_code'] = remote.close_code
-                completed.result()  # Surface the originating error before peer cancellation.
-                if first_task == 'session_expiry':
-                    cause, close_code, close_reason = 'session_expired', 1008, 'Desktop session expired; sign in again'
-                else:
-                    cause = 'upstream_closed'
-            finally:
-                for task in tasks: task.cancel()
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for task, result in zip(tasks, results):
-                    if task.get_name() != first_task and isinstance(result, Exception):
-                        logger.warning(json.dumps({'event': 'desktop_peer_error', 'connection_id': connection_id,
-                                                   'task': task.get_name(), 'error_type': type(result).__name__}))
-    except WebSocketDisconnect as error:
-        cause, close_code, close_reason = 'browser_disconnected', 1000, 'Desktop viewer closed'
-        details['browser_close_code'] = error.code
-    except asyncio.CancelledError:
-        cause, close_code, close_reason = 'gateway_shutdown', 1001, 'Desktop gateway restarting; reconnect'
-        raise
-    except Exception as error:
-        details['error_type'] = type(error).__name__
-        if isinstance(error, PermissionError):
-            cause, close_code, close_reason = 'access_revoked', 1008, 'Desktop access changed; sign in again'
-        elif isinstance(error, ValueError) and first_task == 'browser_input':
-            cause, close_code, close_reason = 'rfb_protocol_error', 1008, 'Unsupported desktop protocol message'
-            details.update(parser_phase=parser.phase, message_type=parser.message_type,
-                           buffered_bytes=len(parser.pending))
-        elif isinstance(error, ConnectionClosed):
-            cause = 'upstream_connection_closed'
-            details['upstream_close_code'] = error.rcvd.code if error.rcvd else None
-            details['upstream_sent_close_code'] = error.sent.code if error.sent else None
-        elif isinstance(error, InvalidStatus):
-            cause = 'upstream_handshake_rejected'
-            details['upstream_http_status'] = error.response.status_code
-        elif isinstance(error, TimeoutError):
-            cause = 'gateway_operation_timeout'
-    finally:
-        # Never log tokens, packet contents, keys, clipboard text, or raw errors.
-        record = {'event': 'desktop_closed', 'connection_id': connection_id, 'first_task': first_task,
-                  'cause': cause, 'close_code': close_code, 'duration_ms': round((time.monotonic()-started)*1000, 2),
-                  **details, **{key: round(value, 2) if isinstance(value, float) else value for key, value in metrics.items()}}
-        (logger.info if cause == 'browser_disconnected' else logger.warning)(json.dumps(record))
-        with suppress(RuntimeError, OSError, TimeoutError, WebSocketDisconnect):
-            await asyncio.wait_for(websocket.close(code=close_code, reason=close_reason), 5)
+                await asyncio.wait_for(sandbox.services.revoke_signed_url(signed), 5)
+            except Exception as error:
+                logger.warning('desktop credential cleanup failed error=%s', type(error).__name__)
+            raise

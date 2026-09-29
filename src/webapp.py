@@ -1,6 +1,6 @@
 """Company-scoped CTRL Loop API. PostgreSQL is the durable contract."""
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 import io
 import json
@@ -23,8 +23,9 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Literal
 from fastapi.exceptions import RequestValidationError
+from starlette.websockets import WebSocketDisconnect
 
-from .desktop_gateway import proxy_desktop
+from .desktop_gateway import desktop_connection
 from .identity import token_hash, hash_password, check_password, normalize_email
 from .company_migration import migrate_company_schema
 from .account_mail import send_account_mail, delivery_mode
@@ -365,7 +366,7 @@ async def protect(request, call_next):
     response.headers['Cache-Control'] = 'no-store'
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Referrer-Policy'] = 'no-referrer'
-    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'"
+    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' wss://run.cua.ai; frame-ancestors 'none'"
     return response
 
 
@@ -689,6 +690,11 @@ async def session(request: Request):
             if error.status_code == 401: return {'authenticated': False}
             raise
         worker = await assigned_worker(db, identity, required=False)
+        # Company/user selection is part of the viewing authorization. Revoke
+        # old guest connections even when the new target has no desktop yet.
+        await db.execute('''DELETE FROM desktop_connections WHERE session_hash=%s
+            AND (company_id<>%s OR assigned_user_id IS DISTINCT FROM %s)''',
+            (identity['session_hash'], identity['company_id'], identity['target_user_id']))
         queued = None
         if worker:
             await release_expired_control(db, worker['id'])
@@ -1203,49 +1209,130 @@ async def worker_finish(identity: UUID, body: WorkerResult, request: Request):
     return {'ok':True}
 
 
-@app.websocket('/api/desktop')
-async def desktop(websocket: WebSocket):
-    digest=token_hash(websocket.cookies.get('ctrl_session',''))
-    if websocket.headers.get('origin') != os.environ['APP_ORIGIN']:
-        await websocket.close(code=1008);return
+@app.post('/api/desktop/connection')
+async def connect_desktop(request: Request):
     async with database() as db:
-        try: identity = await authorize(websocket, db)
-        except HTTPException: identity = None
-        worker = await assigned_worker(db, identity, required=False) if identity else None
-    if not worker or not worker['fleet_namespace'] or not worker['fleet_claim']:
-        await websocket.close(code=1008);return
-    # A socket is bound to this identity, company and target for its lifetime.
-    # A company switch, reassignment or revocation cannot redirect the socket.
-    async def connection_worker(db):
-        try: current = await authorize(websocket, db)
-        except HTTPException: return None
-        if (current['user_id'] != identity['user_id'] or current['company_id'] != identity['company_id']
-                or current['target_user_id'] != identity['target_user_id']):
-            return None
-        return await (await db.execute('''SELECT * FROM workers WHERE id=%s AND company_id=%s
-            AND assigned_user_id=%s AND fleet_namespace=%s AND fleet_claim=%s AND disabled_at IS NULL FOR SHARE''',
-            (worker['id'],identity['company_id'],identity['target_user_id'],worker['fleet_namespace'],worker['fleet_claim']))).fetchone()
-
-    async def session_valid():
-        async with database() as db: return await connection_worker(db) is not None
-
-    @asynccontextmanager
-    async def can_input():
-        async with database() as db:
-            # Keep the shared ownership lock until input is forwarded. A mode
-            # change or worker claim cannot commit between the check and send.
-            # One round trip on a pooled connection, only for actual input.
-            # PostgreSQL remains authoritative even during overlapping deployments.
-            row = await connection_worker(db)
-            if row is None: raise PermissionError('Desktop assignment is no longer authorized')
-            yield bool(row['mode']=='human'
-                       and row['human_session']==digest and row['active_run'] is None)
-    try: await proxy_desktop(websocket,can_input,session_valid,namespace=worker['fleet_namespace'],sandbox=worker['id'])
+        identity = await authorize(request, db)
+        worker = await assigned_worker(db, identity)
+    try:
+        async with asyncio.timeout(25):
+            async with desktop_connection(worker, os.environ['APP_ENV']) as (signed, credential, url):
+                async with database() as db:
+                    # Fleet calls do not hold database locks. Recheck the exact
+                    # session/assignment after issuance and before publication.
+                    current = await authorize(request, db)
+                    assigned = await assigned_worker(db, current)
+                    keys = ('id', 'company_id', 'assigned_user_id', 'fleet_namespace', 'fleet_claim')
+                    if (current['user_id'] != identity['user_id']
+                            or current['session_hash'] != identity['session_hash']
+                            or any(assigned[key] != worker[key] for key in keys)):
+                        raise HTTPException(409, 'Desktop assignment changed; reconnect')
+                    # A selected company/user change invalidates existing guest
+                    # connections for that session, including already-open WSs.
+                    await db.execute('''DELETE FROM desktop_connections WHERE session_hash=%s
+                        AND (worker_id<>%s OR company_id<>%s OR assigned_user_id<>%s
+                             OR fleet_namespace<>%s OR fleet_claim<>%s)''',
+                        (identity['session_hash'], worker['id'], worker['company_id'], worker['assigned_user_id'],
+                         worker['fleet_namespace'], worker['fleet_claim']))
+                    await db.execute('''DELETE FROM desktop_connections d USING sessions s
+                        WHERE d.session_hash=s.token_hash AND s.expires_at<=now()''')
+                    await db.execute('''INSERT INTO desktop_connections(token_hash,session_hash,worker_id,
+                        company_id,assigned_user_id,fleet_namespace,fleet_claim,admission_expires_at)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s)''',
+                        (token_hash(credential), identity['session_hash'], worker['id'], worker['company_id'],
+                         worker['assigned_user_id'], worker['fleet_namespace'], worker['fleet_claim'], signed.expires_at))
+                return {'url': url, 'expires_at': signed.expires_at}
+    except HTTPException:
+        raise
     except Exception as error:
-        # Record type only: upstream URLs/headers and session tokens are private.
-        logger.warning('desktop connection setup failed error=%s', type(error).__name__)
-        try: await websocket.close(code=1011,reason='Desktop connection unavailable; reconnect to retry')
-        except RuntimeError: pass
+        # SDK and network exceptions may embed credentials. Only record type.
+        logger.warning('desktop credential issuance failed error=%s', type(error).__name__)
+        raise HTTPException(503, 'Desktop connection is unavailable; reconnecting automatically') from None
+
+
+async def desktop_policy_worker(db, websocket, credential_hash, *, admission=False):
+    binding = await (await db.execute('SELECT * FROM desktop_connections WHERE token_hash=%s',
+                                     (credential_hash,))).fetchone()
+    if not binding or (admission and binding['admission_expires_at'] <= datetime.now(timezone.utc)):
+        raise PermissionError('Desktop connection is no longer authorized')
+    identity = await session_identity(db, binding['session_hash'], lock=True)
+    if identity is None:
+        raise PermissionError('Desktop session is no longer authorized')
+    identity = await target_context(db, identity, binding['company_id'], binding['assigned_user_id'])
+    # Match the dedicated worker credential as well as the session's target.
+    # Lock order stays user -> session -> worker, as for normal browser input.
+    worker = await worker_authorize(websocket, db, lock=False)
+    keys = ('company_id', 'assigned_user_id', 'fleet_namespace', 'fleet_claim')
+    if worker['id'] != binding['worker_id'] or any(worker[key] != binding[key] for key in keys):
+        raise PermissionError('Desktop worker assignment changed')
+    worker = await (await db.execute('''SELECT * FROM workers WHERE id=%s AND credential_hash=%s
+        AND company_id=%s AND assigned_user_id=%s AND fleet_namespace=%s AND fleet_claim=%s
+        AND disabled_at IS NULL FOR SHARE''',
+        (worker['id'], worker['credential_hash'], binding['company_id'], binding['assigned_user_id'],
+         binding['fleet_namespace'], binding['fleet_claim']))).fetchone()
+    # Lock the binding last: context changes take the same session/worker locks
+    # and cannot invalidate it between this check and the input acknowledgement.
+    live = await (await db.execute('SELECT token_hash FROM desktop_connections WHERE token_hash=%s FOR SHARE',
+                                  (credential_hash,))).fetchone()
+    if worker is None or live is None:
+        raise PermissionError('Desktop access changed')
+    allowed = (worker['mode'] == 'human' and worker['human_session'] == identity['session_hash']
+               and worker['active_run'] is None)
+    return worker, allowed
+
+
+@app.websocket('/api/worker/desktop-policy')
+async def desktop_policy(websocket: WebSocket):
+    """Small authorization messages only; no pixels or RFB input cross the app.
+
+    A grant holds the existing database ownership locks through the guest ACK.
+    The guest's 2s end-to-end deadline is shorter than this 5s ACK timeout. Its
+    local worker lock also prevents a delayed grant overlapping agent execution
+    if the app/control channel fails. Never retry an input grant.
+    """
+    try:
+        async with asyncio.timeout(5):
+            async with database() as db:
+                await worker_authorize(websocket, db, lock=False)
+            await websocket.accept()
+            initial = await websocket.receive_json()
+            credential = initial.get('credential') if isinstance(initial, dict) else None
+            if not isinstance(credential, str) or not 20 <= len(credential) <= 4096:
+                raise PermissionError('Invalid desktop credential')
+            digest = token_hash(credential)
+            del credential, initial
+            async with database() as db:
+                worker, _ = await desktop_policy_worker(db, websocket, digest, admission=True)
+            await websocket.send_json({'valid': True, 'worker_id': worker['id'],
+                'company_id': str(worker['company_id']), 'assigned_user_id': str(worker['assigned_user_id']),
+                'environment': os.environ['APP_ENV']})
+        while True:
+            # Missing guest checks mean a dead connection; do not retain it.
+            message = await asyncio.wait_for(websocket.receive_json(), 20)
+            operation = message.get('op') if isinstance(message, dict) else None
+            if operation not in ('check', 'input'):
+                raise ValueError('Invalid desktop policy operation')
+            async with database() as db:
+                async with asyncio.timeout(5):
+                    worker, allowed = await desktop_policy_worker(db, websocket, digest)
+                await asyncio.wait_for(websocket.send_json({'valid': True, 'allowed': allowed}), 2)
+                if operation == 'input':
+                    acknowledgement = await asyncio.wait_for(websocket.receive_json(), 5)
+                    if acknowledgement != {'op': 'ack'}:
+                        raise ValueError('Invalid desktop input acknowledgement')
+    except WebSocketDisconnect:
+        pass
+    except Exception as error:
+        logger.info('desktop policy closed error=%s', type(error).__name__)
+    finally:
+        with suppress(RuntimeError, OSError, WebSocketDisconnect, TimeoutError):
+            await asyncio.wait_for(websocket.close(code=1008, reason='Desktop permission changed; reconnect'), 2)
+
+
+@app.websocket('/api/desktop')
+async def retired_desktop_relay(websocket: WebSocket):
+    # Old cached clients must upgrade; a fallback would put frames back on AWS.
+    await websocket.close(code=1008, reason='Reload the viewer to use direct Fleet streaming')
 
 
 @app.post('/api/worker/runs/{identity}/artifacts')

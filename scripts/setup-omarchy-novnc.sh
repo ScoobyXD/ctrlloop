@@ -3,6 +3,16 @@
 # https://cua.ai/docs/how-to-guides/sandbox/connect-to-omarchy-with-novnc
 set -euo pipefail
 
+# This bootstrap bridge is only for an unconfigured desktop. Assigned workers
+# own port 5900 through their policy gate, including after a failed deployment.
+install -d -m 700 "$HOME/ctrlloop-dev"
+exec 9>"$HOME/ctrlloop-dev/deploy.lock"
+flock -n 9
+if [[ -e "$HOME/ctrlloop-dev/worker.env" || -e "$HOME/ctrlloop-dev/direct-streaming-required" ]]; then
+    printf '%s\n' 'This desktop has an assigned worker. Use deploy_worker.py to maintain its guarded stream; the bootstrap bridge cannot be restored.' >&2
+    exit 1
+fi
+
 NOVNC_VERSION="1.7.0"
 WEBSOCKIFY_VERSION="0.13.0"
 VNC_ROOT="$HOME/.local/share/omarchy-vnc"

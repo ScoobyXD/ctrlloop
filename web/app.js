@@ -382,20 +382,15 @@ function disconnectViewer() {
 }
 function scheduleViewerReconnect() {
   if (!state.viewerWanted || !state.session?.authenticated || !state.session?.worker?.id || state.switchingCompany || state.signingOut || state.rfb || state.viewerConnecting || state.viewerRetryTimer !== null) return;
-  if (state.viewerRetryCount >= viewerRetryDelays.length) {
-    setViewerStatus("Disconnected", "warn");
-    viewerPlaceholder("Desktop connection unavailable", `${state.viewerFailure} Automatic reconnect stopped after ${viewerRetryDelays.length} attempts. Select Reconnect to try again.`);
-    return;
-  }
   if (document.hidden) {
     setViewerStatus("Reconnect paused", "warn");
     viewerPlaceholder("Desktop connection interrupted", "Automatic reconnect will resume when you return to this tab.");
     return;
   }
-  const delay = viewerRetryDelays[state.viewerRetryCount];
+  const delay = viewerRetryDelays[Math.min(state.viewerRetryCount, viewerRetryDelays.length - 1)];
   const generation = state.viewerGeneration;
   setViewerStatus("Reconnecting", "warn");
-  viewerPlaceholder("Reconnecting to your desktop", `${state.viewerFailure} Retry ${state.viewerRetryCount + 1} of ${viewerRetryDelays.length} in ${delay / 1000} seconds. You can also select Reconnect now.`);
+  viewerPlaceholder("Reconnecting to your desktop", `${state.viewerFailure} Retry ${state.viewerRetryCount + 1} in ${delay / 1000} seconds. You can also select Reconnect now.`);
   state.viewerRetryTimer = setTimeout(() => {
     if (generation !== state.viewerGeneration) return;
     state.viewerRetryTimer = null;
@@ -420,17 +415,16 @@ async function connectViewer({ manual = false } = {}) {
   const generation = state.viewerGeneration;
   const current = () => generation === state.viewerGeneration && state.viewerWanted && state.session?.authenticated;
   const controller = new AbortController(); state.viewerSessionController = controller;
-  const attempt = state.viewerRetryCount ? ` Retry ${state.viewerRetryCount} of ${viewerRetryDelays.length}.` : "";
+  const attempt = state.viewerRetryCount ? ` Retry ${state.viewerRetryCount}.` : "";
   setViewerStatus(state.viewerRetryCount ? "Reconnecting" : "Connecting", "warn");
   viewerPlaceholder("Connecting to your desktop", `Checking your session and opening the desktop connection…${attempt}`, false);
   state.viewerConnectTimer = setTimeout(() => {
-    if (current()) viewerInterrupted("Desktop connection timed out", "The desktop did not connect within 20 seconds.");
-  }, 20000);
+    if (current()) viewerInterrupted("Desktop connection timed out", "The desktop did not connect within 40 seconds.");
+  }, 40000);
   try {
     // Every attempt checks the signed-in session; a failed WebSocket is not an authentication signal.
     const session = await api("/api/session", { signal: controller.signal });
     if (!current()) return;
-    state.viewerSessionController = null;
     if (!adoptSession(session)) return;
     if (!current()) {
       // Scope changes cancel this attempt; reconnect only with the adopted session.
@@ -441,14 +435,17 @@ async function connectViewer({ manual = false } = {}) {
     viewerModule ||= import("/vendor/novnc/core/rfb.js");
     const { default: RFB } = await viewerModule;
     if (!current()) return;
-    const url = new URL(scopedURL("/api/desktop"), window.location.href); url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const rfb = new RFB($("desktop-canvas"), url.toString(), { shared: true });
+    // Signed URLs authorize a new connection only. Never cache or reuse one on reconnect.
+    const connection = await api("/api/desktop/connection", { method: "POST", signal: controller.signal });
+    if (!current()) return;
+    state.viewerSessionController = null;
+    const rfb = new RFB($("desktop-canvas"), connection.url, { shared: true });
     state.rfb = rfb; rfb.viewOnly = true; rfb.focusOnClick = false; rfb.scaleViewport = true; rfb.resizeSession = false; rfb.background = "#070707";
     rfb.addEventListener("connect", () => {
       if (!current() || state.rfb !== rfb) return;
       clearViewerTimer("viewerConnectTimer"); state.viewerConnecting = false;
       $("viewer-placeholder").hidden = true; setViewerStatus("Live", "live"); renderControl();
-      // Brief connect/disconnect flapping must not reset the bounded retry budget.
+      // Brief connect/disconnect flapping must not reset the capped backoff.
       state.viewerStableTimer = setTimeout(() => {
         if (!current() || state.rfb !== rfb) return;
         state.viewerStableTimer = null;
@@ -456,12 +453,13 @@ async function connectViewer({ manual = false } = {}) {
       }, 30000);
     });
     rfb.addEventListener("disconnect", () => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop connection interrupted", "The viewer connection closed. Your saved loops are still available."); });
-    rfb.addEventListener("securityfailure", (event) => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop access failed", event.detail?.reason || "The desktop gateway could not authenticate this connection. Select Reconnect after access is restored.", false); });
-    rfb.addEventListener("credentialsrequired", () => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop authentication required", "The desktop gateway needs server-side credentials. Company credentials are never sent to the desktop.", false); });
+    rfb.addEventListener("securityfailure", () => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop access interrupted", "The desktop could not authenticate this connection. Reconnecting with fresh access."); });
+    rfb.addEventListener("credentialsrequired", () => { if (!current() || state.rfb !== rfb) return; viewerInterrupted("Desktop access interrupted", "The desktop requested credentials. Reconnecting through your CtrlLoop session."); });
   } catch (error) {
     if (!current()) return;
     viewerModule = null;
-    viewerInterrupted("Viewer unavailable", `The desktop connection could not open: ${error.message}`);
+    // Transport errors can include the signed URL; keep credentials out of the UI.
+    viewerInterrupted("Viewer unavailable", error.status ? `The desktop connection could not open: ${error.message}` : "The desktop connection could not open. Reconnecting will obtain fresh access.");
   }
 }
 
@@ -803,7 +801,7 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     clearViewerTimer("viewerRetryTimer");
     if (state.viewerConnecting) {
-      // Hiding the tab pauses an attempt; it must not exhaust the last retry.
+      // Hiding the tab pauses an attempt without increasing its backoff.
       state.viewerRetryCount = Math.max(0, state.viewerRetryCount - 1);
       closeViewerConnection();
     }
