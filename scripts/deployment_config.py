@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import re
 import shutil
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from src.identity import normalize_email
+
 ENVIRONMENTS = ("dev", "prod")
 
 
@@ -29,17 +34,13 @@ class DeploymentConfig:
         return self.state_dir / "deployment-secrets.json"
 
     @property
-    def worker_state_path(self):
-        return self.state_dir / "worker.json"
-
-    @property
     def resource_name(self):
         return self.raw["resource_name"]
 
-    def worker_dir(self, username: str):
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{1,63}", username):
-            raise ValueError("Worker username must be a safe lowercase identifier")
-        return self.state_dir / "workers" / username
+    def worker_dir(self, email: str):
+        email = normalize_email(email)
+        # Stable across operating systems without exposing emails as path names.
+        return self.state_dir / "workers" / hashlib.sha256(email.encode()).hexdigest()
 
     def __getitem__(self, key):
         return self.raw[key]
@@ -63,8 +64,6 @@ def load_environment(name: str) -> DeploymentConfig:
         for key in ("resource_name", "db_name", "db_user", "app_secret_name", "openai_secret"):
             if data[key] == dev[key]:
                 raise ValueError(f"Production must have a distinct {key}")
-        if data.get("bootstrap_legacy_dev") or data.get("bootstrap_worker"):
-            raise ValueError("Production cannot bootstrap the legacy development workspace or worker")
     return DeploymentConfig(name, data)
 
 

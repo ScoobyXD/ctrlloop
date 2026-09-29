@@ -13,10 +13,18 @@ from .reporting import RunReport, package_report
 from .worker import execute_instruction
 
 
+class WorkerAssignmentError(RuntimeError):
+    """A credential, delivery, or journal belongs to a different assigned VM."""
+
+
 async def main():
     endpoint = os.environ['CTRLLOOP_API_URL'].rstrip('/')
     if not endpoint.startswith('https://'):
         raise RuntimeError('Worker delivery requires HTTPS')
+    expected_worker_id = os.environ['CTRLLOOP_WORKER_ID']
+    expected_environment = os.environ['CTRLLOOP_ENVIRONMENT']
+    if not expected_worker_id or expected_environment not in ('dev', 'prod'):
+        raise WorkerAssignmentError('An explicit worker identity and environment are required')
     state = Path(os.environ.get('CTRLLOOP_WORKER_STATE', str(Path.home()/'.local/state/ctrlloop-worker')))
     state.mkdir(parents=True, exist_ok=True)
     # A system-wide per-user lock also prevents two revision services racing.
@@ -54,6 +62,44 @@ async def main():
             response.raise_for_status()
             return response.json()
 
+        def validate_assignment(value):
+            if (not isinstance(value, dict) or value.get('worker_id') != expected_worker_id
+                    or value.get('environment') != expected_environment):
+                raise WorkerAssignmentError('Worker credential does not match the configured VM and environment')
+            try:
+                UUID(str(value['company_id']))
+                UUID(str(value['assigned_user_id']))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                raise WorkerAssignmentError('Worker handshake has no valid company and user assignment') from None
+
+        # A copied token must never redirect this configured VM to another user.
+        assignment = await send('/api/worker/heartbeat', {})
+        validate_assignment(assignment)
+
+        async def check_assignment():
+            current = await send('/api/worker/heartbeat', {})
+            validate_assignment(current)
+            if any(current[key] != assignment[key] for key in ('company_id', 'assigned_user_id')):
+                raise WorkerAssignmentError('Worker assignment changed; explicit operator review is required')
+
+        def validate_run_context(value, *, legacy_journal=False):
+            if not isinstance(value, dict):
+                raise WorkerAssignmentError('Worker delivery is not a run record')
+            try:
+                identity = str(UUID(str(value['id'])))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                raise WorkerAssignmentError('Worker delivery has no valid run identity') from None
+            keys = ('company_id', 'worker_id', 'initiated_by')
+            if legacy_journal and not any(key in value for key in keys):
+                # Old journals are never re-executed. Each evidence/result
+                # request still requires the server's per-run worker access.
+                return identity
+            if (value.get('company_id') != assignment['company_id']
+                    or value.get('worker_id') != expected_worker_id
+                    or value.get('initiated_by') != assignment['assigned_user_id']):
+                raise WorkerAssignmentError('Run or journal does not belong to this assigned company, user, and VM')
+            return identity
+
         async def flush_events(pending, *, terminal=False):
             while pending.get('events'):
                 body = pending['events'][0]
@@ -75,6 +121,7 @@ async def main():
             if not journal.exists():
                 return
             pending = json.loads(journal.read_text())
+            validate_run_context(pending, legacy_journal=True)
             interrupted = not pending.get('finish')
             if not pending.get('report_directory'):
                 recovered = RunReport(Path(os.environ.get('CTRLLOOP_REPORT_DIR', 'reports')), run_id=pending['id'])
@@ -157,26 +204,45 @@ async def main():
                 await asyncio.sleep(5)
 
         heartbeat_task = asyncio.create_task(heartbeat())
+        recovery_needed = False
         try:
             await settle_journal()
             await send('/api/worker/recover', {})
             while True:
                 try:
                     await settle_journal()
+                    if recovery_needed:
+                        await send('/api/worker/recover', {})
+                        recovery_needed = False
                     try:
                         payload = await send('/api/worker/poll', {'revision': revision})
                     except Exception:
                         # A lost poll response may have committed delivery in the DB.
+                        recovery_needed = True
                         await send('/api/worker/recover', {})
+                        recovery_needed = False
                         raise
                     run = payload.get('run')
                     if not run:
                         await asyncio.sleep(2)
                         continue
-                    identity = run['id']
+                    identity = validate_run_context(run)
+                    recovery_needed = True
+                    try:
+                        await check_assignment()
+                    except WorkerAssignmentError:
+                        raise
+                    except Exception:
+                        # Poll committed delivery, but no action or journal has
+                        # started. Release it as interrupted before retrying.
+                        await send('/api/worker/recover', {})
+                        recovery_needed = False
+                        raise
                     report = RunReport(Path(os.environ.get('CTRLLOOP_REPORT_DIR', 'reports')), run_id=identity)
-                    pending = {'id': identity, 'report_directory': str(report.requests_path), 'events': []}
+                    pending = {'id': identity, 'company_id': run['company_id'], 'worker_id': run['worker_id'],
+                               'initiated_by': run['initiated_by'], 'report_directory': str(report.requests_path), 'events': []}
                     write_journal(pending)
+                    recovery_needed = False
                     report.append('delivery_received', run=run, revision=revision)
 
                     async def emit(details):
@@ -207,6 +273,10 @@ async def main():
                     pending['finish'] = finish
                     write_journal(pending)
                     await settle_journal()
+                except WorkerAssignmentError:
+                    # Fail closed without touching a foreign journal/report or
+                    # sending native input. Operator repair must be explicit.
+                    raise
                 except Exception as error:
                     print(json.dumps({'stage': 'worker_connection_error', 'type': type(error).__name__}), flush=True)
                     await asyncio.sleep(5)

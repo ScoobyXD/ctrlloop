@@ -14,7 +14,7 @@ The response is the existing loop object, including `runs: [queuedRun]`. The loo
 
 Creation and reservation commit in one database transaction. Starting requires an assigned, enabled worker under agent control, seen within the last 30 seconds, with no queued/running run or active-run pointer. Unassigned, offline, human-controlled, maintenance, and occupied desktops return HTTP 409 without leaving a new loop behind. The existing generation-capacity limit still returns HTTP 429. The existing unique active-run index and worker lock prevent double reservation.
 
-Both entry points use the same reservation helper and existing `runs` table. Two additive columns hold the requesting session hash and dispatch deadline. Neither field is returned to the browser, worker, or report. Worker polling waits for a ready, nonempty instruction, then rechecks the requesting session, membership and assignment before dispatch. Membership, session, and worker/run locks preserve authorization through that transaction. Concurrent polls dispatch a reservation once.
+Both entry points use the same reservation helper and existing `runs` table. Two additive columns hold the requesting session hash and dispatch deadline. Neither field is returned to the browser, worker, or report. Worker polling waits for a ready, nonempty instruction, then rechecks the requesting session, account privileges, target company/user and assignment before dispatch. Account, session, and worker/run locks preserve authorization through that transaction. Concurrent polls dispatch a reservation once.
 
 ## Lifetime and navigation
 
@@ -22,7 +22,7 @@ The five-minute deadline starts when the run is reserved and includes instructio
 
 Navigating Home, selecting another CtrlLoop, opening/closing the Desktop tab, refreshing, or closing the browser does not cancel a committed reservation. Generation and worker polling run on the server independently of UI polling. The active sign-in session must remain valid for dispatch. A lost create response should be reconciled through the loop list/detail; clients must not blindly replay the POST.
 
-Signing out cancels runs still queued by that session. Switching the selected company, session expiration, and membership revocation also prevent pending dispatch. Generation failure/cancellation, server restart, or worker restart interrupts queued execution without replaying actions. Already dispatched runs retain the existing execution/recovery behavior; logout is not a stop-running command.
+Signing out cancels runs still queued by that session. Session expiration, account/role revocation, and invalidated target assignments also prevent pending dispatch. Devadmin company/user selection changes only the viewing context; pending runs keep their original authorized target and continue across navigation. Generation failure/cancellation, server restart, or worker restart interrupts queued execution without replaying actions. Already dispatched runs retain the existing execution/recovery behavior; logout is not a stop-running command.
 
 `GET /api/session` exposes `worker.queued_run` as the reserved run UUID or `null`, alongside the existing `worker.active_run`. It derives this field from the existing queued run after expiring invalid reservations in the same transaction, so browser navigation and reloads retain the authoritative busy state. The session read releases five-minute-expired, invalid-session, or reassigned-worker reservations even if the worker is offline.
 
@@ -36,12 +36,12 @@ No test files were added. Verification used the existing Python environment and 
 - The schema applied successfully to a fresh database and applied a second time unchanged.
 - Direct async endpoint calls verified legacy generation-only creation, a queued start reservation, waiting through generation, rollback of duplicate submission, blocked human takeover, and exactly one dispatch from two simultaneous polls after readiness.
 - Human-control, maintenance, offline, and unassigned worker starts returned HTTP 409.
-- Deadline expiry, logout, company switch, expired session, and worker restart interrupted queued runs.
+- Deadline expiry, logout, expired session, and worker restart interrupted queued runs.
 - The actual generation exception handler interrupted its queued run when an in-process unavailable client deliberately failed before any network call. Server-start interruption of queued runs was also exercised.
 - Loop creation/detail, worker dispatch, and report responses excluded the private session hash and dispatch deadline.
 - Repeated session reads returned the queued UUID without selected-loop state. A session read cleared an expired reservation with the worker offline, a reservation from an invalidated session, and a reservation belonging to a previous desktop assignee.
 
-This verification did not exercise a real instruction provider, a live desktop action, or the separate company-account migration branch.
+These initial checks preceded the combined company-account integration and did not exercise a real instruction provider or a live desktop action.
 
 ## Interface
 
@@ -66,8 +66,4 @@ automatic second run POST. Preparation/execution state, queued busy state after
 navigating Home, Home desktop access, drawer closing, report layout, and login
 were inspected. The report preview used previously captured run evidence.
 
-This change starts from main. The separate company-account work in
-codex/company-accounts touches shared frontend/backend files and must be integrated
-deliberately before combined deployment. Existing authentication API field names
-are retained here for compatibility with the current backend; user-visible copy
-uses company. Neither this branch nor these verification actions deployed to dev.
+The combined release includes company email signup/login, company administration, and explicit devadmin target selection. The company backend is the canonical account model; ordinary users cannot switch companies. Report links and desktop connections retain the authorized target context.

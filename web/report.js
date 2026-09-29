@@ -36,15 +36,21 @@ const timestamp = (value) => value ? new Date(value).toISOString().replace("T","
 const parts = location.pathname.split("/").filter(Boolean);
 const kind = parts[1], identity = parts[2];
 const base = `/api/${kind}/${encodeURIComponent(identity)}`;
+const requestedContext = new URLSearchParams(location.search);
+function scopedURL(path) {
+  const url = new URL(path, location.origin);
+  for (const key of ["company_id", "user_id"]) if (requestedContext.get(key)) url.searchParams.set(key, requestedContext.get(key));
+  return url.pathname + url.search;
+}
 let current;
 let sessionGeneration = 0;
-const personName = (person) => person?.display_name || person?.username || "Earlier company member";
+const personName = (person) => person?.display_name || person?.email || "Earlier company member";
 function hideRecord() { current = null; lazyContent.clear(); $("report-content").replaceChildren(); $("report-content").hidden = true; }
-function requireLogin() { sessionGeneration+=1; hideRecord(); $("report-login").hidden=false; $("report-loading").hidden=true; $("report-person").textContent="RUN EVIDENCE"; $("report-company").hidden=true; $("report-company-name").textContent=""; }
+function requireLogin() { sessionGeneration+=1; hideRecord(); $("report-login").hidden=false; $("report-loading").hidden=true; $("report-person").textContent="RUN EVIDENCE";  $("report-company-name").textContent=""; }
 
 async function fetchJSON(path, options={}) {
   const generation=sessionGeneration;
-  const response = await fetch(path, {credentials:"same-origin",cache:"no-store",...options});
+  const response = await fetch(scopedURL(path), {credentials:"same-origin",cache:"no-store",...options});
   if(response.status===401){if(generation===sessionGeneration)requireLogin();return null;}
   const data = await response.json();
   if(!response.ok) throw new Error(typeof data.detail==="string" ? data.detail : `Request failed (${response.status})`);
@@ -53,17 +59,17 @@ async function fetchJSON(path, options={}) {
 $("report-login").addEventListener("submit",async(event)=>{
   event.preventDefault();$("login-error").textContent="";$("report-login-submit").disabled=true;sessionGeneration+=1;
   try {
-    const response=await fetch("/api/login",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("report-username").value.trim(),password:$("report-password").value})});
+    const response=await fetch("/api/login",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:$("report-email").value.trim(),password:$("report-password").value})});
     if(!response.ok) { const detail=(await response.json()).detail; throw new Error(typeof detail==="string"?detail:Array.isArray(detail)?detail.map(item=>item.msg||"Invalid input").join("; "):"Sign in failed"); }
     $("report-password").value="";$("report-login").hidden=true;await load();
   } catch(error){$("login-error").textContent=error.message;}
   finally{$("report-login-submit").disabled=false;}
 });
-$("report-company").addEventListener("change",async()=>{
-  const companyId=$("report-company").value;sessionGeneration+=1;hideRecord();$("report-company").disabled=true;
-  try {await fetchJSON("/api/session/workspace",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({workspace_id:companyId})});await load();}
-  catch(error){$("report-loading").hidden=false;$("report-loading").textContent=error.message;}
-  finally{$("report-company").disabled=false;}
+$("report-password-toggle").addEventListener("click", () => {
+  const input = $("report-password"), button = $("report-password-toggle"), reveal = input.type === "password";
+  input.type = reveal ? "text" : "password";
+  button.setAttribute("aria-pressed", String(reveal));
+  button.setAttribute("aria-label", reveal ? "Hide personal password" : "Show personal password");
 });
 
 function loopData(events) {
@@ -213,12 +219,12 @@ function render(data){
   const total=Math.max(0,run?.result?.timing?.through_report_duration_ms||0,...events.map(e=>e.elapsed_ms||0));
   const status=run?.status||request.status,active=["running","queued","generating"].includes(status);
   const files=data.artifact?.files||[];
-  const fileURL=(path)=>`/api/runs/${encodeURIComponent(run?.id)}/files/${path.split("/").map(encodeURIComponent).join("/")}`;
+  const fileURL=(path)=>esc(scopedURL(`/api/runs/${encodeURIComponent(run?.id)}/files/${path.split("/").map(encodeURIComponent).join("/")}`));
   const modelResponse=serverEvents.find(e=>e.stage==="llm_response")?.data;
   const modelCost=modelResponse?.cost_estimate||data.openai_cost_estimate;
   const windowRounds=Math.max(events.filter(e=>e.event==="timing_finished"&&e.operation==="selection.round"&&e.stage==="windows").length,saved.filter(e=>e.stage==="windows").length);
   const controlRounds=Math.max(events.filter(e=>e.event==="timing_finished"&&e.operation==="selection.round"&&e.stage==="controls").length,saved.filter(e=>e.stage==="controls").length);
-  $("report-content").innerHTML=`<div class="report-hero"><div><div class="eyebrow">${run?"DESKTOP RUN":"REQUEST & INSTRUCTION"} · ${esc(identity)}</div><h1>Every available step, in view.</h1><span class="report-badge ${["succeeded","ready"].includes(status)?"":"warning"}">${esc(label(status))}</span><p>${esc(request.prompt)}</p></div><div class="report-actions"><button id="refresh-report" class="report-refresh">Refresh record</button><a class="button primary" href="${base}/download">Download evidence ZIP ↓</a></div></div>
+  $("report-content").innerHTML=`<div class="report-hero"><div><div class="eyebrow">${run?"DESKTOP RUN":"REQUEST & INSTRUCTION"} · ${esc(identity)}</div><h1>Every available step, in view.</h1><span class="report-badge ${["succeeded","ready"].includes(status)?"":"warning"}">${esc(label(status))}</span><p>${esc(request.prompt)}</p></div><div class="report-actions"><button id="refresh-report" class="report-refresh">Refresh record</button><a class="button primary" href="${esc(scopedURL(`${base}/download`))}">Download evidence ZIP ↓</a></div></div>
   ${active?'<div class="report-card warn"><p>This record is still in progress. Refresh to load new evidence. The ZIP contains everything available at download time.</p></div>':""}
   <div class="report-card ${data.missing_capture.length?"warn":""}"><h2>${data.missing_capture.length?"Capture gaps":"Available evidence captured"}</h2>${data.missing_capture.length?`<ul>${data.missing_capture.map(item=>`<li>${esc(item)}</li>`).join("")}</ul>`:'<p>The worker archive and server record are available. Capture completeness describes evidence availability; it does not establish task success.</p>'}<p class="report-note">${esc(data.timing_note)} Authentication headers and infrastructure credentials are intentionally excluded.</p></div>
   <div class="report-metrics"><div class="metric"><strong>${events.length||number(run?.result?.timing?.through_report_duration_ms)?ms(total):"Unavailable"}</strong><span>Worker captured duration</span></div><div class="metric"><strong>${loops.length||"Unavailable"}</strong><span>Precisely bounded loops / attempts</span></div><div class="metric"><strong>${callCountLabel}</strong><span>Jev API calls · ${windowRounds} captured window rounds · ${controlRounds} captured control rounds</span></div><div class="metric"><strong>${tokenLabel}</strong><span>Recorded Jev input tokens</span></div><div class="metric"><strong>${costLabel}</strong><span>Jev usage estimate · $0.042 / million input tokens</span></div></div>
@@ -244,11 +250,9 @@ async function load(){
     if(generation!==sessionGeneration)return;
     if(!session?.authenticated){requireLogin();return;}
     $("report-person").textContent=personName(session.user);
-    const memberships=session.memberships||[],picker=$("report-company");
-    picker.innerHTML=memberships.map(item=>`<option value="${esc(item.workspace_id)}">${esc(item.name)}</option>`).join("");picker.value=session.workspace?.id||"";picker.hidden=memberships.length<=1;
-    $("report-company-name").textContent=memberships.length<=1?session.workspace?.name||"":"";
+    $("report-company-name").textContent = `${session.company?.name || ""}${session.user?.is_devadmin ? " · Devadmin company context" : ""}`;
     const data=await fetchJSON(`${base}/report`);if(data&&generation===sessionGeneration)render(data);
   }
-  catch(error){if(generation!==sessionGeneration)return;hideRecord();$("report-loading").hidden=false;$("report-loading").textContent=`Could not load this report: ${error.message} You may need to select the company that owns it.`;}
+  catch(error){if(generation!==sessionGeneration)return;hideRecord();$("report-loading").hidden=false;$("report-loading").textContent=`Could not load this report: ${error.message} Open the report from the company page where you have access.`;}
 }
 void load();

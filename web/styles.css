@@ -399,3 +399,45 @@ button svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.4
 
 .desktop-shortcut{background:none;border:0;border-left:1px solid #44372b;color:#bf9778;font:10px var(--mono);padding:0 0 0 10px;margin-left:5px}
 .desktop-shortcut:hover{color:var(--accent)}
+
+/* Company accounts share the black-and-orange application shell. */
+.password-field { position: relative; width: 100%; }
+.password-field input { padding-right: 48px !important; width: 100%; }
+.password-toggle { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); background: transparent; border: 0; color: #bdb6ac; display: grid; place-items: center; width: 38px; height: 38px; border-radius: 2px; }
+.password-toggle svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.6; }
+.password-toggle[aria-pressed="true"] { color: var(--accent); background: #2b1a10; }
+.password-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.field-help { font-size: 13px; line-height: 1.7; color: var(--muted); margin: 9px 0 15px; }
+.auth-message { font-size: 13px; line-height: 1.7; background: #1c1510; border: 1px solid #67442e; padding: 14px; border-radius: 2px; overflow-wrap: anywhere; }
+.auth-message.error { color: var(--red); border-color: #67463d; background: #281a17; }
+.auth-links { display: flex; justify-content: space-between; gap: 12px; }
+.login-card select { width: 100%; padding: 12px 14px; font-size: 14px; background: var(--surface); border-color: var(--border); }
+.login-card form>div>label { margin-top: 16px; }
+.login-card label { font-size: 13px; }
+.login-screen[data-auth-view]:not([data-auth-view="login"]) .login-card>h1,
+.login-screen[data-auth-view]:not([data-auth-view="login"]) .login-card>.login-description { display: none; }
+.login-screen[data-auth-view]:not([data-auth-view="login"]) .login-card>.brand { margin-bottom: 24px; }
+.login-screen[data-auth-view]:not([data-auth-view="login"]) .login-card>.eyebrow { display: block; margin-bottom: 22px; }
+.company-form { max-width: 560px; margin-top: 28px; border-top: 1px solid var(--border); padding-top: 20px; }
+.company-form h3 { font-size: 17px; font-weight: 500; }
+.company-form>label { display: block; font-size: 13px; margin: 18px 0 8px; color: #c4bbae; }
+.company-form>label span { color: var(--muted); }
+.company-form input { width: 100%; padding: 12px 14px; font-size: 14px; }
+.company-form>button { margin-top: 18px; }
+.admin-context { padding: 20px 23px; margin: 0 auto 28px; max-width: 1220px; border-color: #68422a; background: #17120e; }
+.admin-context strong { font: 13px var(--mono); color: var(--accent); }
+.admin-context p { font-size: 13px; line-height: 1.7; color: #b8aa98; margin: 9px 0 18px; }
+.admin-context-fields { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
+.admin-context-fields>div { flex: 1; min-width: 180px; }
+.admin-context label { display: block; font-size: 13px; color: #b8aa98; margin-bottom: 8px; }
+.admin-context select { width: 100%; min-height: 39px; padding: 8px 10px; font-size: 13px; }
+.member-actions { display: flex; align-items: center; gap: 8px; }
+.member-role { font-size: 13px; min-width: 150px; padding: 8px 10px; }
+.member-table td .button { white-space: nowrap; }
+#company-view { max-width: 1220px; margin: 0 auto; }
+@media (max-width: 760px) {
+  .admin-context { padding: 17px; }
+  .admin-context-fields { align-items: stretch; flex-direction: column; }
+  .admin-context-fields>div { min-width: 0; }
+  .auth-links { flex-wrap: wrap; gap: 0 12px; }
+}

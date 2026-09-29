@@ -1,4 +1,4 @@
-"""Workspace-scoped CTRL Loop API. PostgreSQL is the durable contract."""
+"""Company-scoped CTRL Loop API. PostgreSQL is the durable contract."""
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -19,11 +19,14 @@ import httpx2
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Literal
+from fastapi.exceptions import RequestValidationError
 
 from .desktop_gateway import proxy_desktop
-from .identity import (token_hash, password_hash, verify_password, normalize_username,
-                       migrate_legacy_identity, create_member)
+from .identity import token_hash, hash_password, check_password, normalize_email
+from .company_migration import migrate_company_schema
+from .account_mail import send_account_mail, delivery_mode
 from .run_artifacts import (MAX_ARCHIVE_BYTES, inspect_archive, store_archive,
                             load_archive, worker_record, evidence_bundle)
 
@@ -50,8 +53,9 @@ async def database():
 
 
 async def event(db, loop_id, stage, message, *, run_id=None, data=None, event_id=None):
-    await db.execute('INSERT INTO events(id,loop_id,run_id,stage,message,data) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING',
-                     (event_id or uuid4(), loop_id, run_id, stage, message, Jsonb(data or {})))
+    await db.execute('''INSERT INTO events(id,company_id,loop_id,run_id,stage,message,data)
+        SELECT %s,company_id,id,%s,%s,%s,%s FROM loops WHERE id=%s ON CONFLICT(id) DO NOTHING''',
+        (event_id or uuid4(), run_id, stage, message, Jsonb(data or {}), loop_id))
 
 
 @asynccontextmanager
@@ -62,7 +66,7 @@ async def lifespan(app):
     for name in ('DATABASE_URL', 'APP_ENV', 'APP_ORIGIN', 'OPENAI_API_KEY', 'CUA_CLIENT_ID', 'CUA_CLIENT_SECRET'):
         if not os.environ.get(name): raise RuntimeError(f'Missing required setting: {name}')
     if os.environ['APP_ENV'] not in ('dev', 'prod'): raise RuntimeError('APP_ENV must be dev or prod')
-    dummy_password_hash = await asyncio.to_thread(password_hash, secrets.token_urlsafe(32))
+    dummy_password_hash = await hash_password(secrets.token_urlsafe(32))
     database_pool = AsyncConnectionPool(
         os.environ['DATABASE_URL'], open=False, min_size=2, max_size=8,
         timeout=5, kwargs={'row_factory': dict_row, 'connect_timeout': 5},
@@ -71,8 +75,7 @@ async def lifespan(app):
     try:
         await database_pool.open(wait=True, timeout=15)
         async with database() as db:
-            await db.execute((ROOT / 'src/schema.sql').read_text())
-            await migrate_legacy_identity(db)
+            await migrate_company_schema(db)
             # Neither unfinished generation nor undispatched execution is replayed.
             await interrupt_queued_runs(db, 'Server restarted before dispatch. Start again when ready.')
             await db.execute("UPDATE loops SET status='error',error='Generation interrupted by server restart; create a new loop.' WHERE status='generating'")
@@ -86,6 +89,13 @@ async def lifespan(app):
 
 
 app = FastAPI(title='CTRL Loop', lifespan=lifespan, docs_url=None, redoc_url=None)
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request, error):
+    # Pydantic's default response echoes rejected input, including credentials.
+    fields = sorted({'.'.join(str(part) for part in item['loc'][1:]) for item in error.errors()})
+    return JSONResponse({'detail': 'Check these fields: ' + ', '.join(fields)}, status_code=422)
 
 
 def openai_cost_estimate(usage):
@@ -107,37 +117,94 @@ def openai_cost_estimate(usage):
 
 
 async def session_identity(db, digest, *, lock=False, session_update=False):
-    session = await (await db.execute('''SELECT user_id,workspace_id FROM sessions
+    session = await (await db.execute('''SELECT user_id,company_id FROM sessions
         WHERE token_hash=%s AND expires_at>now()''', (digest,))).fetchone()
     if not session: return None
-    # Membership -> session -> worker is the shared lock order. Recheck the
-    # session after locking membership so a workspace switch cannot race lookup.
-    identity = await (await db.execute('''SELECT m.user_id,m.workspace_id,u.username,u.display_name,
-        m.role,w.slug AS workspace_slug,w.name AS workspace_name
-        FROM memberships m JOIN users u ON u.id=m.user_id JOIN workspaces w ON w.id=m.workspace_id
-        WHERE m.user_id=%s AND m.workspace_id=%s AND m.revoked_at IS NULL
-        AND u.activated_at IS NOT NULL AND u.disabled_at IS NULL'''
-        + (' FOR SHARE OF m,u' if lock else ''), (session['user_id'],session['workspace_id']))).fetchone()
+    identity = await (await db.execute('''SELECT u.id AS user_id,u.company_id,u.email,u.display_name,
+        u.role,u.is_devadmin,c.slug AS company_slug,c.name AS company_name
+        FROM users u JOIN companies c ON c.id=u.company_id
+        WHERE u.id=%s AND u.company_id=%s AND u.email_verified_at IS NOT NULL
+        AND u.disabled_at IS NULL''' + (' FOR SHARE OF u' if lock else ''),
+        (session['user_id'],session['company_id']))).fetchone()
     if not identity: return None
     current = await (await db.execute('''SELECT token_hash FROM sessions WHERE token_hash=%s
-        AND user_id=%s AND workspace_id=%s AND expires_at>now()'''
+        AND user_id=%s AND company_id=%s AND expires_at>now()'''
         + (' FOR UPDATE' if session_update else ' FOR SHARE' if lock else ''),
-        (digest,session['user_id'],session['workspace_id']))).fetchone()
-    return {**identity, 'session_hash':digest} if current else None
+        (digest,session['user_id'],session['company_id']))).fetchone()
+    return {**identity, 'session_hash': digest, 'home_company_id': identity['company_id'],
+            'target_user_id': identity['user_id'], 'target_email': identity['email'],
+            'target_display_name': identity['display_name'], 'target_verified': True} if current else None
+
+
+async def target_context(db, identity, company_id=None, user_id=None):
+    """Only a verified platform devadmin can supply another company/user context."""
+    try:
+        company_id = UUID(str(company_id)) if company_id else identity['home_company_id']
+        user_id = UUID(str(user_id)) if user_id else (identity['user_id'] if company_id == identity['home_company_id'] else None)
+    except ValueError as error:
+        raise HTTPException(400, 'Invalid company or user selection') from error
+    if not identity['is_devadmin'] and (company_id != identity['home_company_id'] or user_id != identity['user_id']):
+        raise HTTPException(403, 'Platform devadmin access required for another company or user')
+    company = await (await db.execute('SELECT id,slug,name FROM companies WHERE id=%s', (company_id,))).fetchone()
+    if not company: raise HTTPException(404, 'Company not found')
+    target = None
+    if user_id:
+        target = await (await db.execute('''SELECT id,email,display_name,email_verified_at FROM users
+            WHERE id=%s AND company_id=%s AND disabled_at IS NULL FOR SHARE''', (user_id,company_id))).fetchone()
+        if not target: raise HTTPException(404, 'Active company user not found')
+    return {**identity, 'company_id': company_id, 'company_slug': company['slug'], 'company_name': company['name'],
+            'target_user_id': user_id, 'target_email': target['email'] if target else None,
+            'target_display_name': target['display_name'] if target else None,
+            'target_verified': bool(target and target['email_verified_at'])}
 
 
 async def authorize(request, db, *, owner=False, session_update=False):
     identity = await session_identity(db, token_hash(request.cookies.get('ctrl_session', '')), lock=True, session_update=session_update)
-    if not identity: raise HTTPException(401, 'Sign in to access this workspace')
-    if owner and identity['role'] != 'owner': raise HTTPException(403, 'Workspace owner access required')
+    if not identity: raise HTTPException(401, 'Sign in to access your company')
+    identity = await target_context(db, identity,
+        request.headers.get('x-company-id') or request.query_params.get('company_id'),
+        request.headers.get('x-user-id') or request.query_params.get('user_id'))
+    if owner and not identity['is_devadmin'] and identity['role'] != 'company_admin':
+        raise HTTPException(403, 'Company admin access required')
     return identity
 
 
+async def authorize_company_management(request, db):
+    # Serialize company administration before taking user locks. Otherwise two
+    # admins changing each other's access can hold each other's shared user lock.
+    initial = await session_identity(db, token_hash(request.cookies.get('ctrl_session', '')))
+    if not initial: raise HTTPException(401, 'Sign in to access your company')
+    raw_company = request.headers.get('x-company-id') or request.query_params.get('company_id')
+    try: company_id = UUID(raw_company) if raw_company else initial['home_company_id']
+    except ValueError as error: raise HTTPException(400, 'Invalid company selection') from error
+    if not initial['is_devadmin'] and company_id != initial['home_company_id']:
+        raise HTTPException(403, 'Platform devadmin access required')
+    # A global admin-write lock also covers devadmins managing each other's
+    # home companies; these rare operations must share one lock order.
+    await db.execute("SELECT pg_advisory_xact_lock(hashtext('ctrlloop.account.management'))")
+    return await authorize(request, db, owner=True)
+
+
+async def lock_session_owner(db, digest):
+    session = await (await db.execute('SELECT user_id FROM sessions WHERE token_hash=%s', (digest,))).fetchone()
+    if session:
+        # Includes disabled/unverified/expired accounts so logout follows the
+        # same user -> session -> worker order as reset and ordinary access.
+        await db.execute('SELECT id FROM users WHERE id=%s FOR SHARE', (session['user_id'],))
+    await db.execute('SELECT token_hash FROM sessions WHERE token_hash=%s FOR UPDATE', (digest,))
+
+
+def acting_user(identity):
+    if not identity['target_user_id']:
+        raise HTTPException(409, 'Select a company user before creating or running a CtrlLoop')
+    return identity['target_user_id']
+
+
 async def assigned_worker(db, identity, *, lock=True, required=True):
-    worker = await (await db.execute('''SELECT * FROM workers WHERE workspace_id=%s
+    worker = await (await db.execute('''SELECT * FROM workers WHERE company_id=%s
         AND assigned_user_id=%s AND disabled_at IS NULL''' + (' FOR UPDATE' if lock else ''),
-        (identity['workspace_id'], identity['user_id']))).fetchone()
-    if not worker and required: raise HTTPException(409, 'No personal desktop is assigned to your membership')
+        (identity['company_id'], identity['target_user_id']))).fetchone()
+    if not worker and required: raise HTTPException(409, 'No personal desktop is assigned to the selected company user')
     return worker
 
 
@@ -145,16 +212,14 @@ async def worker_authorize(request, db, *, lock=True):
     header = request.headers.get('authorization', '')
     if not header.startswith('Bearer ') or len(header) > 600: raise HTTPException(401, 'Invalid worker credential')
     digest = token_hash(header[7:])
-    # Lock membership before worker, matching user and admin mutation order.
-    # Pending users may provision/heartbeat their VM, but cannot sign in or run.
-    candidate = await (await db.execute('''SELECT w.id,w.workspace_id,w.assigned_user_id FROM workers w
-        JOIN memberships m ON m.workspace_id=w.workspace_id AND m.user_id=w.assigned_user_id
-        JOIN users u ON u.id=m.user_id WHERE w.credential_hash=%s AND w.disabled_at IS NULL
-        AND m.revoked_at IS NULL AND u.disabled_at IS NULL FOR SHARE OF m,u''', (digest,))).fetchone()
+    candidate = await (await db.execute('''SELECT w.id,w.company_id,w.assigned_user_id FROM workers w
+        JOIN users u ON u.company_id=w.company_id AND u.id=w.assigned_user_id
+        WHERE w.credential_hash=%s AND w.disabled_at IS NULL AND u.disabled_at IS NULL
+        FOR SHARE OF u''', (digest,))).fetchone()
     if not candidate: raise HTTPException(401, 'Invalid worker credential or inactive assignment')
     worker = await (await db.execute('''SELECT * FROM workers WHERE id=%s AND credential_hash=%s
-        AND workspace_id=%s AND assigned_user_id=%s AND disabled_at IS NULL''' + (' FOR UPDATE' if lock else ''),
-        (candidate['id'], digest, candidate['workspace_id'], candidate['assigned_user_id']))).fetchone()
+        AND company_id=%s AND assigned_user_id=%s AND disabled_at IS NULL''' + (' FOR UPDATE' if lock else ''),
+        (candidate['id'], digest, candidate['company_id'], candidate['assigned_user_id']))).fetchone()
     if not worker: raise HTTPException(401, 'Worker assignment changed')
     return worker
 
@@ -169,11 +234,11 @@ def public_worker(worker, digest=None, *, queued_run=None):
 
 
 async def release_expired_control(db, worker_id):
-    await db.execute('''UPDATE workers SET mode='agent',human_session=NULL WHERE id=%s AND mode='human'
-        AND NOT EXISTS (SELECT 1 FROM sessions s JOIN memberships m ON m.user_id=s.user_id
-        AND m.workspace_id=s.workspace_id JOIN users u ON u.id=s.user_id
-        WHERE s.token_hash=workers.human_session AND s.expires_at>now() AND m.revoked_at IS NULL
-        AND u.disabled_at IS NULL AND s.workspace_id=workers.workspace_id AND s.user_id=workers.assigned_user_id)''', (worker_id,))
+    await db.execute("""UPDATE workers SET mode='agent',human_session=NULL WHERE id=%s AND mode='human'
+        AND NOT EXISTS (SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id AND u.company_id=s.company_id
+        WHERE s.token_hash=workers.human_session AND s.expires_at>now()
+        AND u.disabled_at IS NULL AND u.email_verified_at IS NOT NULL
+        AND (u.is_devadmin OR (s.company_id=workers.company_id AND s.user_id=workers.assigned_user_id)))""", (worker_id,))
 
 
 async def interrupt_queued_runs(db, message, *, clause='TRUE', params=()):
@@ -185,23 +250,31 @@ async def interrupt_queued_runs(db, message, *, clause='TRUE', params=()):
 
 
 async def release_expired_queue(db, worker_id):
-    await interrupt_queued_runs(db, 'Start expired or sign-in is no longer valid. Start again when ready.',
+    # The session belongs to the real actor. A devadmin may act for a verified
+    # user in another company, but losing that privilege cancels pending work.
+    await interrupt_queued_runs(db, 'Start expired or authorization is no longer valid. Start again when ready.',
         clause="""worker_id=%s AND (dispatch_before IS NULL OR dispatch_before<=now()
-            OR NOT EXISTS (SELECT 1 FROM sessions s JOIN loops l ON l.id=runs.loop_id
-                JOIN workers w ON w.id=runs.worker_id
+            OR NOT EXISTS (SELECT 1 FROM sessions s
+                JOIN users actor ON actor.id=s.user_id AND actor.company_id=s.company_id
+                JOIN workers w ON w.id=runs.worker_id AND w.company_id=runs.company_id
+                JOIN users target ON target.id=runs.initiated_by AND target.company_id=runs.company_id
                 WHERE s.token_hash=runs.request_session_hash AND s.expires_at>now()
-                AND s.user_id=runs.initiated_by AND s.workspace_id=l.workspace_id
-                AND w.assigned_user_id=s.user_id AND w.workspace_id=s.workspace_id AND w.disabled_at IS NULL))""",
+                AND actor.disabled_at IS NULL AND actor.email_verified_at IS NOT NULL
+                AND target.disabled_at IS NULL AND target.email_verified_at IS NOT NULL
+                AND w.assigned_user_id=target.id AND w.disabled_at IS NULL
+                AND (actor.is_devadmin OR (actor.id=target.id AND actor.company_id=runs.company_id))))""",
         params=(worker_id,))
 
 
 def public_run(run):
     return {key: value for key, value in run.items()
-            if key not in ('request_session_hash', 'dispatch_before', 'loop_status', 'loop_workspace_id')}
+            if key not in ('request_session_hash', 'dispatch_before', 'loop_status')}
 
 
 async def queue_run(db, loop, principal):
     # Both create-and-start and explicit reruns use the same reservation checks.
+    if not principal['target_verified']:
+        raise HTTPException(409, 'The selected user must verify their email before running a CtrlLoop')
     worker = await assigned_worker(db, principal)
     await release_expired_control(db, worker['id'])
     await release_expired_queue(db, worker['id'])
@@ -211,33 +284,36 @@ async def queue_run(db, loop, principal):
         raise HTTPException(409, 'Worker is offline')
     active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running')", (worker['id'],))).fetchone()
     if active or worker['active_run']: raise HTTPException(409, 'The desktop already has an active run')
-    run = await (await db.execute("""INSERT INTO runs(id,loop_id,worker_id,initiated_by,request_session_hash,dispatch_before)
-        VALUES(%s,%s,%s,%s,%s,now()+interval '5 minutes') RETURNING *""",
-        (uuid4(),loop['id'],worker['id'],principal['user_id'],principal['session_hash']))).fetchone()
-    run['initiator'] = {key: principal[key] for key in ('username', 'display_name')} | {'id': principal['user_id']}
+    run = await (await db.execute("""INSERT INTO runs(id,company_id,loop_id,worker_id,initiated_by,request_session_hash,dispatch_before)
+        VALUES(%s,%s,%s,%s,%s,%s,now()+interval '5 minutes') RETURNING *""",
+        (uuid4(),principal['company_id'],loop['id'],worker['id'],acting_user(principal),principal['session_hash']))).fetchone()
+    run['initiator'] = {'id': acting_user(principal), 'email': principal['target_email'], 'display_name': principal['target_display_name']}
     message = ('Desktop reserved; the instruction will run automatically when ready'
                if loop['status'] == 'generating' else 'Saved instruction queued for its assigned Omarchy worker')
-    await event(db, loop['id'], 'delivery_queued', message, run_id=run['id'])
+    await event(db, loop['id'], 'delivery_queued', message, run_id=run['id'],
+                data={'actor_user_id': str(principal['user_id'])})
     return public_run(run)
 
 
-def throttle(request, identity=''):
+def throttle(request, identity='', *, peer_limit=True, limit=10):
     now = time.monotonic()
     peer = request.client.host if request.client else 'unknown'
-    keys = ('peer:' + peer, 'identity:' + token_hash(identity)) if identity else ('peer:' + peer,)
+    keys = (('peer:' + peer,) if peer_limit else ()) + (('identity:' + token_hash(identity),) if identity else ())
+    if len(login_attempts) >= 10000:
+        for key in list(login_attempts):
+            if now-login_attempts[key][-1] >= 300: login_attempts.pop(key, None)
+        if any(key not in login_attempts for key in keys) and len(login_attempts) >= 10000:
+            raise HTTPException(429, 'Sign-in service is busy; try again in five minutes')
     for key in keys:
         recent = [stamp for stamp in login_attempts.get(key, []) if now-stamp < 300]
-        if len(recent) >= 10: raise HTTPException(429, 'Too many attempts; wait five minutes')
+        if len(recent) >= limit: raise HTTPException(429, 'Too many attempts; wait five minutes')
         login_attempts[key] = recent + [now]
-    if len(login_attempts) > 10000:
-        for key in list(login_attempts):
-            if not login_attempts[key] or now-login_attempts[key][-1] > 300: login_attempts.pop(key, None)
 
 
-async def issue_session(db, response, user_id, workspace_id):
+async def issue_session(db, response, user_id, company_id):
     raw = secrets.token_urlsafe(32)
-    await db.execute("INSERT INTO sessions(token_hash,expires_at,user_id,workspace_id) VALUES(%s,now()+interval '12 hours',%s,%s)",
-                     (token_hash(raw), user_id, workspace_id))
+    await db.execute("INSERT INTO sessions(token_hash,expires_at,user_id,company_id) VALUES(%s,now()+interval '12 hours',%s,%s)",
+                     (token_hash(raw), user_id, company_id))
     response.set_cookie('ctrl_session', raw, secure=True, httponly=True, samesite='strict', max_age=43200)
 
 
@@ -254,36 +330,52 @@ async def protect(request, call_next):
     return response
 
 
-class Login(BaseModel):
-    username: str = Field(min_length=2, max_length=64)
+class AccountBody(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+
+class EmailBody(AccountBody):
+    email: str = Field(min_length=3, max_length=254)
+
+
+class Login(EmailBody):
     password: str = Field(max_length=500)
 
 
-class ActivationToken(BaseModel):
+class Signup(Login):
+    password: str = Field(min_length=12, max_length=500)
+    display_name: str = Field(min_length=1, max_length=100)
+    role: Literal['user', 'company_admin']
+    company_id: UUID | None = None
+    company_name: str | None = Field(default=None, min_length=1, max_length=100)
+    company_password: str = Field(min_length=12, max_length=500)
+
+
+class AccountToken(AccountBody):
     token: str = Field(min_length=32, max_length=500)
 
 
-class Activation(ActivationToken):
+class PasswordReset(AccountToken):
     password: str = Field(min_length=12, max_length=500)
 
 
-class WorkspaceSelection(BaseModel):
-    workspace_id: UUID
+class CompanyUpdate(AccountBody):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    company_password: str | None = Field(default=None, min_length=12, max_length=500)
+    current_password: str = Field(max_length=500)
 
 
-class NewMember(BaseModel):
-    username: str = Field(min_length=2, max_length=64)
-    display_name: str = Field(min_length=1, max_length=100)
-
-
-class MembershipUpdate(BaseModel):
+class UserUpdate(AccountBody):
     active: bool
+    role: Literal['user', 'company_admin'] | None = None
 
 
 class WorkerDeployment(BaseModel):
     phase: str
     expected_worker_id: str = Field(min_length=1, max_length=200)
     environment: str
+    company_id: UUID
+    assigned_user_id: UUID
     revision: str | None = Field(default=None, max_length=200)
 
 
@@ -319,65 +411,188 @@ async def health():
     return {'status': 'ok'}
 
 
+def account_email(value):
+    try: return normalize_email(value)
+    except ValueError as error: raise HTTPException(400, str(error)) from error
+
+
+async def new_account_token(db, user, purpose):
+    # Persistent per-account limit supplements peer/email/company attempt limits.
+    count = await (await db.execute('''SELECT count(*) AS n FROM auth_tokens
+        WHERE company_id=%s AND user_id=%s AND created_at>now()-interval '1 hour' ''',
+        (user['company_id'],user['id']))).fetchone()
+    if count['n'] >= 5: return None
+    raw = secrets.token_urlsafe(32)
+    minutes = 30 if purpose == 'reset_password' else 1440
+    await db.execute('''INSERT INTO auth_tokens(token_hash,company_id,user_id,purpose,expires_at)
+        VALUES(%s,%s,%s,%s,now()+make_interval(mins => %s))''',
+        (token_hash(raw),user['company_id'],user['id'],purpose,minutes))
+    return raw
+
+
+async def deliver_account_email(email, raw, purpose):
+    if not raw: return delivery_mode()
+    try: return await asyncio.to_thread(send_account_mail, email, raw, purpose)
+    except Exception as error:
+        logger.warning('account mail delivery failed error=%s', type(error).__name__)
+        return 'unavailable'
+
+
+def mail_response(mode, *, signup=False):
+    if mode == 'local':
+        message = 'Development email was captured locally; no email was sent. Ask the local operator for the link.'
+    elif mode == 'unavailable':
+        message = 'Email delivery is unavailable. Contact the operator to configure email, then request a new link.'
+    else:
+        message = ('Check your email to verify your account.' if signup else
+                   'If an eligible account exists, a link has been requested. Check your email.')
+    return {'message': message, 'email_delivery': mode}
+
+
+@app.get('/api/companies')
+async def public_companies(request: Request):
+    # No private company attributes or password material leaves this endpoint.
+    async with database() as db:
+        rows = await (await db.execute('''SELECT c.id,c.name FROM companies c
+            WHERE c.join_password_hash IS NOT NULL AND EXISTS(SELECT 1 FROM users u
+                WHERE u.company_id=c.id AND u.role='company_admin' AND u.email_verified_at IS NOT NULL
+                AND u.disabled_at IS NULL) ORDER BY lower(c.name),c.id''')).fetchall()
+    return {'companies': rows}
+
+
+@app.post('/api/signup')
+async def signup(body: Signup, request: Request):
+    email = account_email(body.email)
+    throttle(request, email)
+    name = body.display_name.strip()
+    if not name: raise HTTPException(400, 'Enter your name')
+    if body.role == 'company_admin':
+        if body.company_id or not body.company_name or not body.company_name.strip():
+            raise HTTPException(400, 'Company admins must create a new company')
+    elif not body.company_id or body.company_name is not None:
+        raise HTTPException(400, 'Users must select an existing company')
+    if body.company_id: throttle(request, 'join:' + str(body.company_id), peer_limit=False, limit=30)
+    async with database() as db:
+        await db.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', ('ctrlloop.email.' + email,))
+        exists = await (await db.execute('SELECT 1 FROM users WHERE email=%s', (email,))).fetchone()
+        if exists: raise HTTPException(409, 'Unable to sign up with this email. Try signing in or recovering your account.')
+        if body.role == 'user':
+            company = await (await db.execute('''SELECT c.* FROM companies c WHERE c.id=%s
+                AND EXISTS(SELECT 1 FROM users u WHERE u.company_id=c.id AND u.role='company_admin'
+                    AND u.email_verified_at IS NOT NULL AND u.disabled_at IS NULL) FOR SHARE OF c''',
+                (body.company_id,))).fetchone()
+            valid = await check_password(body.company_password, (company or {}).get('join_password_hash') or dummy_password_hash)
+            if not company or not valid: raise HTTPException(400, 'Company or company password is incorrect')
+            company_id = company['id']
+        else:
+            company_id = uuid4()
+            encoded_join = await hash_password(body.company_password)
+            await db.execute('INSERT INTO companies(id,slug,name,join_password_hash) VALUES(%s,%s,%s,%s)',
+                (company_id,'company-' + company_id.hex,body.company_name.strip(),encoded_join))
+        encoded = await hash_password(body.password)
+        user = await (await db.execute('''INSERT INTO users(id,company_id,email,display_name,password_hash,role)
+            VALUES(%s,%s,%s,%s,%s,%s) RETURNING id,company_id,email''',
+            (uuid4(),company_id,email,name,encoded,body.role))).fetchone()
+        raw = await new_account_token(db, user, 'verify_email')
+    mode = await deliver_account_email(email, raw, 'verify_email')
+    return {'verification_required': True, **mail_response(mode, signup=True)}
+
+
 @app.post('/api/login')
 async def login(body: Login, request: Request, response: Response):
-    username = body.username.strip().lower()
-    throttle(request, username)
+    email = account_email(body.email)
+    throttle(request, email)
     async with database() as db:
-        user = await (await db.execute('SELECT * FROM users WHERE username=%s FOR SHARE', (username,))).fetchone()
-        valid = await asyncio.to_thread(verify_password, body.password, (user or {}).get('password_hash') or dummy_password_hash)
-        if not valid or not user or not user['activated_at'] or user['disabled_at']:
-            raise HTTPException(401, 'Incorrect username or password')
-        membership = await (await db.execute('''SELECT workspace_id FROM memberships WHERE user_id=%s
-            AND revoked_at IS NULL ORDER BY created_at,workspace_id LIMIT 1 FOR SHARE''', (user['id'],))).fetchone()
-        if not membership: raise HTTPException(403, 'No active workspace membership')
-        await issue_session(db, response, user['id'], membership['workspace_id'])
+        user = await (await db.execute('SELECT * FROM users WHERE email=%s FOR SHARE', (email,))).fetchone()
+        valid = await check_password(body.password, (user or {}).get('password_hash') or dummy_password_hash)
+        if not valid or not user or user['disabled_at']:
+            raise HTTPException(401, 'Incorrect email or password')
+        if not user['email_verified_at']:
+            raise HTTPException(403, 'Verify your email before signing in. You can request a new verification link.')
+        old_digest = token_hash(request.cookies.get('ctrl_session', ''))
+        await lock_session_owner(db, old_digest)
+        await db.execute("UPDATE workers SET mode='agent',human_session=NULL WHERE human_session=%s", (old_digest,))
+        await interrupt_queued_runs(db, 'Sign-in changed before dispatch. Start again when ready.',
+                                    clause='request_session_hash=%s', params=(old_digest,))
+        await db.execute('DELETE FROM sessions WHERE token_hash=%s', (old_digest,))
+        await issue_session(db, response, user['id'], user['company_id'])
     return {'authenticated': True}
 
 
-async def activation_user(db, token, *, lock=False):
-    user = await (await db.execute('''SELECT * FROM users WHERE activation_token_hash=%s
-        AND activation_expires_at>now() AND activated_at IS NULL AND disabled_at IS NULL'''
-        + (' FOR UPDATE' if lock else ''), (token_hash(token),))).fetchone()
-    if not user: raise HTTPException(400, 'Activation link is invalid, expired or already used')
-    memberships = await (await db.execute('''SELECT w.id,w.name FROM workspaces w JOIN memberships m
-        ON m.workspace_id=w.id WHERE m.user_id=%s AND m.revoked_at IS NULL
-        ORDER BY m.created_at,w.id FOR SHARE OF m''', (user['id'],))).fetchall()
-    if not memberships: raise HTTPException(400, 'Activation link has no active workspace membership')
-    return user, memberships
+async def consume_account_token(db, raw, purpose):
+    digest = token_hash(raw)
+    candidate = await (await db.execute('SELECT user_id FROM auth_tokens WHERE token_hash=%s', (digest,))).fetchone()
+    if not candidate: raise HTTPException(400, 'Link is invalid, expired or already used')
+    # Shared lock order with login, worker authorization, and account management.
+    user = await (await db.execute('SELECT * FROM users WHERE id=%s AND disabled_at IS NULL FOR UPDATE',
+                                  (candidate['user_id'],))).fetchone()
+    if not user: raise HTTPException(400, 'Link is invalid, expired or already used')
+    token = await (await db.execute('''DELETE FROM auth_tokens WHERE token_hash=%s AND purpose=%s
+        AND company_id=%s AND user_id=%s AND expires_at>now() RETURNING token_hash''',
+        (digest,purpose,user['company_id'],user['id']))).fetchone()
+    if not token: raise HTTPException(400, 'Link is invalid, expired or already used')
+    return user
 
 
-@app.post('/api/activate/inspect')
-async def inspect_activation(body: ActivationToken, request: Request):
+@app.post('/api/verify-email')
+async def verify_email(body: AccountToken, request: Request):
     throttle(request)
     async with database() as db:
-        user, memberships = await activation_user(db, body.token)
-        return {'user': {'username': user['username'], 'display_name': user['display_name']},
-                'workspaces': memberships, 'expires_at': user['activation_expires_at']}
+        user = await consume_account_token(db, body.token, 'verify_email')
+        await db.execute('UPDATE users SET email_verified_at=COALESCE(email_verified_at,now()) WHERE id=%s', (user['id'],))
+        await db.execute("DELETE FROM auth_tokens WHERE user_id=%s AND purpose='verify_email'", (user['id'],))
+    return {'message': 'Email verified. Sign in with your personal password.'}
 
 
-@app.post('/api/activate')
-async def activate(body: Activation, request: Request, response: Response):
+async def request_account_email(body, request, purpose):
+    email = account_email(body.email)
+    throttle(request, email)
+    raw = None
+    async with database() as db:
+        user = await (await db.execute('SELECT * FROM users WHERE email=%s AND disabled_at IS NULL FOR UPDATE', (email,))).fetchone()
+        if user and (purpose == 'reset_password' or not user['email_verified_at']):
+            raw = await new_account_token(db, user, purpose)
+    return mail_response(await deliver_account_email(email, raw, purpose))
+
+
+@app.post('/api/resend-verification')
+async def resend_verification(body: EmailBody, request: Request):
+    return await request_account_email(body, request, 'verify_email')
+
+
+@app.post('/api/forgot-password')
+async def forgot_password(body: EmailBody, request: Request):
+    return await request_account_email(body, request, 'reset_password')
+
+
+@app.post('/api/reset-password')
+async def reset_password(body: PasswordReset, request: Request, response: Response):
     throttle(request)
     async with database() as db:
-        user, memberships = await activation_user(db, body.token, lock=True)
-        encoded = await asyncio.to_thread(password_hash, body.password)
-        await db.execute('''UPDATE users SET password_hash=%s,activated_at=now(),activation_token_hash=NULL,
-            activation_expires_at=NULL WHERE id=%s''', (encoded, user['id']))
-        await issue_session(db, response, user['id'], memberships[0]['id'])
-    return {'authenticated': True}
+        user = await consume_account_token(db, body.token, 'reset_password')
+        encoded = await hash_password(body.password)
+        await db.execute('UPDATE users SET password_hash=%s,email_verified_at=COALESCE(email_verified_at,now()) WHERE id=%s', (encoded,user['id']))
+        # Reset proves possession of the email; migrated pending accounts can activate here.
+        await db.execute('DELETE FROM auth_tokens WHERE user_id=%s', (user['id'],))
+        await db.execute('''UPDATE workers SET mode=CASE WHEN mode='human' THEN 'agent' ELSE mode END,human_session=NULL
+            WHERE human_session IN (SELECT token_hash FROM sessions WHERE user_id=%s)''', (user['id'],))
+        await interrupt_queued_runs(db, 'Password reset before dispatch. Start again after signing in.',
+            clause='request_session_hash IN (SELECT token_hash FROM sessions WHERE user_id=%s)', params=(user['id'],))
+        await db.execute('DELETE FROM sessions WHERE user_id=%s', (user['id'],))
+    response.delete_cookie('ctrl_session', secure=True, httponly=True, samesite='strict')
+    return {'message': 'Password reset. Sign in with your new personal password.'}
 
 
 @app.post('/api/logout')
 async def logout(request: Request, response: Response):
     digest = token_hash(request.cookies.get('ctrl_session', ''))
     async with database() as db:
-        # Logging out remains possible after a membership was revoked.
-        await db.execute('DELETE FROM sessions WHERE token_hash=%s', (digest,))
+        await lock_session_owner(db, digest)
+        await db.execute("UPDATE workers SET mode='agent',human_session=NULL WHERE human_session=%s", (digest,))
         await interrupt_queued_runs(db, 'Signed out before dispatch. Start again after signing in.',
                                     clause='request_session_hash=%s', params=(digest,))
-        await db.execute("UPDATE workers SET mode='agent',human_session=NULL WHERE human_session=%s", (digest,))
-    response.delete_cookie('ctrl_session')
+        await db.execute('DELETE FROM sessions WHERE token_hash=%s', (digest,))
+    response.delete_cookie('ctrl_session', secure=True, httponly=True, samesite='strict')
     return {'authenticated': False}
 
 
@@ -385,7 +600,9 @@ async def logout(request: Request, response: Response):
 async def session(request: Request):
     async with database() as db:
         try: identity = await authorize(request, db)
-        except HTTPException: return {'authenticated': False}
+        except HTTPException as error:
+            if error.status_code == 401: return {'authenticated': False}
+            raise
         worker = await assigned_worker(db, identity, required=False)
         queued = None
         if worker:
@@ -393,75 +610,87 @@ async def session(request: Request):
             await release_expired_queue(db, worker['id'])
             worker = await assigned_worker(db, identity)
             queued = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status='queued'", (worker['id'],))).fetchone()
-        memberships = await (await db.execute('''SELECT m.workspace_id,w.slug,w.name,m.role FROM memberships m
-            JOIN workspaces w ON w.id=m.workspace_id WHERE m.user_id=%s AND m.revoked_at IS NULL
-            ORDER BY w.name,w.id''', (identity['user_id'],))).fetchall()
         return {'authenticated': True,
-                'user': {'id': identity['user_id'], 'username': identity['username'], 'display_name': identity['display_name']},
-                'workspace': {'id': identity['workspace_id'], 'slug': identity['workspace_slug'],
-                              'name': identity['workspace_name'], 'role': identity['role']},
-                'memberships': memberships, 'worker': public_worker(worker, identity['session_hash'], queued_run=queued['id'] if queued else None),
+                'user': {key: identity[key] for key in ('email','display_name','is_devadmin')} | {'id': identity['user_id']},
+                'company': {'id': identity['company_id'], 'slug': identity['company_slug'],
+                            'name': identity['company_name'], 'role': identity['role'] if identity['company_id']==identity['home_company_id'] else None},
+                'home_company_id': identity['home_company_id'], 'target_user_id': identity['target_user_id'],
+                'worker': public_worker(worker, identity['session_hash'], queued_run=queued['id'] if queued else None),
                 'model': MODEL, 'reasoning_effort': 'high', 'jev_model': 'jev-1.13.0'}
 
 
-@app.post('/api/session/workspace')
-async def select_workspace(body: WorkspaceSelection, request: Request):
+@app.get('/api/admin/companies')
+async def admin_companies(request: Request):
     async with database() as db:
-        identity = await authorize(request, db, session_update=True)
-        membership = await (await db.execute('''SELECT 1 FROM memberships WHERE user_id=%s AND workspace_id=%s
-            AND revoked_at IS NULL FOR SHARE''', (identity['user_id'], body.workspace_id))).fetchone()
-        if not membership: raise HTTPException(403, 'Active workspace membership required')
-        await interrupt_queued_runs(db, 'Company changed before dispatch. Start again in the selected company.',
-                                    clause='request_session_hash=%s', params=(identity['session_hash'],))
-        await db.execute("UPDATE workers SET mode='agent',human_session=NULL WHERE human_session=%s", (identity['session_hash'],))
-        await db.execute('UPDATE sessions SET workspace_id=%s WHERE token_hash=%s', (body.workspace_id, identity['session_hash']))
-    return {'workspace_id': body.workspace_id}
+        identity = await authorize(request, db)
+        if not identity['is_devadmin']: raise HTTPException(403, 'Platform devadmin access required')
+        return {'companies': await (await db.execute('SELECT id,slug,name FROM companies ORDER BY name,id')).fetchall()}
 
 
-@app.get('/api/memberships')
-async def list_memberships(request: Request):
+@app.get('/api/company/users')
+async def company_users(request: Request):
     async with database() as db:
         identity = await authorize(request, db, owner=True)
-        rows = await (await db.execute('''SELECT u.id AS user_id,u.username,u.display_name,m.role,
-            CASE WHEN m.revoked_at IS NOT NULL OR u.disabled_at IS NOT NULL THEN 'revoked'
-                 WHEN u.activated_at IS NULL THEN 'pending' ELSE 'active' END AS status,
-            w.id AS worker_id,w.last_seen,w.mode FROM memberships m JOIN users u ON u.id=m.user_id
-            LEFT JOIN workers w ON w.workspace_id=m.workspace_id AND w.assigned_user_id=m.user_id AND w.disabled_at IS NULL
-            WHERE m.workspace_id=%s ORDER BY u.display_name,u.username''', (identity['workspace_id'],))).fetchall()
+        rows = await (await db.execute('''SELECT u.id AS user_id,u.email,u.display_name,u.role,
+            CASE WHEN u.disabled_at IS NOT NULL THEN 'disabled'
+                 WHEN u.email_verified_at IS NULL THEN 'pending' ELSE 'active' END AS status,
+            w.id AS worker_id,w.last_seen,w.mode FROM users u
+            LEFT JOIN workers w ON w.company_id=u.company_id AND w.assigned_user_id=u.id AND w.disabled_at IS NULL
+            WHERE u.company_id=%s ORDER BY u.display_name,u.email''', (identity['company_id'],))).fetchall()
         for row in rows:
-            worker_id, seen, mode = row.pop('worker_id'), row.pop('last_seen'), row.pop('mode')
+            worker_id,seen,mode = row.pop('worker_id'),row.pop('last_seen'),row.pop('mode')
             row['worker'] = {'id': worker_id, 'mode': mode, 'status': 'online' if seen and (datetime.now(timezone.utc)-seen).total_seconds()<30 else 'offline'} if worker_id else None
-        return {'members': rows}
+        return {'users': rows}
 
 
-@app.post('/api/memberships')
-async def add_membership(body: NewMember, request: Request):
+@app.patch('/api/company')
+async def update_company(body: CompanyUpdate, request: Request):
+    throttle(request)
     async with database() as db:
-        identity = await authorize(request, db, owner=True)
-        try: return await create_member(db, identity['workspace_id'], body.username, body.display_name)
-        except ValueError as error: raise HTTPException(409, str(error)) from error
+        identity = await authorize_company_management(request, db)
+        credentials = await (await db.execute('SELECT password_hash FROM users WHERE id=%s', (identity['user_id'],))).fetchone()
+        if not await check_password(body.current_password, credentials['password_hash']):
+            raise HTTPException(403, 'Your current personal password is incorrect')
+        if body.name is not None:
+            if not body.name.strip(): raise HTTPException(400, 'Enter a company name')
+            await db.execute('UPDATE companies SET name=%s WHERE id=%s', (body.name.strip(),identity['company_id']))
+        if body.company_password is not None:
+            encoded = await hash_password(body.company_password)
+            await db.execute('UPDATE companies SET join_password_hash=%s WHERE id=%s', (encoded,identity['company_id']))
+    return {'message': 'Company updated. Company password changes apply only to future signups.'}
 
 
-@app.patch('/api/memberships/{user_id}')
-async def update_membership(user_id: UUID, body: MembershipUpdate, request: Request):
+@app.patch('/api/company/users/{user_id}')
+async def update_company_user(user_id: UUID, body: UserUpdate, request: Request):
     async with database() as db:
-        identity = await authorize(request, db, owner=True)
-        if user_id == identity['user_id']: raise HTTPException(409, 'You cannot change your own membership')
-        membership = await (await db.execute('SELECT * FROM memberships WHERE workspace_id=%s AND user_id=%s FOR UPDATE',
-            (identity['workspace_id'], user_id))).fetchone()
-        if not membership: raise HTTPException(404, 'Membership not found')
-        # Owner role changes are an explicit admin operation, not member controls.
-        if membership['role'] == 'owner': raise HTTPException(409, 'Owner memberships require an administrator')
-        await db.execute('UPDATE memberships SET revoked_at=' + ('NULL' if body.active else 'now()') + ' WHERE workspace_id=%s AND user_id=%s',
-                         (identity['workspace_id'], user_id))
+        identity = await authorize_company_management(request, db)
+        if user_id == identity['user_id']: raise HTTPException(409, 'You cannot change your own company role or access')
+        await db.execute('SELECT id FROM companies WHERE id=%s FOR UPDATE', (identity['company_id'],))
+        user = await (await db.execute('SELECT * FROM users WHERE company_id=%s AND id=%s FOR UPDATE',
+            (identity['company_id'],user_id))).fetchone()
+        if not user: raise HTTPException(404, 'Company user not found')
+        if user['is_devadmin'] and not identity['is_devadmin']:
+            raise HTTPException(403, 'Platform devadmin accounts require platform administration')
+        role = body.role or user['role']
+        if user['role'] == 'company_admin' and (not body.active or role != 'company_admin'):
+            other = await (await db.execute("SELECT 1 FROM users WHERE company_id=%s AND id<>%s AND role='company_admin' AND disabled_at IS NULL AND email_verified_at IS NOT NULL LIMIT 1",
+                (identity['company_id'],user_id))).fetchone()
+            if not other: raise HTTPException(409, 'Keep at least one verified, active company admin')
+        active = await (await db.execute("SELECT 1 FROM runs WHERE company_id=%s AND initiated_by=%s AND status IN ('queued','running') LIMIT 1",
+            (identity['company_id'],user_id))).fetchone()
+        if not body.active and active: raise HTTPException(409, 'Wait for this user’s queued or running work to finish before disabling access')
+        await db.execute('UPDATE users SET role=%s,disabled_at=' + ('NULL' if body.active else 'now()') + ' WHERE id=%s AND company_id=%s',
+            (role,user_id,identity['company_id']))
         if not body.active:
-            await db.execute('DELETE FROM sessions WHERE workspace_id=%s AND user_id=%s', (identity['workspace_id'], user_id))
-            await interrupt_queued_runs(db, 'Membership revoked before dispatch. No actions were sent.',
-                clause='initiated_by=%s AND loop_id IN (SELECT id FROM loops WHERE workspace_id=%s)',
-                params=(user_id, identity['workspace_id']))
-            await db.execute("UPDATE workers SET mode=CASE WHEN mode='human' THEN 'agent' ELSE mode END,human_session=NULL WHERE workspace_id=%s AND assigned_user_id=%s",
-                             (identity['workspace_id'], user_id))
-    return {'user_id': user_id, 'active': body.active}
+            await db.execute('''UPDATE workers SET mode=CASE WHEN mode='human' THEN 'agent' ELSE mode END,human_session=NULL
+                WHERE (company_id=%s AND assigned_user_id=%s) OR human_session IN(SELECT token_hash FROM sessions WHERE user_id=%s)''',
+                (identity['company_id'],user_id,user_id))
+            await interrupt_queued_runs(db, 'Account disabled before dispatch. No actions were sent.',
+                clause='request_session_hash IN (SELECT token_hash FROM sessions WHERE user_id=%s)', params=(user_id,))
+            await db.execute('DELETE FROM sessions WHERE user_id=%s', (user_id,))
+            await db.execute('DELETE FROM auth_tokens WHERE user_id=%s', (user_id,))
+    return {'user_id': user_id, 'active': body.active, 'role': role}
+
 
 
 @app.post('/api/worker/mode')
@@ -487,9 +716,9 @@ async def change_mode(body: Mode, request: Request):
 async def list_loops(request: Request):
     async with database() as db:
         identity = await authorize(request, db)
-        return await (await db.execute('''SELECT l.*,jsonb_build_object('id',u.id,'username',u.username,'display_name',u.display_name) AS creator
-            FROM loops l LEFT JOIN users u ON u.id=l.created_by WHERE l.workspace_id=%s
-            ORDER BY l.created_at DESC LIMIT 100''', (identity['workspace_id'],))).fetchall()
+        return await (await db.execute('''SELECT l.*,jsonb_build_object('id',u.id,'email',u.email,'display_name',u.display_name) AS creator
+            FROM loops l LEFT JOIN users u ON u.id=l.created_by WHERE l.company_id=%s
+            ORDER BY l.created_at DESC LIMIT 100''', (identity['company_id'],))).fetchall()
 
 
 @app.post('/api/loops')
@@ -499,19 +728,19 @@ async def create_loop(body: Prompt, request: Request):
     identity = uuid4()
     async with database() as db:
         principal = await authorize(request, db)
-        busy = await (await db.execute("SELECT count(*) AS count FROM loops WHERE workspace_id=%s AND status='generating'", (principal['workspace_id'],))).fetchone()
+        busy = await (await db.execute("SELECT count(*) AS count FROM loops WHERE company_id=%s AND status='generating'", (principal['company_id'],))).fetchone()
         if busy['count'] >= 3: raise HTTPException(429, 'Generation is busy; try again shortly')
-        row = await (await db.execute('INSERT INTO loops(id,prompt,model,workspace_id,created_by) VALUES(%s,%s,%s,%s,%s) RETURNING *',
-            (identity,prompt,MODEL,principal['workspace_id'],principal['user_id']))).fetchone()
-        row['creator'] = {key: principal[key] for key in ('username', 'display_name')} | {'id': principal['user_id']}
-        await event(db, identity, 'user_request', prompt)
+        row = await (await db.execute('INSERT INTO loops(id,prompt,model,company_id,created_by) VALUES(%s,%s,%s,%s,%s) RETURNING *',
+            (identity,prompt,MODEL,principal['company_id'],acting_user(principal)))).fetchone()
+        row['creator'] = {'id': acting_user(principal), 'email': principal['target_email'], 'display_name': principal['target_display_name']}
+        await event(db, identity, 'user_request', prompt, data={'actor_user_id': str(principal['user_id'])})
         await event(db, identity, 'llm_generation', 'Generating an instruction with gpt-6-luna · high reasoning')
         row['runs'] = [await queue_run(db, row, principal)] if body.start else []
-    task = asyncio.create_task(generate_instruction(identity, prompt)); generation_tasks.add(task); task.add_done_callback(generation_tasks.discard)
+    task = asyncio.create_task(generate_instruction(identity, prompt, principal['company_id'])); generation_tasks.add(task); task.add_done_callback(generation_tasks.discard)
     return row
 
 
-async def generate_instruction(identity, prompt):
+async def generate_instruction(identity, prompt, company_id):
     started = time.monotonic()
     payload = {'model': MODEL, 'reasoning': {'effort': 'high'}, 'store': False,
                'instructions': 'Restate the user request as one concise computer instruction, preserving their intended application and task. Output only the instruction. Do not invent task data, credentials, destinations, additional steps, or claims of execution. The executor can select visible windows and controls and attempt click or type actions, but does not yet plan arbitrary tasks, generate typing content, or assess general task completion. Preserve the request faithfully even when those capabilities may be needed; do not redirect it to a particular website.',
@@ -546,14 +775,14 @@ async def generate_instruction(identity, prompt):
         instruction = ''.join(part.get('text','') for item in result.get('output',[]) if item.get('type')=='message' for part in item.get('content',[]) if part.get('type')=='output_text').strip()
         if result.get('status') != 'completed' or not instruction: raise ValueError('Model did not return a complete instruction')
         async with database() as db:
-            await db.execute("UPDATE loops SET instruction=%s,status='ready',generated_at=now(),llm_response_id=%s,llm_usage=%s WHERE id=%s", (instruction,result.get('id'),Jsonb(result.get('usage',{})),identity))
+            await db.execute("UPDATE loops SET instruction=%s,status='ready',generated_at=now(),llm_response_id=%s,llm_usage=%s WHERE id=%s AND company_id=%s", (instruction,result.get('id'),Jsonb(result.get('usage',{})),identity,company_id))
             await event(db,identity,'llm_generated',instruction,data={'model':result.get('model'), 'reasoning_effort':'high','duration_ms':round((time.monotonic()-started)*1000), 'response_id':result.get('id'),'usage':result.get('usage')})
             await event(db,identity,'db_saved','Generated instruction committed to PostgreSQL')
     except asyncio.CancelledError:
         async with database() as db:
             await interrupt_queued_runs(db, 'Generation interrupted before dispatch. No actions were sent.',
-                                        clause='loop_id=%s', params=(identity,))
-            await db.execute("UPDATE loops SET status='error',error='Generation interrupted; inspect available request evidence.' WHERE id=%s", (identity,))
+                                        clause='loop_id=%s AND company_id=%s', params=(identity,company_id))
+            await db.execute("UPDATE loops SET status='error',error='Generation interrupted; inspect available request evidence.' WHERE id=%s AND company_id=%s", (identity,company_id))
             await event(db, identity, 'error', 'Generation interrupted; response capture may be unavailable',
                         data={'error_type': 'CancelledError', 'duration_ms': round((time.monotonic()-started)*1000, 3)})
         raise
@@ -561,8 +790,8 @@ async def generate_instruction(identity, prompt):
         message = f'LLM generation failed ({type(error).__name__}); no instruction was fabricated.'
         async with database() as db:
             await interrupt_queued_runs(db, 'Generation failed before dispatch. No actions were sent.',
-                                        clause='loop_id=%s', params=(identity,))
-            await db.execute("UPDATE loops SET status='error',error=%s WHERE id=%s", (message,identity))
+                                        clause='loop_id=%s AND company_id=%s', params=(identity,company_id))
+            await db.execute("UPDATE loops SET status='error',error=%s WHERE id=%s AND company_id=%s", (message,identity,company_id))
             await event(db,identity,'error',message,data={'error_type':type(error).__name__, 'duration_ms':round((time.monotonic()-started)*1000, 3)})
 
 
@@ -570,16 +799,16 @@ async def generate_instruction(identity, prompt):
 async def loop_detail(identity: UUID, request: Request):
     async with database() as db:
         principal = await authorize(request, db)
-        row = await (await db.execute('''SELECT l.*,jsonb_build_object('id',u.id,'username',u.username,'display_name',u.display_name) AS creator
-            FROM loops l LEFT JOIN users u ON u.id=l.created_by WHERE l.id=%s AND l.workspace_id=%s''', (identity,principal['workspace_id']))).fetchone()
+        row = await (await db.execute('''SELECT l.*,jsonb_build_object('id',u.id,'email',u.email,'display_name',u.display_name) AS creator
+            FROM loops l LEFT JOIN users u ON u.id=l.created_by WHERE l.id=%s AND l.company_id=%s''', (identity,principal['company_id']))).fetchone()
         if not row: raise HTTPException(404,'Loop not found')
-        row['events'] = await (await db.execute('SELECT * FROM events WHERE loop_id=%s AND run_id IS NULL ORDER BY created_at',(identity,))).fetchall()
-        row['runs'] = await (await db.execute('''SELECT r.*,jsonb_build_object('id',u.id,'username',u.username,'display_name',u.display_name) AS initiator
+        row['events'] = await (await db.execute('SELECT * FROM events WHERE company_id=%s AND loop_id=%s AND run_id IS NULL ORDER BY created_at',(principal['company_id'],identity))).fetchall()
+        row['runs'] = await (await db.execute('''SELECT r.*,jsonb_build_object('id',u.id,'email',u.email,'display_name',u.display_name) AS initiator
             FROM runs r LEFT JOIN users u ON u.id=r.initiated_by JOIN workers w ON w.id=r.worker_id
-            WHERE r.loop_id=%s AND w.workspace_id=%s ORDER BY r.created_at DESC''', (identity,principal['workspace_id']))).fetchall()
+            WHERE r.loop_id=%s AND r.company_id=%s ORDER BY r.created_at DESC''', (identity,principal['company_id']))).fetchall()
         row['runs'] = [public_run(run) for run in row['runs']]
         for run in row['runs']:
-            run['events'] = await (await db.execute('SELECT * FROM events WHERE run_id=%s ORDER BY created_at',(run['id'],))).fetchall()
+            run['events'] = await (await db.execute('SELECT * FROM events WHERE company_id=%s AND run_id=%s ORDER BY created_at',(principal['company_id'],run['id']))).fetchall()
         return row
 
 
@@ -587,7 +816,7 @@ async def loop_detail(identity: UUID, request: Request):
 async def create_run(identity: UUID, request: Request):
     async with database() as db:
         principal = await authorize(request, db)
-        loop = await (await db.execute('SELECT * FROM loops WHERE id=%s AND workspace_id=%s', (identity,principal['workspace_id']))).fetchone()
+        loop = await (await db.execute('SELECT * FROM loops WHERE id=%s AND company_id=%s', (identity,principal['company_id']))).fetchone()
         if not loop or loop['status'] != 'ready': raise HTTPException(409, 'A saved instruction is required')
         return await queue_run(db, loop, principal)
 
@@ -595,44 +824,44 @@ async def create_run(identity: UUID, request: Request):
 @app.post('/api/worker/poll')
 async def worker_poll(body: WorkerPoll, request: Request):
     async with database() as db:
-        # Hold membership, then the requesting session, then worker/run locks.
-        # Logout/revocation cannot commit between authorization and dispatch.
+        # Lock the target and real actor, then actor session, then worker/run.
+        # Revocation/reset/logout cannot commit between validation and dispatch.
         worker = await worker_authorize(request, db, lock=False)
-        pending = await (await db.execute("""SELECT r.*,l.instruction,l.status AS loop_status,
-            l.workspace_id AS loop_workspace_id FROM runs r JOIN loops l ON l.id=r.loop_id
-            WHERE r.worker_id=%s AND r.status='queued'""", (worker['id'],))).fetchone()
-        valid_session = None
-        if pending and pending['initiated_by'] == worker['assigned_user_id'] and pending['loop_workspace_id'] == worker['workspace_id']:
-            valid_session = await (await db.execute("""SELECT token_hash FROM sessions WHERE token_hash=%s
-                AND user_id=%s AND workspace_id=%s AND expires_at>now() FOR SHARE""",
-                (pending['request_session_hash'],worker['assigned_user_id'],worker['workspace_id']))).fetchone()
+        pending = await (await db.execute("SELECT * FROM runs WHERE worker_id=%s AND status='queued'", (worker['id'],))).fetchone()
+        principal = None
+        if pending and pending['request_session_hash']:
+            actor = await session_identity(db, pending['request_session_hash'], lock=True)
+            if actor:
+                try: principal = await target_context(db, actor, pending['company_id'], pending['initiated_by'])
+                except HTTPException: pass
         worker = await worker_authorize(request, db)
         await release_expired_control(db, worker['id'])
         worker = await (await db.execute('UPDATE workers SET last_seen=now(),revision=%s WHERE id=%s RETURNING *', (body.revision,worker['id']))).fetchone()
         if not pending: return {'run': None}
-        # A different/new reservation waits for the next poll; it was not authorized above.
-        run = await (await db.execute("""SELECT r.*,l.instruction,l.status AS loop_status,
-            l.workspace_id AS loop_workspace_id FROM runs r JOIN loops l ON l.id=r.loop_id
-            WHERE r.id=%s AND r.worker_id=%s AND r.status='queued' FOR UPDATE OF r""",
-            (pending['id'],worker['id']))).fetchone()
+        # A new reservation waits for the next poll; it was not authorized above.
+        run = await (await db.execute("""SELECT r.*,l.instruction,l.status AS loop_status
+            FROM runs r JOIN loops l ON l.id=r.loop_id AND l.company_id=r.company_id
+            WHERE r.id=%s AND r.worker_id=%s AND r.company_id=%s AND r.status='queued' FOR UPDATE OF r""",
+            (pending['id'],worker['id'],worker['company_id']))).fetchone()
         if not run: return {'run': None}
-        authorized = (valid_session and run['request_session_hash'] == valid_session['token_hash']
-                      and run['initiated_by'] == worker['assigned_user_id']
-                      and run['loop_workspace_id'] == worker['workspace_id'])
+        authorized = (principal and principal['target_verified']
+                      and run['request_session_hash'] == principal['session_hash']
+                      and run['initiated_by'] == principal['target_user_id'] == worker['assigned_user_id']
+                      and run['company_id'] == principal['company_id'] == worker['company_id'])
         if not authorized or not run['dispatch_before'] or run['dispatch_before'] <= datetime.now(timezone.utc):
-            await interrupt_queued_runs(db, 'Start expired or sign-in is no longer valid. Start again when ready.',
-                                        clause='id=%s', params=(run['id'],))
+            await interrupt_queued_runs(db, 'Start expired or authorization is no longer valid. Start again when ready.',
+                                        clause='id=%s AND company_id=%s', params=(run['id'],worker['company_id']))
             return {'run': None}
         if run['loop_status'] == 'error':
             await interrupt_queued_runs(db, 'Generation failed before dispatch. No actions were sent.',
-                                        clause='id=%s', params=(run['id'],))
+                                        clause='id=%s AND company_id=%s', params=(run['id'],worker['company_id']))
             return {'run': None}
         if worker['active_run'] or worker['mode'] != 'agent' or run['loop_status'] != 'ready' or not run['instruction']:
             return {'run': None}
-        await db.execute("UPDATE runs SET status='running',started_at=now(),revision=%s,request_session_hash=NULL WHERE id=%s", (body.revision,run['id']))
+        await db.execute("UPDATE runs SET status='running',started_at=now(),revision=%s,request_session_hash=NULL WHERE id=%s AND company_id=%s", (body.revision,run['id'],worker['company_id']))
         await db.execute('UPDATE workers SET active_run=%s WHERE id=%s', (run['id'],worker['id']))
         await event(db, run['loop_id'], 'delivery_sent', 'Persisted instruction dispatched to the assigned worker',
-                    run_id=run['id'], data={'revision': body.revision, 'worker': worker['id']})
+                    run_id=run['id'], data={'revision': body.revision, 'worker': worker['id'], 'actor_user_id': str(principal['user_id'])})
         return {'run': public_run(run)}
 
 
@@ -641,7 +870,8 @@ async def worker_heartbeat(request: Request):
     async with database() as db:
         worker = await worker_authorize(request, db)
         await db.execute('UPDATE workers SET last_seen=now() WHERE id=%s',(worker['id'],))
-    return {'ok':True, 'worker_id':worker['id'], 'environment':os.environ['APP_ENV']}
+    return {'ok':True, 'worker_id':worker['id'], 'company_id':worker['company_id'],
+            'assigned_user_id':worker['assigned_user_id'], 'environment':os.environ['APP_ENV']}
 
 
 @app.post('/api/worker/deployment')
@@ -649,7 +879,8 @@ async def worker_deployment(body: WorkerDeployment, request: Request):
     if body.phase not in ('begin', 'finish'): raise HTTPException(400, 'Invalid deployment phase')
     async with database() as db:
         worker = await worker_authorize(request, db)
-        if body.expected_worker_id != worker['id'] or body.environment != os.environ['APP_ENV']:
+        if (body.expected_worker_id != worker['id'] or body.environment != os.environ['APP_ENV']
+                or body.company_id != worker['company_id'] or body.assigned_user_id != worker['assigned_user_id']):
             raise HTTPException(409, 'Deployment worker or environment does not match the credential')
         await release_expired_queue(db, worker['id'])
         active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running')", (worker['id'],))).fetchone()
@@ -659,7 +890,8 @@ async def worker_deployment(body: WorkerDeployment, request: Request):
         mode = 'maintenance' if body.phase == 'begin' else 'agent'
         await db.execute('UPDATE workers SET mode=%s,human_session=NULL,revision=COALESCE(%s,revision) WHERE id=%s',
                          (mode, body.revision if body.phase == 'finish' else None, worker['id']))
-    return {'worker_id': worker['id'], 'environment': os.environ['APP_ENV'], 'mode': mode}
+    return {'worker_id': worker['id'], 'company_id': worker['company_id'],
+            'assigned_user_id': worker['assigned_user_id'], 'environment': os.environ['APP_ENV'], 'mode': mode}
 
 
 @app.post('/api/worker/recover')
@@ -668,12 +900,12 @@ async def worker_recover(request: Request):
     async with database() as db:
         worker = await worker_authorize(request, db)
         await interrupt_queued_runs(db, 'Worker restarted before dispatch. Start again when ready.',
-                                    clause='worker_id=%s', params=(worker['id'],))
+                                    clause='worker_id=%s AND company_id=%s', params=(worker['id'],worker['company_id']))
         rows=await (await db.execute("""UPDATE runs r SET status='interrupted',finished_at=now(),
             error='Worker restarted or delivery was interrupted. Actions were not replayed.' FROM loops l
-            WHERE r.loop_id=l.id AND r.worker_id=%s AND r.initiated_by=%s AND l.workspace_id=%s
+            WHERE r.loop_id=l.id AND r.worker_id=%s AND r.initiated_by=%s AND l.company_id=%s
             AND r.status='running' RETURNING r.id,r.loop_id""",
-            (worker['id'],worker['assigned_user_id'],worker['workspace_id']))).fetchall()
+            (worker['id'],worker['assigned_user_id'],worker['company_id']))).fetchall()
         for row in rows:
             await event(db,row['loop_id'],'interrupted','Worker restarted; inspect the desktop before a new run. No actions replayed.',run_id=row['id'])
         await db.execute('UPDATE workers SET active_run=NULL,last_seen=now() WHERE id=%s',(worker['id'],))
@@ -682,9 +914,9 @@ async def worker_recover(request: Request):
 
 async def owned_run(db, identity, worker, *, active=True):
     run = await (await db.execute('''SELECT r.* FROM runs r JOIN loops l ON l.id=r.loop_id
-        WHERE r.id=%s AND r.worker_id=%s AND r.initiated_by=%s AND l.workspace_id=%s'''
+        WHERE r.id=%s AND r.worker_id=%s AND r.initiated_by=%s AND l.company_id=%s'''
         + (" AND r.status='running'" if active else '') + ' FOR UPDATE OF r',
-        (identity,worker['id'],worker['assigned_user_id'],worker['workspace_id']))).fetchone()
+        (identity,worker['id'],worker['assigned_user_id'],worker['company_id']))).fetchone()
     if not run: raise HTTPException(409,'Run is not owned by this active worker')
     return run
 
@@ -721,19 +953,22 @@ async def desktop(websocket: WebSocket):
     if websocket.headers.get('origin') != os.environ['APP_ORIGIN']:
         await websocket.close(code=1008);return
     async with database() as db:
-        identity = await session_identity(db, digest, lock=True)
+        try: identity = await authorize(websocket, db)
+        except HTTPException: identity = None
         worker = await assigned_worker(db, identity, required=False) if identity else None
-        if not worker or not worker['fleet_namespace'] or not worker['fleet_claim']:
-            await websocket.close(code=1008);return
-    # A socket is bound to this identity, workspace and target for its lifetime.
-    # A workspace switch, reassignment or revocation cannot redirect the socket.
+    if not worker or not worker['fleet_namespace'] or not worker['fleet_claim']:
+        await websocket.close(code=1008);return
+    # A socket is bound to this identity, company and target for its lifetime.
+    # A company switch, reassignment or revocation cannot redirect the socket.
     async def connection_worker(db):
-        current = await session_identity(db, digest, lock=True)
-        if not current or current['user_id'] != identity['user_id'] or current['workspace_id'] != identity['workspace_id']:
+        try: current = await authorize(websocket, db)
+        except HTTPException: return None
+        if (current['user_id'] != identity['user_id'] or current['company_id'] != identity['company_id']
+                or current['target_user_id'] != identity['target_user_id']):
             return None
-        return await (await db.execute('''SELECT * FROM workers WHERE id=%s AND workspace_id=%s
+        return await (await db.execute('''SELECT * FROM workers WHERE id=%s AND company_id=%s
             AND assigned_user_id=%s AND fleet_namespace=%s AND fleet_claim=%s AND disabled_at IS NULL FOR SHARE''',
-            (worker['id'],identity['workspace_id'],identity['user_id'],worker['fleet_namespace'],worker['fleet_claim']))).fetchone()
+            (worker['id'],identity['company_id'],identity['target_user_id'],worker['fleet_namespace'],worker['fleet_claim']))).fetchone()
 
     async def session_valid():
         async with database() as db: return await connection_worker(db) is not None
@@ -772,11 +1007,11 @@ async def worker_artifacts(identity: UUID, request: Request):
             raise HTTPException(400, 'Invalid run evidence archive') from error
         async with database() as db:
             # Recovery uploads are permitted after interruption; they never replay actions.
-            # Recheck after the upload body arrives and retain membership/assignment
+            # Recheck after the upload body arrives and retain user/assignment
             # locks through storage, so revocation cannot commit during this write.
             worker = await worker_authorize(request, db)
             run = await owned_run(db, identity, worker, active=False)
-            try: await asyncio.to_thread(store_archive, identity, bytes(content))
+            try: await asyncio.to_thread(store_archive, run['company_id'], identity, bytes(content))
             except Exception as error:
                 logger.warning('artifact upload failed error=%s', type(error).__name__)
                 raise HTTPException(503, 'Evidence storage unavailable; retrying the upload is safe') from error
@@ -797,18 +1032,18 @@ async def report_record(identity, request, *, loop_only=False):
             run = None
             loop_id = identity
         else:
-            run = await (await db.execute('''SELECT r.*,jsonb_build_object('id',u.id,'username',u.username,'display_name',u.display_name) AS initiator
+            run = await (await db.execute('''SELECT r.*,jsonb_build_object('id',u.id,'email',u.email,'display_name',u.display_name) AS initiator
                 FROM runs r JOIN loops l ON l.id=r.loop_id JOIN workers w ON w.id=r.worker_id
-                LEFT JOIN users u ON u.id=r.initiated_by WHERE r.id=%s AND l.workspace_id=%s AND w.workspace_id=%s''',
-                (identity,principal['workspace_id'],principal['workspace_id']))).fetchone()
+                LEFT JOIN users u ON u.id=r.initiated_by WHERE r.id=%s AND l.company_id=%s AND w.company_id=%s''',
+                (identity,principal['company_id'],principal['company_id']))).fetchone()
             if not run: raise HTTPException(404, 'Run not found')
             loop_id = run['loop_id']
             run = public_run(run)
-        loop = await (await db.execute('''SELECT l.*,jsonb_build_object('id',u.id,'username',u.username,'display_name',u.display_name) AS creator
-            FROM loops l LEFT JOIN users u ON u.id=l.created_by WHERE l.id=%s AND l.workspace_id=%s''',
-            (loop_id,principal['workspace_id']))).fetchone()
+        loop = await (await db.execute('''SELECT l.*,jsonb_build_object('id',u.id,'email',u.email,'display_name',u.display_name) AS creator
+            FROM loops l LEFT JOIN users u ON u.id=l.created_by WHERE l.id=%s AND l.company_id=%s''',
+            (loop_id,principal['company_id']))).fetchone()
         if not loop: raise HTTPException(404, 'Request not found')
-        events = await (await db.execute('SELECT * FROM events WHERE loop_id=%s AND (run_id IS NULL OR run_id=%s) ORDER BY created_at,id', (loop_id, None if loop_only else identity))).fetchall()
+        events = await (await db.execute('SELECT * FROM events WHERE company_id=%s AND loop_id=%s AND (run_id IS NULL OR run_id=%s) ORDER BY created_at,id', (principal['company_id'],loop_id, None if loop_only else identity))).fetchall()
     missing = []
     if not any(item['stage'] == 'llm_request' for item in events): missing.append('Exact OpenAI request was not captured for this earlier request.')
     if not any(item['stage'] == 'llm_response' for item in events): missing.append('OpenAI response is unavailable; generation may predate capture or have been interrupted.')
@@ -825,7 +1060,7 @@ async def report_record(identity, request, *, loop_only=False):
 
 async def report_content(record):
     if not record['artifact']: return None
-    try: return await asyncio.to_thread(load_archive, record['run']['id'])
+    try: return await asyncio.to_thread(load_archive, record['run']['company_id'], record['run']['id'])
     except Exception as error:
         logger.warning('artifact read failed error=%s', type(error).__name__)
         record['missing_capture'].append('The stored worker archive could not be read at download time. Retry later; server evidence remains available.')

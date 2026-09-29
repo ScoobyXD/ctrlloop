@@ -4,7 +4,7 @@ Cua Driver observes an Omarchy cloud desktop, existing Jev rounds select a windo
 
 The loop connects to an existing Fleet claim. It does not provision, renew, release, or delete workers. The preserved Windows Hermes/CUA demo remains separate; its [compatibility launcher](docs/hermes-plugin.md) still works independently of this runtime.
 
-The new **[CTRL] Loop website MVP** adds typed chat, real `gpt-6-luna` instruction generation with high reasoning, PostgreSQL persistence, an assigned in-VM worker using `jev-1.13.0`, and an embedded desktop viewer with coordinated takeover. See the [MVP setup, AWS/worker deployment, APIs, and current limitations](docs/mvp.md). The bounded sample opens X in an already-open Chrome window; it does not establish that authenticated feed contents were read. Deployment and run evidence are documented separately from implementation.
+The **[CTRL] Loop website** adds company accounts, email verification and personal email/password login, company administration, PostgreSQL persistence, an assigned per-user VM, real `gpt-6-luna` instruction generation, and the existing `jev-1.13.0` executor. Each account belongs to one company; platform devadmins can explicitly administer other companies after a verified-account operator grant. See [company accounts, migration, email configuration and VM assignment](docs/company-accounts.md), and [MVP APIs and runtime behavior](docs/mvp.md). This source change is local; it does not establish what is deployed or migrate live data.
 
 ## Run
 
@@ -16,7 +16,7 @@ uv sync --locked --no-dev
 
 The project pins `typesafe-sdk==0.7.1`, `cua-sandbox==0.7.0`, and `cua-fleet==0.1.17`. Jev remains `jev-1.13.0`; the adapter requires Cua Driver `0.24.0`. The deployed Linux Driver includes the [verified native entry-value patch](docs/native-driver-entry-value.md) needed to read Chrome's address before navigation.
 
-Keep `TYPESAFE_API_KEY` in the local `.env` and Fleet credentials in the local `.env.fleet`. Both files are Git-ignored. The default worker reference is `.local/omarchy-fleet/claim.json`, saved by the separate [Fleet setup helper](docs/omarchy-fleet-trial.md). That reference identifies an existing claim; it is not a desktop backup. An expired or deleted claim needs deliberate provisioning outside the control loop.
+Keep `TYPESAFE_API_KEY` in the local `.env` and Fleet credentials in the local `.env.fleet`. Both files are Git-ignored. For the standalone CLI demo only, the default claim reference is `.local/omarchy-fleet/claim.json`, saved by the separate [Fleet setup helper](docs/omarchy-fleet-trial.md). That reference identifies an existing claim; it is not a desktop backup. An expired or deleted claim needs deliberate provisioning outside the control loop.
 
 ```powershell
 uv run --locked python src/main.py "Click the More information link." --url https://example.com/ --max-iterations 1
