@@ -43,6 +43,8 @@ The executor still selects visible controls with its existing bounded loop. It d
 
 ## Deploy only your worker
 
+**Current rollout status:** the domain fix keeps the existing shared-password application image. Personal member sign-in, Kevin's app worker assignment and initial guest configuration still require the separate identity migration/release. Retrieving provider credentials works independently; the worker commands below become usable after that assignment and configuration are completed.
+
 The administrator records a member assignment in the existing `workers` table and writes these local files:
 
 ```text
@@ -52,32 +54,56 @@ The administrator records a member assignment in the existing `workers` table an
 
 These two identity files can accompany onboarding. They contain routing identifiers, not provider or worker credentials. `target.json` must name the actual sandbox, namespace, claim, member, workspace and development origin. The deploy tool compares them with the bound Fleet desktop and the server's worker identity before changing a service.
 
-Independent worker deployment is pending Kevin's Fleet credential and a successful access check to the existing guest in `ctrlloop-omarchy-dev-kevin-20260928`. The owner has requested unrestricted provider access: leave the optional namespace selection empty, displayed as **All namespaces (no restriction)**, when creating the dedicated key. A namespace-limited key is no longer a prerequisite. See [Fleet credential handoff](#fleet-credential-handoff); the embedded website viewer needs no Fleet key on Kevin's computer.
+Both developers use the **same existing Jev key, OpenAI key and Fleet client ID/secret**, retrieved through their own AWS SSO identities. Follow [Shared provider credentials](#shared-provider-credentials) once your AWS account assignment is ready. The embedded website viewer needs no Fleet key on your computer.
 
-After the Fleet access prerequisite is resolved and the administrator has configured the VM's dedicated worker/Jev credentials, updates reuse that guest configuration. Kevin does not need the shared database password, app bootstrap password, OpenAI key or another person's worker token:
+After the administrator has configured the VM's dedicated worker/Jev credentials, updates reuse that guest configuration. The provider file also supports local development; worker updates only consume its Fleet credentials:
 
 ```text
-uv run --locked python scripts/deploy_worker.py --environment dev --member kevin --fleet-env .local/environments/dev/workers/kevin/fleet.env --status
-uv run --locked python scripts/deploy_worker.py --environment dev --member kevin --fleet-env .local/environments/dev/workers/kevin/fleet.env --source-ref REVIEWED-COMMIT
+uv run --locked python scripts/deploy_worker.py --environment dev --member kevin --fleet-env .local/environments/dev/shared.env --status
+uv run --locked python scripts/deploy_worker.py --environment dev --member kevin --fleet-env .local/environments/dev/shared.env --source-ref REVIEWED-COMMIT
 ```
 
 Omit `--source-ref` only when deliberately deploying the current checkout, including local edits. The report records the resulting source-bundle revision. `--stage-only` uploads and compiles code without starting a worker or transferring credentials.
 
 Deployment checks the exact assignment, takes the guest deployment lock, asks the server to put only that worker into maintenance, and refuses active/unsettled runs or human ownership. It starts the selected revision and releases maintenance after successful startup. Failed deployment keeps maintenance in place; inspect the privately recorded guest log before using the explicit `--resume` recovery operation. Never substitute another member's target or claim.
 
-Initial setup uses `--configure --jev-env PATH`, plus that member's private `credentials.json`, under administrator control. That file contains the worker's dedicated bearer token. It is not part of a contributor onboarding bundle, source archive, or Git commit. Browser profiles are not copied between members.
+Initial setup uses `--configure --jev-env .local/environments/dev/shared.env`, plus that member's private `credentials.json`, under administrator control. That file contains the worker's dedicated bearer token. It is not part of a contributor onboarding bundle, source archive, or Git commit. Browser profiles are not copied between members.
 
 When moving the existing owner worker to the selected custom domain, initial configuration also requires `--previous-api-url https://d1t0sm9jhdinfi.cloudfront.net`. That explicit transition still requires the exact existing worker identity and unchanged bearer token; the new origin must match the recorded assignment.
 
-### Fleet credential handoff
+## Shared provider credentials
 
-Sign in as the account that owns the existing pools at [Fleet API keys](https://run.cua.ai/user-keys). Create a dedicated key named `ctrlloop-kevin`, leave **Allowed Namespaces (optional)** empty—the placeholder reads **All namespaces (no restriction)**—and save its one-time client ID/secret privately in ignored `.local/environments/dev/workers/kevin/fleet.env`. The official UI omits the scope restriction when no namespaces are selected. The key acts for its owner; a new personal Cua login does not automatically gain access to another account's pools. [Official Fleet credential setup](https://cua.ai/docs/how-to-guides/sandbox/set-up-fleet-credentials), [UI implementation](https://github.com/trycua/cua/blob/main/libs/fleet/src/pages/UserApiKeys.tsx).
+AWS Secrets Manager is the shared source of the existing credentials. `ctrlloop/mvp/app` holds `TYPESAFE_API_KEY`, `CUA_CLIENT_ID` and `CUA_CLIENT_SECRET`; OpenAI remains in the separately configured `mangorts/dev/openai-api-key` secret. The app's existing secret references are reused. This setup creates no new provider keys, changes no provider permissions and does not rotate credentials.
 
-The existing infrastructure credential returned **HTTP 403** from read-only `list_user_api_keys()`. Fleet's policy reserves key management for interactive clients, so selecting all namespaces does not let an API key create other keys. Use the signed-in key-management page. No new key has been created here. [Key-management policy](https://github.com/trycua/cua/blob/main/libs/fleet/backend/auth/authz_user_keys.rego).
+After configuring your personal [AWS SSO identity](#aws-identities-and-full-account-access), run this from the repository on macOS or Windows:
 
-To verify Kevin's credential, clear inherited `FLEETS_TOKEN`, configure `CUA_CLIENT_ID` and `CUA_CLIENT_SECRET`, and run the official guide's read-only token/namespace check. Then run the worker `--status` command above: successful namespace listing alone does not prove access to the already-assigned guest. Keep client secrets and bearer tokens out of output; the SDK key object's string representation includes its secret. Hand the dedicated credential to Kevin privately, separately from the non-secret target/claim files.
+```text
+aws sso login --profile mangorts-dev
+uv run --locked python scripts/provider_credentials.py fetch --environment dev --profile mangorts-dev
+```
 
-The official Fleet documentation reviewed does not establish an organization/member invitation procedure for sharing the existing pools with Kevin's separate dashboard identity. For that form of access, ask Cua to enable the appropriate account access; do not assume a new personal key shares the owner's pools. The credential guide links [Cua support](https://cua.ai/docs/how-to-guides/sandbox/set-up-fleet-credentials#create-a-fleet-user-api-key) for access problems. Full provider access is separate from CTRL Loop's per-member VM assignment, which remains enforced by the application.
+The retrieval command verifies the AWS account, writes **only** `TYPESAFE_API_KEY`, `OPENAI_API_KEY`, `CUA_CLIENT_ID` and `CUA_CLIENT_SECRET` to `.local/environments/dev/shared.env`, and verifies the file matches the retrieved values. It prints variable names and version metadata, never values. The file is ignored and untracked, replaced atomically, and created with owner-only permissions (`0600`) on macOS/Linux. Rerun the same command to refresh your local copy. It does not export the app/database credentials or any VM's `WORKER_TOKEN`.
+
+Pass that file to the existing `--fleet-env` and `--jev-env` arguments. To use its values for local commands in a macOS terminal:
+
+```sh
+set -a
+. .local/environments/dev/shared.env
+set +a
+unset FLEETS_TOKEN
+```
+
+The file quotes values so sourcing it cannot expand shell substitutions. `FLEETS_TOKEN` otherwise takes precedence over Fleet client credentials. Clear previously inherited `CUA_CLIENT_ID`/`CUA_CLIENT_SECRET` before using `--fleet-env`, or source the retrieved file as shown, because the worker tool preserves existing process environment variables. Keep this file out of frontend bundles, screenshots and logs. [TypeSafe authentication](https://docs.typesafe.ai/api), [OpenAI secret/environment guidance](https://developers.openai.com/api/docs/guides/production-best-practices#api-keys), [Fleet credential configuration](https://cua.ai/docs/how-to-guides/sandbox/set-up-fleet-credentials#configure-the-sandbox-sdk).
+
+Fleet access uses the same existing credential used for the project pools. This setup adds no namespace restriction and does not create or rotate a separate Kevin key. Its existing provider permissions remain unchanged; access to a particular guest must still be verified. Sharing it does not create a separate Cua dashboard login. CTRL Loop's personal VM assignments and the dedicated per-VM worker bearer tokens remain separate from shared provider access.
+
+The owner's one-time import of the existing local Jev key uses:
+
+```text
+uv run --locked python scripts/provider_credentials.py seed-jev --environment dev --profile mangorts-dev --jev-env .env
+```
+
+This reads the current project secret, adds only the exact existing Jev value, and preserves every unrelated field. A guarded version-stage move refuses a concurrent secret change. Repeating it with the same key is a no-op; a different stored Jev key is rejected. Kevin only needs `fetch`. No model request, VM configuration or website deployment is performed by either command.
 
 ## AWS identities and full account access
 

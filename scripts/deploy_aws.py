@@ -22,6 +22,7 @@ import zipfile
 
 import boto3
 from botocore.exceptions import ClientError
+from dotenv import dotenv_values
 from deployment_config import ROOT, load_environment, migrate_legacy_dev
 
 
@@ -59,12 +60,9 @@ def after_iam_propagation(fn, **kwargs):
 
 
 def fleet_credentials(path):
-    values = {}
-    for line in path.read_text(encoding="utf-8-sig").splitlines():
-        name, sep, value = line.partition("=")
-        if sep and name.strip() in {"CUA_CLIENT_ID", "CUA_CLIENT_SECRET"}:
-            values[name.strip()] = value.strip().strip("\"'")
-    if set(values) != {"CUA_CLIENT_ID", "CUA_CLIENT_SECRET"}:
+    source = dotenv_values(path, encoding="utf-8-sig", interpolate=False)
+    values = {name: source.get(name) for name in ("CUA_CLIENT_ID", "CUA_CLIENT_SECRET")}
+    if not all(values.values()):
         raise RuntimeError("Fleet credential file is missing required values")
     return values
 
@@ -166,7 +164,9 @@ class Deployment:
 
     def prepare(self, fleet_env):
         sm = self.client("secretsmanager")
-        if not self.secret and self.state.get("app_secret_arn"):
+        if self.state.get("app_secret_arn"):
+            # AWS is authoritative; a cached local copy can predate shared-key
+            # imports or an administrator's unrelated secret update.
             self.secret = json.loads(sm.get_secret_value(SecretId=self.state["app_secret_arn"])["SecretString"])
             self.validate_state()
             save(self.secret_path, self.secret)

@@ -22,7 +22,7 @@
   "origin_host": "origin.dev.mangorts.com",
   "requested_domain": "dev.ctrlloop.io",
   "expected_distribution": "EFZQEEWLIM0FZ",
-  "expected_url": "https://d1t0sm9jhdinfi.cloudfront.net",
+  "expected_url": "https://dev.ctrlloop.io",
   "bootstrap_legacy_dev": true,
   "bootstrap_owner_username": "owner",
   "bootstrap_owner_display_name": "Owner",

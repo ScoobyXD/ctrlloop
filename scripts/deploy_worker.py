@@ -127,7 +127,7 @@ uv sync --locked --no-dev --python 3.12
             private=json.loads((local/'credentials.json').read_text())
             if private['worker_id']!=target['id'] or private['environment']!=args.environment:
                 raise ValueError('Dedicated credentials do not match this worker and environment')
-            jev=dotenv_values(args.jev_env).get('TYPESAFE_API_KEY')
+            jev=dotenv_values(args.jev_env,interpolate=False).get('TYPESAFE_API_KEY')
             if not jev:raise RuntimeError('TYPESAFE_API_KEY is missing')
             settings={'CTRLLOOP_API_URL':target['api_url'],'WORKER_TOKEN':private['WORKER_TOKEN'],
                   'CTRLLOOP_WORKER_ID':target['id'],'CTRLLOOP_ENVIRONMENT':args.environment,
