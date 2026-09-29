@@ -62,7 +62,7 @@ https://run.cua.ai/api/svc/<namespace>/<sandbox>-vnc/vnc.html?autoconnect=1&resi
 
 The helper intentionally disconnects without releasing the claim. Closing its process or the browser viewer leaves the desktop available until explicit cleanup or expiry. Trial storage is disposable; download anything needed before cleanup.
 
-### Current trial: missing desktop tools and theme recovery
+### September 27: missing desktop tools and theme recovery
 
 The replacement image lacked a browser, `xdg-terminal-exec`, and the `vipsthumbnail` helper used by Omarchy's background picker. Its current theme contained only an empty `foot.ini`; `theme.name` and the current background link were missing. The recovery uses per-user files and the existing desktop user's permissions. It does not change Driver code, system packages, passwords, keys, or the Fleet expiry.
 
@@ -80,6 +80,12 @@ The helpers script extracts the required official package payloads below `~/.loc
 Before theme recovery, the existing state was backed up at `/home/omarchy/.local/state/omarchy/ctrlloop-before-desktop-repair-20260927T185918Z`. The official command `OMARCHY_THEME_HEADLESS=1 omarchy-theme-set "Tokyo Night"` then initialized the missing theme name and background. The authenticated viewer visibly shows the eight-image background carousel. Selecting an image has not yet been verified.
 
 These per-user package copies do not receive automatic updates and belong to this disposable VM. No repository tests or Jev calls were run for this recovery. The configured pool expiry remains `2026-09-27T23:08:51Z`, with claim shutdown at `2026-09-27T23:08:53Z` and automatic renewal disabled.
+
+### September 29: desktop recovery on the same assignment
+
+The assigned sandbox `ctrlloop-omarchy-20260927-1708-e33048ae` again lacked its browser and initialized theme. Recovery reused the existing setup scripts and the installed Omarchy assets at `/usr/share/omarchy`. This guest uses `~/.local/state/omarchy/current` for its current theme, rather than the older `~/.config/omarchy/current` path. Existing state was backed up at `~/.local/state/omarchy/ctrlloop-before-desktop-repair-20260929`; the forced `foot` terminal startup in `~/.config/hypr/autostart.lua` was also backed up and disabled. The existing Tokyo Night theme was applied, and the normal desktop and launcher were visually verified.
+
+Chrome `154.0.8037.57` was restored. The user approved its Terms of Service, first-run setup completed with optional usage reporting disabled, and the normal browser window opened to `about:blank`. Cua Driver observed 149 elements with window-specific snapshot tokens, including the address bar. This repair did not recover the previous browser profile or implement durable guest-state persistence. No VM was provisioned or restarted, no Driver code or Jev questions changed, and no tests were added or run.
 
 ### Prior trial: WayVNC seat compatibility and recovery
 
