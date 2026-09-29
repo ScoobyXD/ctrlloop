@@ -242,7 +242,7 @@ export function renderStepTiming({ step, stepIndex = 0, run = null, report = nul
         ${chart.pieces.map((piece, index) => `<button type="button" class="wb-timing-segment" id="${esc(timingId)}-segment-${index}" style="width:${piece.total ? 100 : (piece.end - piece.start) / chart.duration * 100}%;--segment-color:${piece.color}" ${details(piece)}></button>`).join("")}
       </div><div class="wb-timing-scale"><span>0 ms</span><span>${esc(ms(chart.duration))}</span></div>
       <div class="wb-timing-legend">${[...legend.values()].map((piece, index) => `<button type="button" id="${esc(timingId)}-legend-${index}" ${details(piece)}><i class="wb-timing-key" style="--segment-color:${piece.color}" aria-hidden="true"></i><span>${esc(piece.label)} · ${esc(ms(piece.end))}</span></button>`).join("")}</div>
-      <div class="wb-timing-info" id="${esc(infoId)}" role="status" hidden></div>` : !loading && !error ? '<p class="wb-timing-note">Process timing details are unavailable in this captured run.</p>' : ""}
+      <div class="wb-timing-info" id="${esc(infoId)}" role="tooltip" hidden></div>` : !loading && !error ? '<p class="wb-timing-note">Process timing details are unavailable in this captured run.</p>' : ""}
       ${chart && !capturedChart && !loading ? '<p class="wb-timing-note">Step total shown; process breakdown unavailable.</p>' : ""}
       ${loading ? `<p class="wb-timing-note" role="status">${capturedChart ? "Refreshing captured timings…" : "Loading process timings…"}</p>` : ""}
       ${error ? `<p class="wb-timing-note wb-timing-error" role="status">${esc(error)}</p><button type="button" class="button quiet small" id="${esc(timingId)}-retry" data-wb="retry-evidence" data-run-id="${esc(record.run?.id)}">Retry evidence</button>` : ""}
@@ -254,33 +254,54 @@ export function renderStepTiming({ step, stepIndex = 0, run = null, report = nul
 
 const timingContainers = new WeakSet();
 
-/** Keep hover and keyboard details within the step's own column. */
+/** Float details beside the pointer without changing the step's layout. */
 export function bindStepTimings(container) {
   if (!container || timingContainers.has(container)) return;
   timingContainers.add(container);
+  let tooltip = null, activeButton = null, dismissed = null;
   const segment = target => target?.closest?.("[data-timing-info]");
-  const show = target => {
+  const hide = () => { if (tooltip) tooltip.hidden = true; tooltip = null; };
+  const show = (target, point) => {
     const button = segment(target);
-    if (!button || !container.contains(button)) return;
+    if (!button || !container.contains(button) || dismissed === button) return;
     const info = button.closest(".wb-step-timing")?.querySelector(".wb-timing-info");
-    if (info) { info.textContent = button.dataset.timingInfo; info.hidden = false; }
+    if (!info) return;
+    if (tooltip !== info) hide();
+    tooltip = info;
+    activeButton = button;
+    if (info.textContent !== button.dataset.timingInfo) info.textContent = button.dataset.timingInfo;
+    info.hidden = false;
+    const anchor = button.getBoundingClientRect();
+    const x = point?.clientX ?? anchor.right, y = point?.clientY ?? anchor.top;
+    const {width,height} = info.getBoundingClientRect();
+    const margin = 12, viewport = document.documentElement;
+    const left = x + margin + width <= viewport.clientWidth - margin ? x + margin : x - width - margin;
+    const top = y - height - margin >= margin ? y - height - margin : y + margin;
+    info.style.left = `${Math.max(margin, Math.min(left, viewport.clientWidth - width - margin))}px`;
+    info.style.top = `${Math.max(margin, Math.min(top, viewport.clientHeight - height - margin))}px`;
   };
-  const hide = event => {
-    const button = segment(event.target);
-    if (!button) return;
-    const disclosure = button.closest(".wb-step-timing");
+  container.addEventListener("pointerover", event => show(event.target, event));
+  container.addEventListener("pointermove", event => show(event.target, event));
+  container.addEventListener("pointerout", event => {
+    if (!segment(event.target)) return;
     const next = segment(event.relatedTarget);
-    if (next && disclosure?.contains(next)) { show(next); return; }
-    const focused = segment(document.activeElement);
-    if (event.type === "pointerout" && focused && disclosure?.contains(focused)) { show(focused); return; }
-    const info = disclosure?.querySelector(".wb-timing-info");
-    if (info) info.hidden = true;
-  };
-  container.addEventListener("pointerover", event => show(event.target));
-  container.addEventListener("focusin", event => show(event.target));
-  container.addEventListener("click", event => show(event.target));
-  container.addEventListener("pointerout", hide);
+    if (next === segment(event.target)) return;
+    dismissed = null;
+    hide();
+    if (next) show(next, event);
+  });
+  container.addEventListener("focusin", event => {
+    if (segment(event.target)?.matches(":focus-visible")) show(event.target);
+  });
   container.addEventListener("focusout", hide);
+  window.addEventListener("keydown", event => {
+    if (event.key === "Escape") { dismissed = activeButton; hide(); }
+    else dismissed = null;
+  });
+  container.addEventListener("toggle", event => { if (!event.target.open) hide(); }, true);
+  window.addEventListener("scroll", hide, true);
+  window.addEventListener("resize", hide);
+  window.addEventListener("blur", hide);
 }
 
 function questions(call) {

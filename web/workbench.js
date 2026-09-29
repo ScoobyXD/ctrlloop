@@ -122,8 +122,6 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     const focusId = focused?.id, selection = focused && 'selectionStart' in focused ? [focused.selectionStart, focused.selectionEnd] : null;
     const openDetails = new Set([...host.querySelectorAll('details[open]')].map(el => el.dataset.disclosure || el.id).filter(Boolean));
     for (const element of host.querySelectorAll('[data-timing-key]')) timingDisclosure.set(element.dataset.timingKey, element.open);
-    const previousScroll = host.querySelector('.wb-steps')?.scrollTop ?? 0;
-    const previousRunning = host.querySelector('.wb-steps [aria-busy="true"]')?.dataset.stepId;
     const step = selectedStep();
     const inspectedRun = step ? runForStep(step) : run;
     const inspection = reportState(inspectedRun);
@@ -191,13 +189,6 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     </section>`;
     for (const element of host.querySelectorAll('details')) if ((element.dataset.disclosure || element.id) && openDetails.has(element.dataset.disclosure || element.id)) element.open = true;
     for (const element of host.querySelectorAll('[data-timing-key]')) if (timingDisclosure.has(element.dataset.timingKey)) element.open = timingDisclosure.get(element.dataset.timingKey);
-    const list = host.querySelector('.wb-steps');
-    list.scrollTop = previousScroll;
-    const runningRow = list.querySelector('[aria-busy="true"]');
-    if (runningRow && runningRow.dataset.stepId !== previousRunning) {
-      const rowBounds = runningRow.getBoundingClientRect(), listBounds = list.getBoundingClientRect();
-      if (rowBounds.top < listBounds.top || rowBounds.top + 48 > listBounds.bottom) list.scrollTop += rowBounds.top - listBounds.top;
-    }
     bindStepInspector(host.querySelector('#wb-inspector'));
     bindStepTimings(host);
     if (focusId) { const replacement = host.querySelector(`#${CSS.escape(focusId)}`); replacement?.focus({preventScroll:true}); if (selection && replacement?.setSelectionRange && !['number','select-one'].includes(replacement.type)) replacement.setSelectionRange(...selection); }
