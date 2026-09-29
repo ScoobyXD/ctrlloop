@@ -8,10 +8,11 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 import logging
 import math
+from time import perf_counter_ns
 from typing import Any, TYPE_CHECKING
 
 import httpx2
-from typesafe_sdk import Choice, SystemOneResponse, TypeSafeError
+from typesafe_sdk import Choice, SystemOneResponse, TypeSafeAPIError, TypeSafeError
 from typesafe_sdk._core.config import Config
 from typesafe_sdk._core.endpoints import prepare_system_one
 
@@ -25,9 +26,12 @@ if TYPE_CHECKING:
 
 
 PINNED_MODEL = "jev-1.13.0"
-# Maximum options per selection question; byte sizing can make a group smaller.
-GROUP_SIZE = 10
-REQUEST_BUDGET_BYTES = 90_000
+# Jev 1.13.0 limits and an optimistic, model-specific wire-byte estimate.
+# These are independent context limits, not allocations between state/questions.
+MAX_CHOICE_OPTIONS = 255
+BYTES_PER_INPUT_TOKEN = 2.05
+QUESTION_BUDGET_BYTES = round(32_000 * BYTES_PER_INPUT_TOKEN)
+REQUEST_BUDGET_BYTES = round(64_000 * BYTES_PER_INPUT_TOKEN)
 SETTLING_MS = {
     "<50ms": 50,
     "100ms": 100,
@@ -41,6 +45,17 @@ logger = logging.getLogger(__name__)
 
 class SelectionError(Exception):
     """Jev rejected a complete round or its response cannot be used safely."""
+
+
+def _context_rejected(error: TypeSafeError) -> bool:
+    """Recognize only the service's observed token-limit rejection contract."""
+    return (
+        isinstance(error, TypeSafeAPIError)
+        and error.status == 400
+        and isinstance(error.body, Mapping)
+        and isinstance(error.body.get("detail"), Mapping)
+        and error.body["detail"].get("error_type") == "max_tokens_exceeded"
+    )
 
 
 @dataclass(frozen=True)
@@ -105,57 +120,109 @@ class ChoiceSelector:
             raise ValueError(f"This experiment requires {PINNED_MODEL}.")
         self.client = client
         self.model = model
+        # Kept for this selector's ongoing run, never calibrated through API calls.
+        self.question_budget_bytes = QUESTION_BUDGET_BYTES
+        self.request_budget_bytes = REQUEST_BUDGET_BYTES
 
     def judge(
         self, state: str | dict[str, Any], questions: dict[str, Choice], *,
         report: "RunReport | None" = None,
     ) -> tuple[dict[str, str], dict]:
-        """Submit one complete batch using the pinned client and shared validation."""
+        """Attempt one batch; return explicit context rejection for the retry loop."""
+        body_bytes = _request_body_size(state, questions, self.model)
+        single_sizes = [
+            _request_body_size(state, {key: question}, self.model)
+            for key, question in questions.items()
+        ]
+        if any(size > QUESTION_BUDGET_BYTES for size in single_sizes):
+            raise SelectionError("A complete question with shared state exceeds the Jev question byte allowance.")
+        # An aggregate rejection must not make an otherwise fitting standalone
+        # question impossible to try. Each still obeys the independent 32k estimate.
+        request_budget = max(self.request_budget_bytes, max(single_sizes, default=0))
+        if body_bytes > request_budget:
+            raise SelectionError("Jev request exceeds the current request byte allowance.")
+        trace = {
+            "state": deepcopy(state),
+            "question_keys": list(questions),
+            "question_count": len(questions),
+            "questions": {
+                key: {"type": question.type, "instructions": deepcopy(question.instructions),
+                      "criteria": deepcopy(question.criteria)}
+                for key, question in questions.items()
+            },
+            "answers": {}, "requested_model": self.model,
+            "body_bytes": body_bytes, "request_budget_bytes": request_budget,
+            "question_budget_bytes": max(self.question_budget_bytes, max(single_sizes, default=0)),
+            "target_question_budget_bytes": self.question_budget_bytes,
+            "input_tokens": None, "output_tokens": None, "input_cost_usd": None,
+            "input_price_per_million_usd": 0.042,
+            "outcome": "error", "context_rejection": False,
+        }
+        started_ns = perf_counter_ns()
         try:
-            body_bytes = _request_body_size(state, questions, self.model)
-            if body_bytes > REQUEST_BUDGET_BYTES:
-                raise SelectionError(
-                    f"Jev request exceeds the {REQUEST_BUDGET_BYTES}-byte request budget."
-                )
             # SDK time includes request encoding and response decoding. The
             # report's HTTP timing separately measures the client-observed call.
             with report.span(
                 "selection.sdk_call", question_keys=list(questions),
-                body_bytes=body_bytes, request_budget_bytes=REQUEST_BUDGET_BYTES,
+                question_count=len(questions), body_bytes=body_bytes,
+                request_budget_bytes=request_budget,
+                question_budget_bytes=trace["question_budget_bytes"],
+                target_question_budget_bytes=self.question_budget_bytes,
             ) if report else nullcontext({}) as sdk_timing:
+                if report:
+                    trace["sdk_span_id"] = sdk_timing["span_id"]
                 response = self.client.system_one(
                     state=state, questions=questions, model=self.model
                 )
+            with report.span("selection.response_validation") if report else nullcontext({}) as validation_timing:
+                choices, validated = self._validate_response(questions, response)
+                trace.update(validated, outcome="ok")
+                if report:
+                    trace["response_validation_span_id"] = validation_timing["span_id"]
+            return choices, trace
         except TypeSafeError as error:
-            # No request bodies, UI content, credentials, or raw HTTP responses in errors.
             status = getattr(error, "status", None)
+            trace.update(status_code=status if type(status) is int else None,
+                         error_type=type(error).__name__)
+            if _context_rejected(error):
+                trace.update(outcome="context_rejected", context_rejection=True,
+                             service_error_type="max_tokens_exceeded")
+                usage = error.body.get("usage")
+                if isinstance(usage, Mapping):
+                    for name in ("input_tokens", "output_tokens"):
+                        value = usage.get(name)
+                        if type(value) is int and value >= 0:
+                            trace[name] = value
+                    if trace["input_tokens"] is not None:
+                        trace["input_cost_usd"] = trace["input_tokens"] * 0.042 / 1_000_000
+                return {}, trace
+            # Do not expose raw bodies or reinterpret unrelated HTTP failures.
             safe_status = status if type(status) is int else "unavailable"
             if status in (413, 422):
                 raise SelectionError(
                     f"Jev rejected the request batch (HTTP {safe_status}); verify "
-                    "the service request limits and question format. The batch "
-                    "was not retried in smaller calls."
+                    "the service request limits and question format."
                 ) from None
             raise SelectionError(
                 f"TypeSafe request failed: {type(error).__name__} (HTTP {safe_status})."
             ) from None
-
-        with report.span("selection.response_validation") if report else nullcontext({}) as validation_timing:
-            choices, trace = self._validate_response(questions, response)
-            trace["state"] = deepcopy(state)
-            trace.update(body_bytes=body_bytes, request_budget_bytes=REQUEST_BUDGET_BYTES)
-        if report:
-            trace.update(
-                sdk_span_id=sdk_timing["span_id"],
-                response_validation_span_id=validation_timing["span_id"],
-            )
-        return choices, trace
+        finally:
+            trace["duration_ms"] = (perf_counter_ns() - started_ns) / 1_000_000
+            if report:
+                # Also durable when an atomic failure prevents round advancement.
+                # Exact payloads already live in the existing HTTP capture hooks.
+                report.append("selection_attempt", **{
+                    key: value for key, value in trace.items()
+                    if key not in {"state", "questions", "answers"}
+                })
 
     def _group_candidates(
         self, state: str | dict[str, Any], candidates: list[Candidate], round_id: str,
-    ) -> tuple[list[list[Candidate]], dict[str, Choice]]:
-        """Build the largest contiguous groups that fit, up to GROUP_SIZE."""
-        groups = []
+        *, question_budget_bytes: int | None = None,
+    ) -> tuple[dict[str, list[Candidate]], dict[str, Choice]]:
+        """Propose up to the service's 255 options; shrink only on byte overflow."""
+        budget = self.question_budget_bytes if question_budget_bytes is None else question_budget_bytes
+        groups = {}
         questions = {}
         start = 0
         while start < len(candidates):
@@ -170,47 +237,66 @@ class ChoiceSelector:
                     },
                 )
 
-            count = min(GROUP_SIZE, len(candidates) - start)
+            count = min(MAX_CHOICE_OPTIONS, len(candidates) - start)
             question = question_for(count)
-            if _request_body_size(state, {key: question}, self.model) > REQUEST_BUDGET_BYTES:
+            if _request_body_size(state, {key: question}, self.model) > budget:
                 low, high = 1, count - 1
                 count = 0
                 while low <= high:
                     middle = (low + high) // 2
                     proposed = question_for(middle)
                     size = _request_body_size(state, {key: proposed}, self.model)
-                    if size <= REQUEST_BUDGET_BYTES:
+                    if size <= budget:
                         count, question = middle, proposed
                         low = middle + 1
                     else:
                         high = middle - 1
                 if not count:
-                    raise SelectionError(
-                        f"A single candidate question with shared state exceeds the "
-                        f"{REQUEST_BUDGET_BYTES}-byte request budget."
-                    )
-            groups.append(candidates[start:start + count])
+                    # A sibling's rejection cannot prove this indivisible
+                    # candidate is too large. Try it under the original estimate;
+                    # an explicit rejection of that singleton is terminal.
+                    count, question = 1, question_for(1)
+                    if _request_body_size(state, {key: question}, self.model) > QUESTION_BUDGET_BYTES:
+                        raise SelectionError(
+                            "A single candidate question with shared state exceeds the "
+                            f"{QUESTION_BUDGET_BYTES}-byte initial question allowance."
+                        )
+            if count == 1 and start + 1 < len(candidates) and question_budget_bytes is None:
+                # Two is the minimum meaningful comparison. A smaller sibling's
+                # rejection is not evidence that this pair cannot fit. Never use
+                # this fallback while splitting an explicitly rejected question.
+                pair = question_for(2)
+                if _request_body_size(state, {key: pair}, self.model) <= QUESTION_BUDGET_BYTES:
+                    count, question = 2, pair
+            groups[key] = candidates[start:start + count]
             questions[key] = question
             start += count
 
-        if len(candidates) > 1 and len(groups) == len(candidates):
-            raise SelectionError(
-                "The request budget permits only singleton groups; "
-                "selection cannot narrow these candidates."
-            )
         return groups, questions
 
     def _pack_questions(
         self, state: str | dict[str, Any], questions: dict[str, Choice],
+        *, request_budget_bytes: int | None = None,
     ) -> list[tuple[dict[str, Choice], int]]:
         """Measure the full round first, then find the largest fitting prefixes."""
         items = list(questions.items())
+        single_sizes = [
+            _request_body_size(state, {key: question}, self.model)
+            for key, question in items
+        ]
+        if any(size > QUESTION_BUDGET_BYTES for size in single_sizes):
+            raise SelectionError(
+                "A complete question with shared state exceeds the Jev question byte allowance; "
+                "the required action or settling question cannot be split safely."
+            )
+        request_budget = (min(self.request_budget_bytes, request_budget_bytes)
+                          if request_budget_bytes is not None else self.request_budget_bytes)
         batches = []
         start = 0
         while start < len(items):
             remaining = dict(items[start:])
             remaining_bytes = _request_body_size(state, remaining, self.model)
-            if remaining_bytes <= REQUEST_BUDGET_BYTES:
+            if remaining_bytes <= request_budget:
                 batches.append((remaining, remaining_bytes))
                 break
 
@@ -221,73 +307,161 @@ class ChoiceSelector:
             while low <= high:
                 middle = (low + high) // 2
                 size = _request_body_size(state, dict(items[start:start + middle]), self.model)
-                if size <= REQUEST_BUDGET_BYTES:
+                if size <= request_budget:
                     count, body_bytes = middle, size
                     low = middle + 1
                 else:
                     high = middle - 1
             if not count:
-                raise SelectionError(
-                    f"A complete question with shared state exceeds the "
-                    f"{REQUEST_BUDGET_BYTES}-byte request budget."
-                )
+                # A lowered aggregate target may be smaller than an indivisible
+                # question. Isolate it under the independently checked question
+                # limit; do not lend its larger allowance to unrelated batches.
+                count, body_bytes = 1, single_sizes[start]
             batches.append((dict(items[start:start + count]), body_bytes))
             start += count
         return batches
 
     def _judge_batches(
         self, state: str | dict[str, Any], batches: list[tuple[dict[str, Choice], int]],
-        question_candidate_counts: dict[str, int], *, report: "RunReport | None",
-        group_keys: Sequence[str] = (),
+        groups: dict[str, list[Candidate]], *, report: "RunReport | None",
     ) -> tuple[dict[str, str], list[dict]]:
-        if not batches:
-            return {}, []
-        group_key_set = frozenset(group_keys)
+        """Retain successes, then resize only rejected work between parallel waves.
 
-        def run_batch(index: int, batch: tuple[dict[str, Choice], int]):
-            questions, body_bytes = batch
-            batch_groups = [key for key in questions if key in group_key_set]
-            # Action and timer questions add no candidate count.
-            candidate_count = sum(question_candidate_counts.get(key, 0) for key in questions)
-            with report.span(
-                "selection.batch", batch=index + 1, batch_count=len(batches),
-                batch_candidate_count=candidate_count, group_keys=batch_groups,
-                question_keys=list(questions), body_bytes=body_bytes,
-                request_budget_bytes=REQUEST_BUDGET_BYTES,
-            ) if report else nullcontext({}) as timing:
-                choices, trace = self.judge(state, questions, report=report)
-                trace.update(
-                    batch=index + 1, batch_count=len(batches),
-                    candidate_count=candidate_count, group_keys=batch_groups,
+        Groups are replaced in place when a candidate question needs splitting.
+        All resulting winners advance together in the caller's logical round.
+        """
+        pending = [(batch, None) for batch in batches]
+        chosen, api_calls = {}, []
+        attempt = 0
+        while pending:
+            jobs = []
+            for (questions, body_bytes), parent in pending:
+                replacements = {}
+                prepared = {}
+                for index, (key, question) in enumerate(questions.items()):
+                    if parent is None or len(questions) > 1:
+                        prepared[key] = question
+                        continue
+                    # A standalone rejection has already been checked below:
+                    # only a candidate group with at least two options is split.
+                    # Use this payload's reduction, not a smaller sibling's, so
+                    # heterogeneous descriptions retain meaningful comparisons.
+                    prefix = f"retry{parent['batch']}_{index}"
+                    children, child_questions = self._group_candidates(
+                        state, groups[key], prefix,
+                        question_budget_bytes=int(parent["body_bytes"] * 0.8),
+                    )
+                    if len(children) < 2:
+                        raise SelectionError("Jev context recovery could not split the candidate question.")
+                    replacements[key] = list(children)
+                    ordered = {}
+                    for group_key, candidates in groups.items():
+                        if group_key == key:
+                            ordered.update(children)
+                        else:
+                            ordered[group_key] = candidates
+                    groups.clear()
+                    groups.update(ordered)
+                    prepared.update(child_questions)
+                retry_batches = [(questions, body_bytes)] if parent is None else self._pack_questions(
+                    state, prepared,
+                    request_budget_bytes=parent["body_bytes"] - 1 if parent else None,
                 )
-                if report:
-                    trace["batch_span_id"] = timing["span_id"]
-                return choices, trace
+                if parent is not None:
+                    # A failed payload is never resent unchanged, even if shared
+                    # state dominates the body or longer replacement IDs add bytes.
+                    if any(size >= parent["body_bytes"] for _, size in retry_batches):
+                        raise SelectionError(
+                            "Jev context recovery cannot produce a smaller complete request "
+                            "without dropping essential state or candidates."
+                        )
+                    parent.update(replacement_questions=replacements,
+                                  retry_batches=list(range(attempt + 1, attempt + 1 + len(retry_batches))))
+                    if report:
+                        report.append(
+                            "selection_retry", retry_of_batch=parent["batch"],
+                            retry_batches=parent["retry_batches"],
+                            replacement_questions=replacements,
+                            request_budget_bytes=self.request_budget_bytes,
+                            question_budget_bytes=self.question_budget_bytes,
+                        )
+                for batch in retry_batches:
+                    attempt += 1
+                    jobs.append((attempt, batch, parent))
 
-        if len(batches) == 1:
-            results = [run_batch(0, batches[0])]
-        else:
-            # Submit every independent batch before waiting. Each worker keeps
-            # its own report context, inherited from this selection round.
-            with ThreadPoolExecutor(thread_name_prefix="jev-batch") as executor:
-                futures = [
-                    executor.submit(copy_context().run, run_batch, index, batch)
-                    for index, batch in enumerate(batches)
-                ]
-                try:
-                    results = [future.result() for future in futures]
-                except BaseException:
-                    for future in futures:
-                        future.cancel()
-                    raise
+            def run_batch(job):
+                number, (questions, body_bytes), parent = job
+                retry_of = parent["batch"] if parent else None
+                retry_limit = parent["body_bytes"] - 1 if parent else None
+                batch_groups = [key for key in questions if key in groups]
+                candidate_count = sum(len(groups[key]) for key in batch_groups)
+                metadata = {
+                    "batch": number, "batch_count": attempt,
+                    "batch_candidate_count": candidate_count,
+                    "group_keys": batch_groups, "question_keys": list(questions),
+                    "question_count": len(questions), "body_bytes": body_bytes,
+                    "retry_of_batch": retry_of,
+                    "retry_body_bytes_limit": retry_limit,
+                    "request_budget_bytes": self.request_budget_bytes,
+                    "question_budget_bytes": self.question_budget_bytes,
+                }
+                with report.span("selection.batch", **metadata) if report else nullcontext({}) as timing:
+                    choices, trace = self.judge(state, questions, report=report)
+                    trace.update(batch=number, batch_count=attempt,
+                                 candidate_count=candidate_count, group_keys=batch_groups,
+                                 retry_of_batch=retry_of, retry_body_bytes_limit=retry_limit)
+                    timing.update(outcome=trace["outcome"], context_rejection=trace["context_rejection"])
+                    if report:
+                        trace["batch_span_id"] = timing["span_id"]
+                    return choices, trace
 
-        chosen = {}
-        api_calls = []
-        for choices, trace in results:
-            # Each response has been validated against its exact question keys.
-            # Ordered futures preserve batch order despite out-of-order replies.
-            chosen.update(choices)
-            api_calls.append(trace)
+            # Budgets and group mappings are immutable while workers are active.
+            # Collect every result before retrying so successful siblings survive.
+            if len(jobs) == 1:
+                results = [run_batch(jobs[0])]
+            else:
+                with ThreadPoolExecutor(thread_name_prefix="jev-batch") as executor:
+                    futures = [executor.submit(copy_context().run, run_batch, job) for job in jobs]
+                    results, errors = [], []
+                    try:
+                        for future in futures:
+                            try:
+                                results.append(future.result())
+                            except Exception as error:
+                                errors.append(error)
+                    except BaseException:
+                        for future in futures:
+                            future.cancel()
+                        raise
+                    if errors:
+                        raise errors[0]
+            pending = []
+            for (choices, trace), (_, (questions, _), _) in zip(results, jobs, strict=True):
+                api_calls.append(trace)
+                if trace["outcome"] == "ok":
+                    chosen.update(choices)
+                    continue
+                if len(questions) > 1:
+                    # Isolate complete questions before attributing overflow to
+                    # any one question. Shared state is counted in every size.
+                    largest = max(_request_body_size(state, {key: q}, self.model)
+                                  for key, q in questions.items())
+                    self.request_budget_bytes = min(
+                        self.request_budget_bytes, max(largest, int(trace["body_bytes"] * 0.8)),
+                    )
+                else:
+                    key, question = next(iter(questions.items()))
+                    if key not in groups or len(groups[key]) < 2:
+                        raise SelectionError(
+                            "Jev rejected shared state plus one atomic question/candidate for "
+                            "exceeding its token limit; selection stopped without sending an action."
+                        )
+                    self.question_budget_bytes = min(
+                        self.question_budget_bytes, int(trace["body_bytes"] * 0.8),
+                    )
+                pending.append(((questions, trace["body_bytes"]), trace))
+        for trace in api_calls:
+            trace["batch_count"] = len(api_calls)
         return chosen, api_calls
 
     def _validate_response(
@@ -348,17 +522,7 @@ class ChoiceSelector:
         if any(type(value) is not int or value < 0 for value in tokens.values()):
             raise SelectionError("Jev returned invalid token usage.")
         return choices, {
-            "question_keys": list(questions),
-            "questions": {
-                key: {
-                    "type": question.type,
-                    "instructions": deepcopy(question.instructions),
-                    "criteria": deepcopy(question.criteria),
-                }
-                for key, question in questions.items()
-            },
             "answers": answer_traces,
-            "requested_model": self.model,
             "response_model": returned_model,
             **tokens,
             "input_cost_usd": tokens["input_tokens"] * 0.042 / 1_000_000,
@@ -404,7 +568,6 @@ class ChoiceSelector:
                     with report.span("selection.grouping") if report else nullcontext({}) as grouping_timing:
                         round_state = deepcopy(original_request)
                         groups, questions = self._group_candidates(round_state, current, round_id)
-                        group_keys = list(questions)
                         final_round = len(groups) == 1
                         action_keys = {}
                         timing_keys = {}
@@ -436,7 +599,8 @@ class ChoiceSelector:
                                             criteria={label: None for label in SETTLING_MS},
                                         )
                     with report.span(
-                        "selection.packing", request_budget_bytes=REQUEST_BUDGET_BYTES,
+                        "selection.packing", request_budget_bytes=self.request_budget_bytes,
+                        question_budget_bytes=self.question_budget_bytes,
                     ) if report else nullcontext({}) as packing_timing:
                         # Selection, action choices, and hypothetical timers are
                         # fixed before sizing and independent across batches.
@@ -445,19 +609,26 @@ class ChoiceSelector:
                         packing_timing["batch_count"] = len(batches)
                     chosen, api_calls = self._judge_batches(
                         round_state, batches,
-                        dict(zip(group_keys, map(len, groups), strict=True)),
-                        report=report, group_keys=group_keys,
+                        groups, report=report,
                     )
+                    # Recovery can split a formerly final group. Recompare all
+                    # its winners before consuming any speculative action.
+                    final_round = len(groups) == 1
+                    if len(current) > 1 and len(groups) >= len(current):
+                        raise SelectionError(
+                            "The Jev context allowance permits only singleton groups; "
+                            "selection cannot narrow these candidates safely."
+                        )
                     # Advance only after every batch in this round succeeds.
                     with report.span("selection.advancement") if report else nullcontext({}) as advancement_timing:
                         winners = []
                         group_traces = []
-                        for key, group in zip(group_keys, groups, strict=True):
+                        for key, group in groups.items():
                             winner_key = chosen[key]
                             winners.append(next(candidate for candidate in group if candidate.key == winner_key))
                             group_traces.append({
                                 "question_key": key,
-                                "options": list(questions[key].criteria),
+                                "options": [candidate.key for candidate in group],
                                 "winner": winner_key,
                             })
                         round_trace = {
@@ -469,7 +640,7 @@ class ChoiceSelector:
                             "round": round_number,
                             "round_id": round_id,
                         }
-                        if final_round and stage == "controls" and requested_action is None:
+                        if action_keys:
                             round_trace["actions"] = {
                                 candidate.key: {
                                     "question_key": action_keys[candidate.key],
@@ -477,8 +648,9 @@ class ChoiceSelector:
                                 }
                                 for candidate in current
                             }
-                            action = chosen[action_keys[winners[0].key]]
-                        if final_round and include_settling:
+                            if final_round:
+                                action = chosen[action_keys[winners[0].key]]
+                        if timing_keys:
                             round_trace["settling"] = {
                                 candidate.key: {
                                     possible_action: {
@@ -490,7 +662,8 @@ class ChoiceSelector:
                                 }
                                 for candidate in current
                             }
-                            settling_ms = round_trace["settling"][winners[0].key][action]["milliseconds"]
+                            if final_round:
+                                settling_ms = round_trace["settling"][winners[0].key][action]["milliseconds"]
                         current = winners
                     if report:
                         round_trace.update(

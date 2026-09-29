@@ -1,12 +1,17 @@
 # Reading run timings
 
 The [main workflow](main-workflow.md) defines the selection and timing contract.
-A candidate is one window or control. A group contains up to ten
-window/control candidates. Each selection round prepares its complete
-HTTP body, then packs whole questions into bodies of at most 90,000 bytes.
+A candidate is one window or control. Group size depends on the SDK-prepared
+compact UTF-8 request bytes, up to Jev's real limit of 255 options per Choice.
+Each proposed group is measured with shared state and shrinks only on overflow.
+For pinned `jev-1.13.0`, the initial estimate of 2.05 bytes per input token gives
+65,600 bytes for state plus one question and 131,200 bytes for state plus all
+questions in a request. Shared state counts once per request; these independent
+allowances are estimates of the 32k/64k limits, not token guarantees.
 A fitting round uses one call; larger rounds dispatch batches in parallel.
-All batch winners recombine before the next round starts. Every window and
-control group uses the same
+Explicit token-limit rejections retry smaller unfinished work while retaining
+successful batches. All batch winners recombine before the next round starts.
+Every window and control group uses the same
 `QUESTION` from [`src/jev_questions.py`](../src/jev_questions.py). The final control
 round also includes `ACTION` for every finalist and a hypothetical
 `TIMER` for each of `click` and `type_text`. Only the chosen control's action and
@@ -20,8 +25,8 @@ it requires available prepared text before activation, then sends Win+S and
 immediately types that exact string in the same iteration.
 There is no intervening observation, confirmation, sleep, or Jev call, and no
 settling wait after typing. Each subsequent iteration starts with fresh window
-discovery. The byte cap bounds request size; it is
-not a token-limit guarantee for unusually long descriptions or shared state.
+discovery. The [selection contract](main-workflow.md#selection-contract)
+describes the exact overflow signature, shrinking policy, and irreducible stop.
 
 The CLI collects events, timestamps, and actual Jev payloads in memory. At the end
 one worker creates a unique `reports/run-<timestamp>-<id>/` folder, writes the
@@ -101,8 +106,11 @@ and `timing_finished` events describe operations:
 | `started_at`, `finished_at` | Corresponding anchored UTC work boundaries. |
 | `status` | `ok`, `error`, or `interrupted`; failures retain `error_type`. |
 | `iteration`, `stage`, `round`, `round_id`, `question_keys` | Loop, selection, and HTTP correlation where applicable. |
-| `batch`, `batch_count`, `batch_candidate_count` | One-based batch position, number of calls in the round, and candidates in this batch. Action/timer questions add no candidate count. Inherited by nested SDK and HTTP events. |
-| `body_bytes`, `request_budget_bytes` | Complete SDK-prepared body size and the 90,000-byte budget, retained with each API call and batch timing. |
+| `batch`, `batch_count`, `batch_candidate_count` | Unique one-based batch identity within the round, recorded batch count, and candidates in this attempt. Recovery adds batches without adding a logical round. Action/timer questions add no candidate count. Inherited by nested SDK and HTTP events. |
+| `body_bytes`, `request_budget_bytes`, `question_budget_bytes` | Complete SDK-prepared compact body size and effective request/single-question allowances on each SDK attempt. Initial allowances are 131,200/65,600 bytes. Effective allowances admit a fitting standalone question and permitted atomic/minimum-comparison exceptions. |
+| `target_question_budget_bytes` | Selector's current grouping target, lowered after standalone candidate-group rejections. It can be smaller than an attempt's effective question allowance. |
+| `retry_body_bytes_limit` | Strict retry cap: the rejected parent's measured body size minus one byte. Every replacement API body is smaller than its own parent. |
+| `outcome`, `context_rejection`, `retry_of_batch` | Attempt outcome, explicit token-limit rejection marker, and rejected parent batch for replacement work. Retry metadata and question mappings connect splits to their original work. |
 
 Use `duration_ms` or the explicit work boundaries, rather than subtracting event
 creation timestamps. A start event can be recorded before its measured work
@@ -150,17 +158,29 @@ recorded startup work. `initialization.request_read`, optional `initialization.t
 Within selection, inspect `selection.validation`, `selection.round`,
 `selection.grouping`, `selection.packing`, `selection.batch`, `selection.sdk_call`,
 `selection.response_validation`, and `selection.advancement`. A round starts
-before forming its groups and ends after all its winners are ready. A batch
-contains one SDK call and local validation/collection of its answers; batches
-execute concurrently with independent reporting context and span ancestry.
+before forming its groups and ends after all its winners are ready, including
+any size-recovery attempts. A batch contains one SDK call and local
+validation/collection of its answers. Independent batches execute concurrently
+within a wave with separate reporting context and span ancestry. Recovery keeps
+successful answers and sends only unfinished work in later waves.
+`selection_attempt` journals a summary of each real attempt; its payloads remain
+in the existing HTTP capture. `selection_retry` links the rejected batch to new
+batch IDs and replacement question keys. Neither event is a new logical round.
 `selection.packing` measures local SDK preparation and byte sizing; it sends no
 API requests. A singleton window can bypass selection. A singleton control
 is still selected, with its action Choice and both timers included before packing
 when execution context is available. A trailing one-candidate group remains
 whole within the same round.
-An oversized atomic question plus state fails during packing, before that round
-sends any API calls. A missing HTTP event after that failure does
-not imply that candidates were silently skipped.
+An atomic candidate or companion question above a lowered grouping target can
+still be tried under the original 65,600-byte estimate. Later ordinary grouping
+can likewise retain a two-candidate comparison under that original bound when
+the lower target permits only a singleton; retry splitting never uses this
+fallback. Inputs exceeding the original bound can fail during local grouping
+or packing. A standalone atomic rejection, inability to produce a strictly
+smaller retry, or inability to narrow candidates stops through `SelectionError`.
+Earlier successful attempts remain in the HTTP
+evidence, even if no complete round is returned. A missing HTTP event after a
+local sizing failure does not imply that candidates were silently skipped.
 
 Foreground activation precedes the newly selected real window's control snapshot.
 Windows Search uses `foreground_activation` for desktop Win+S, then directly
@@ -240,13 +260,18 @@ shared daemon remains running. No periodic health polling is performed.
 
 A question key such as `controls_r1_g0` identifies the stage, round, and group.
 Rounds and batches are numbered from one; group numbers start at zero and remain
-unique across the whole round. `iteration`, `round_id`, `batch`, and
+unique across the whole round. Replacement groups receive unique question keys;
+retry batches receive new identities while preserving the logical round number.
+`iteration`, `round_id`, `batch`, and
 `question_keys` link each group to its API call. Every newly produced round trace
 uses one `api_calls` list, including rounds with only one call. Each call retains
-its own model identities, token usage, questions, answers, probabilities, and
-SDK/validation span IDs, plus its batch number, batch count, candidate count,
-prepared `body_bytes`, and batch span ID. The round's groups retain their options
-and winners in original group order, regardless of response order. Historical
+its requested model, questions, attempt outcome, duration, byte allowances,
+retry relationship, and available span IDs, plus its batch identity,
+question/candidate counts, prepared `body_bytes`, and batch span ID. Successful
+attempts also retain the returned model, answers, probabilities, and usage.
+Rejected attempts without usage retain unknown tokens and cost. The round's
+groups retain their options and winners in original candidate order, including
+replacement groups, regardless of response order. Historical
 reports used a singular `api_call` record; consumers reading them should treat
 it as a one-item list. New reports do not duplicate the singular field.
 
@@ -254,7 +279,9 @@ HTTP events share `request_id` and iteration/round/batch context, linking
 `jev_request` with `jev_response`, `jev_response_error`, or
 `jev_request_unfinished`. Sum token usage once per `api_calls` entry, or once per
 HTTP response's usage object; those are two views of the same usage and must not
-be added together.
+be added together. Input cost is actual returned `input_tokens * 0.042 / 1,000,000`.
+Missing rejection usage is not zero usage and is never filled from the byte
+estimate. Retried API attempts add to call count, not selection-round count.
 
 The timing summary's `jev_api_call_count` counts actual prepared requests seen
 by the HTTP hook. It is zero when no request occurs; Python callers must register
