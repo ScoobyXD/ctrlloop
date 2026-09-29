@@ -12,8 +12,8 @@ const stageLabels = {
   completed: "Run completed", error: "Error", failed: "Run failed",
 };
 const viewerRetryDelays = [1000, 2000, 4000, 8000, 15000];
-const state = { session: null, sessionGeneration: 0, signingOut: false, loops: [], detail: null, selectedId: null, creating: false, running: false, changingMode: false, pollBusy: false, rfb: null, viewerGeneration: 0, viewerConnecting: false, viewerWanted: false, viewerRetryCount: 0, viewerRetryTimer: null, viewerConnectTimer: null, viewerStableTimer: null, viewerSessionController: null, viewerFailure: "", fit: true, lastDetailSignature: "", lastListSignature: "" };
-Object.assign(state, { view: "home", tab: "activity", switchingCompany: false, members: [], savingMember: false, savingCompany: false, authBusy: false, authView: "login", resetToken: null, companies: [], companyContext: null, userContext: null });
+const state = { session: null, sessionGeneration: 0, signingOut: false, loops: [], detail: null, selectedId: null, creating: false, running: false, changingMode: false, pollBusy: false, rfb: null, viewerGeneration: 0, viewerConnecting: false, viewerWanted: false, viewerRetryCount: 0, viewerRetryTimer: null, viewerConnectTimer: null, viewerStableTimer: null, viewerSessionController: null, viewerFailure: "", lastDetailSignature: "", lastListSignature: "" };
+Object.assign(state, { view: "home", controlUnconfirmed: false, switchingCompany: false, members: [], savingMember: false, savingCompany: false, authBusy: false, authView: "login", resetToken: null, companies: [], companyContext: null, userContext: null });
 const emptyDetail = $("loop-detail").innerHTML;
 let viewerModule;
 
@@ -30,7 +30,7 @@ function statusClass(status) { return errorStatuses.has(status) ? "error" : acti
 function badge(status) { return `<span class="badge ${statusClass(status)}">${escapeHtml(humanize(status))}</span>`; }
 function getRuns() { return Array.isArray(state.detail?.runs) ? state.detail.runs : []; }
 function hasActiveRun() { return Boolean(state.session?.worker?.active_run || state.session?.worker?.queued_run) || getRuns().some((run) => run.worker_id === state.session?.worker?.id && activeStatuses.has(run.status)); }
-function desktopIsVisible() { return ["loop", "desktop"].includes(state.view) && state.tab === "desktop"; }
+function desktopIsVisible() { return ["loop", "desktop"].includes(state.view); }
 function autoStartPending() { return getRuns().some(run => run.status === "queued" && run.worker_id === state.session?.worker?.id); }
 function personName(person) { return person?.display_name || person?.email || "Earlier company member"; }
 function canManageCompany() { return state.session?.user?.is_devadmin === true || state.session?.company?.role === "company_admin"; }
@@ -50,7 +50,7 @@ function resetCompanyView() {
   disconnectViewer(); state.loops = []; state.detail = null; state.selectedId = null; state.members = [];
   state.creating = false; state.running = false; state.changingMode = false; state.savingMember = false; state.savingCompany = false; $("save-company").disabled = false; state.viewerFailure = "";
   $("create-loop").disabled = state.switchingCompany; $("create-loop").innerHTML = 'Start CtrlLoop <span aria-hidden="true">↗</span>'; $("prompt").disabled = false;
-  state.lastListSignature = ""; state.lastDetailSignature = ""; state.view = "home"; state.tab = "activity";
+  state.lastListSignature = ""; state.lastDetailSignature = ""; state.view = "home";
   renderNavigation(false);
   $("loop-detail").innerHTML = emptyDetail; $("member-list").replaceChildren(); $("member-count").textContent = "";
   $("member-management").open = false; $("member-error").hidden = true; $("page-notice").hidden = true;
@@ -95,6 +95,7 @@ function adoptSession(session) {
     state.sessionGeneration += 1; resetCompanyView(); history.replaceState(null, "", "#home");
   }
   state.session = session;
+  state.controlUnconfirmed = false;
   state.companyContext = session.user?.is_devadmin ? session.company?.id || null : null;
   state.userContext = session.user?.is_devadmin ? session.target_user_id || null : null;
   $("login-screen").hidden = true; $("app").hidden = false;
@@ -142,7 +143,7 @@ function renderSession() {
   $("worker-status").textContent = worker ? `Your worker · ${humanize(worker.status)}${worker.mode === "maintenance" ? " · Worker deployment in progress" : ""}` : "No desktop assigned to the selected account";
   $("worker-last-seen").textContent = worker?.last_seen ? `Last seen ${formatTime(worker.last_seen)}` : "";
   $("worker-last-seen").title = worker?.last_seen ? formatDate(worker.last_seen, { second: "2-digit", timeZoneName: "short" }) : "";
-  $("fit-view").disabled = !worker; $("fullscreen").disabled = !worker;
+  $("fullscreen").disabled = !worker;
   if (!worker) {
     if (state.rfb || state.viewerConnecting || state.viewerWanted) disconnectViewer();
     setViewerStatus("No desktop assigned", "warn");
@@ -155,16 +156,25 @@ function renderControl() {
   const human = state.session?.worker?.mode === "human";
   const maintenance = state.session?.worker?.mode === "maintenance";
   const agent = state.session?.worker?.mode === "agent";
-  const canControl = state.session?.worker?.can_control === true;
+  const canControl = state.session?.worker?.can_control === true && !state.controlUnconfirmed;
   const active = hasActiveRun();
-  const disabled = !state.session?.worker?.id || (!human && !agent) || state.changingMode || state.switchingCompany || active || (human && !canControl);
+  const disabled = !state.session?.worker?.id || (!human && !agent) || state.controlUnconfirmed || state.changingMode || state.switchingCompany || state.running || active || (human && !canControl);
   $("control-mode-label").textContent = maintenance ? "Deployment in progress" : canControl ? "You have control" : "View only";
-  $("control-mode-description").textContent = !state.session?.worker ? "Waiting for a desktop to be assigned to you." : maintenance ? "Runs and control will resume after worker deployment." : canControl ? "Return control when you're ready to run a loop." : human ? "Another session of your account controls this desktop." : active ? "The agent is running. Takeover is locked." : "The agent controls this desktop.";
+  $("control-mode-description").textContent = !state.session?.worker ? "Waiting for a desktop to be assigned to you." : maintenance ? "Runs and control will resume after worker deployment." : state.changingMode ? "Switching desktop control…" : canControl ? "Return control when you're ready to run a loop." : human ? "Another session of your account controls this desktop." : active ? "The agent is running. Control is available when it finishes." : "Click the desktop to take control.";
   $("control-mode-icon").textContent = canControl ? "↖" : "◉";
+  if (state.controlUnconfirmed) {
+    $("control-mode-label").textContent = "Checking control";
+    $("control-mode-description").textContent = "Desktop input is paused until ownership can be confirmed.";
+  }
   $("control-mode-icon").parentElement.classList.toggle("human", canControl);
-  $("toggle-control").textContent = state.changingMode ? "Switching…" : maintenance ? "Deployment in progress" : canControl ? "Return to agent ↗" : human ? "Control unavailable" : "Take control ↗";
+  $("toggle-control").textContent = state.changingMode ? "Switching…" : "Return to agent ↗";
+  $("toggle-control").hidden = !canControl;
   $("toggle-control").disabled = disabled;
-  if (state.rfb) { state.rfb.viewOnly = !human || !canControl || active; state.rfb.focusOnClick = human && canControl && !active; }
+  const inputEnabled = human && canControl && !disabled;
+  const takeover = $("desktop-takeover");
+  takeover.hidden = inputEnabled || !state.rfb || state.viewerConnecting;
+  takeover.setAttribute("aria-disabled", String(disabled));
+  if (state.rfb) { state.rfb.viewOnly = !inputEnabled; state.rfb.focusOnClick = inputEnabled; }
   const startReason = !state.session?.worker?.id ? "Save your CtrlLoop now. An assigned desktop is needed before it can run." : maintenance ? "Your desktop is being updated. Starting will be available when it’s ready." : human ? "Return desktop control to the agent before starting a CtrlLoop." : state.session?.worker?.status !== "online" ? "Your desktop is offline. Starting will be available when it reconnects." : active ? "Your desktop is running a CtrlLoop. You can follow its activity or start another when it finishes." : "Describe it once. We’ll prepare the instruction and start.";
   $("compose-hint").textContent = startReason;
   $("create-loop").disabled = state.creating || state.switchingCompany || state.running || state.changingMode || (Boolean(state.session?.worker?.id) && (active || !agent || state.session.worker.status !== "online"));
@@ -178,7 +188,7 @@ function renderControl() {
     runButton.textContent = state.running ? "Starting…" : active ? "Run in progress" : getRuns().length ? "Run again ↗" : "Start CtrlLoop ↗";
   }
   const hint = $("run-control-hint");
-  if (hint) { hint.textContent = human ? canControl ? "Return control to the agent to run this instruction." : "Your other session must return desktop control before a run can start." : !state.session?.worker?.id ? "Desktop provisioning pending. You can run this CtrlLoop once a desktop is assigned to you." : state.session?.worker?.status !== "online" ? "Waiting for your assigned worker to come online." : state.detail?.status === "generating" ? autoStartPending() ? "Preparing the instruction. Execution will start automatically." : "Preparing the saved instruction. No execution is currently queued." : "Runs use the assigned desktop shown in the Desktop tab. Follow each recorded step here."; }
+  if (hint) { hint.textContent = human ? canControl ? "Return control to the agent to run this instruction." : "Your other session must return desktop control before a run can start." : !state.session?.worker?.id ? "Desktop provisioning pending. You can run this CtrlLoop once a desktop is assigned to you." : state.session?.worker?.status !== "online" ? "Waiting for your assigned worker to come online." : state.detail?.status === "generating" ? autoStartPending() ? "Preparing the instruction. Execution will start automatically." : "Preparing the saved instruction. No execution is currently queued." : "Watch this run on the live desktop beside the instruction. Recorded steps appear below."; }
   if (hint && maintenance) hint.textContent = "Worker deployment in progress. Run and control access will resume when deployment completes.";
 }
 
@@ -186,24 +196,24 @@ function renderControl() {
 function renderNavigation(writeHistory = true) {
   $("home-view").hidden = state.view !== "home";
   $("loop-view").hidden = !["loop", "desktop"].includes(state.view);
-  document.querySelector(".loop-tabs").hidden = state.view === "desktop";
+  $("loop-workspace").classList.toggle("desktop-only", state.view === "desktop");
+  $("loop-progress").hidden = state.view !== "loop";
   $("company-view").hidden = state.view !== "company";
   $("home-nav").classList.toggle("selected", state.view === "home");
   $("home-nav").toggleAttribute("aria-current", state.view === "home");
   if (state.view === "home") $("home-nav").setAttribute("aria-current", "page");
   $("company-nav").classList.toggle("selected", state.view === "company");
   $("breadcrumb-page").textContent = state.view === "loop" ? "CtrlLoop" : state.view === "desktop" ? "Desktop" : state.view === "company" ? "People & access" : "Home";
-  $("activity-view").hidden = state.tab !== "activity";
-  $("desktop-view").hidden = state.tab !== "desktop";
-  for (const name of ["activity", "desktop"]) {
-    $("tab-" + name).setAttribute("aria-selected", String(state.tab === name));
-    $("tab-" + name).tabIndex = state.tab === name ? 0 : -1;
-  }
+  $("activity-view").hidden = state.view !== "loop";
   const desktopVisible = desktopIsVisible();
+  if (!desktopVisible) {
+    setExpandedDesktop(false);
+    if (document.fullscreenElement === $("desktop-panel")) void document.exitFullscreen().catch(() => {});
+  }
   if (!desktopVisible && (state.viewerWanted || state.rfb || state.viewerConnecting)) disconnectViewer();
   if (desktopVisible && state.session?.worker?.id && !state.viewerWanted && !state.signingOut) void connectViewer({ manual: true });
   if (writeHistory) {
-    const route = state.view === "loop" && state.selectedId ? `#loop/${encodeURIComponent(state.selectedId)}${state.tab === "desktop" ? "/desktop" : ""}` : state.view === "desktop" ? "#desktop" : state.view === "company" ? "#company" : "#home";
+    const route = state.view === "loop" && state.selectedId ? `#loop/${encodeURIComponent(state.selectedId)}` : state.view === "desktop" ? "#desktop" : state.view === "company" ? "#company" : "#home";
     if (location.hash !== route) history.pushState(null, "", route);
   }
   setSidebarOpen(false);
@@ -213,18 +223,15 @@ function showHome({ focus = false, fromHistory = false } = {}) {
   renderNavigation(!fromHistory); renderLoops(); renderControl();
   if (focus) { $("prompt").focus(); $("compose-panel").scrollIntoView({ behavior: "smooth", block: "center" }); }
 }
-function setLoopTab(tab, fromHistory = false) {
-  state.tab = tab; renderNavigation(!fromHistory);
-}
 function showDesktop(fromHistory = false) {
-  state.view = "desktop"; state.tab = "desktop"; state.selectedId = null; state.detail = null;
+  state.view = "desktop"; state.selectedId = null; state.detail = null;
   $("loop-title").textContent = state.session?.user?.is_devadmin ? $("desktop-owner").textContent : "Your desktop"; $("loop-reference").textContent = "COMPANY / DESKTOP";
   $("loop-heading-status").replaceChildren(); renderNavigation(!fromHistory); renderLoops(); renderControl();
 }
 async function openRoute() {
   if (location.hash === "#desktop") { showDesktop(true); return; }
   const route = location.hash.match(/^#loop\/([^/]+)(\/desktop)?$/);
-  if (route) { await selectLoop(decodeURIComponent(route[1]), { fromHistory: true, tab: route[2] ? "desktop" : "activity" }); return; }
+  if (route) { await selectLoop(decodeURIComponent(route[1]), { fromHistory: true }); return; }
   if (location.hash === "#company" && canManageCompany()) {
     state.view = "company"; state.selectedId = null; renderNavigation(false); renderLoops(); $("member-management").open = true; return;
   }
@@ -255,8 +262,9 @@ function renderLoops() {
   if (!state.loops.length) { $("loop-list").innerHTML = '<p class="list-empty">Your CtrlLoops live here.<br>Start with a new request.</p>'; return; }
   $("loop-list").innerHTML = state.loops.map(loop => `<button class="loop-list-item ${String(loop.id) === String(state.selectedId) ? "selected" : ""}" data-loop-id="${escapeHtml(loop.id)}" ${String(loop.id) === String(state.selectedId) ? 'aria-current="page"' : ""}><span class="loop-icon" aria-hidden="true">↳</span><span class="list-title">${escapeHtml(loop.prompt || "Untitled CtrlLoop")}</span><span class="list-item-meta"><i class="status-dot ${errorStatuses.has(loop.status) ? "error" : loop.status === "generating" ? "warn" : ""}"></i>${escapeHtml(humanize(loop.status))}<time title="${escapeHtml(formatDate(loop.created_at))}">${escapeHtml(validDate(loop.created_at)?.toLocaleDateString(undefined, { month: "short", day: "numeric" }) || "—")}</time></span></button>`).join("");
 }
-async function selectLoop(id, { fromHistory = false, tab = "activity" } = {}) {
-  state.selectedId = id; state.detail = null; state.view = "loop"; state.tab = tab; state.lastDetailSignature = "";
+async function selectLoop(id, { fromHistory = false } = {}) {
+  state.selectedId = id; state.detail = null; state.view = "loop"; state.lastDetailSignature = "";
+  $("loop-progress").replaceChildren();
   $("loop-title").textContent = state.loops.find(loop => String(loop.id) === String(id))?.prompt || "Loading CtrlLoop…";
   $("loop-reference").textContent = `CTRLLOOP / ${String(id).slice(0, 8).toUpperCase()}`;
   $("loop-heading-status").replaceChildren(); $("loop-detail").innerHTML = '<p class="loading-message" role="status">Loading activity…</p>';
@@ -306,7 +314,8 @@ function renderDetail() {
   const prepared = Boolean(loop.instruction);
   const executed = latest && !activeStatuses.has(latest.status) && !errorStatuses.has(latest.status);
   const progress = `<div class="progress-strip" aria-label="CtrlLoop progress"><div class="progress-step done"><span><i>✓</i></span><div><strong>Request</strong><small>Saved to company</small></div></div><div class="progress-step ${prepared ? "done" : generating ? "current" : ""}"><span><i>${prepared ? "✓" : "02"}</i></span><div><strong>Prepare</strong><small>${prepared ? "Instruction ready" : generating ? "Generating…" : "Needs attention"}</small></div></div><div class="progress-step ${executed ? "done" : prepared && latest && activeStatuses.has(latest.status) ? "current" : ""}"><span><i>${executed ? "✓" : "03"}</i></span><div><strong>Execute</strong><small>${generating && latest?.status === "queued" ? "Starts automatically" : latest ? escapeHtml(humanize(latest.status)) : "Not started"}</small></div></div></div>`;
-  $("loop-detail").innerHTML = `${progress}<div class="detail-grid"><aside class="request-summary"><div class="detail-heading"><h2>Request & instruction</h2><button id="reuse-request" class="button quiet small" title="Use this request in a new CtrlLoop">Reuse ↗</button></div><div class="request-block"><div class="content-label"><span>REQUEST</span></div><p class="request-text">${escapeHtml(loop.prompt)}</p><p class="workflow-attribution">Created by ${escapeHtml(personName(loop.creator))}<br>${escapeHtml(formatDate(loop.created_at))}</p></div><div class="instruction-block"><div class="content-label"><span>INSTRUCTION</span><span>${prepared ? "SAVED" : "PENDING"}</span></div>${prepared ? `<p class="instruction-text">${escapeHtml(loop.instruction)}</p>` : `<p class="instruction-missing">${generating ? autoStartPending() ? "Preparing your instruction. Execution will start automatically on your assigned desktop." : "Preparing the saved instruction. No execution is currently queued." : "An instruction could not be prepared. Your original request is saved."}</p>`}${model ? `<div class="instruction-meta">${escapeHtml(model)}</div>` : ""}${loop.error ? `<div class="inline-error">${escapeHtml(valueText(loop.error))}</div>` : ""}<div class="instruction-actions"><button id="run-instruction" class="button primary" ${!prepared ? "disabled" : ""}>Run again ↗</button><button id="open-desktop" class="button secondary small">View desktop ↗</button></div><p class="run-hint" id="run-control-hint"></p><div class="instruction-actions"><a class="button quiet small" href="${escapeHtml(scopedURL(`/reports/loops/${encodeURIComponent(loop.id)}`))}" target="_blank" rel="noopener">Request report ↗</a><a class="button quiet small" href="${escapeHtml(scopedURL(`/api/loops/${encodeURIComponent(loop.id)}/download`))}">Evidence ↓</a></div></div></aside><div class="activity-column"><div class="activity-header"><h3>Execution activity</h3><span>${runs.length} ${runs.length === 1 ? "run" : "runs"} · ${escapeHtml(Intl.DateTimeFormat().resolvedOptions().timeZone)}</span></div>${loopEvents.length ? `<section class="run-group"><div class="run-summary"><div><span>Instruction preparation</span>${generating ? badge("preparing") : ""}</div></div><ol class="timeline">${loopEvents.map((event, index) => renderEvent(event, index, `loop-${loop.id}`)).join("")}</ol></section>` : ""}${runs.map((run, index) => renderRun(run, index, runs.length)).join("")}${!runs.length ? `<p class="no-events">${generating ? "Preparing the instruction…" : "This CtrlLoop has no recorded executions yet."}</p>` : ""}</div></div>`;
+  $("loop-progress").innerHTML = progress;
+  $("loop-detail").innerHTML = `<aside class="request-summary"><div class="detail-heading"><h2>Request & instruction</h2><button id="reuse-request" class="button quiet small" title="Use this request in a new CtrlLoop">Reuse ↗</button></div><div class="request-block"><div class="content-label"><span>REQUEST</span></div><p class="request-text">${escapeHtml(loop.prompt)}</p><p class="workflow-attribution">Created by ${escapeHtml(personName(loop.creator))}<br>${escapeHtml(formatDate(loop.created_at))}</p></div><div class="instruction-block"><div class="content-label"><span>INSTRUCTION</span><span>${prepared ? "SAVED" : "PENDING"}</span></div>${prepared ? `<p class="instruction-text">${escapeHtml(loop.instruction)}</p>` : `<p class="instruction-missing">${generating ? autoStartPending() ? "Preparing your instruction. Execution will start automatically on your assigned desktop." : "Preparing the saved instruction. No execution is currently queued." : "An instruction could not be prepared. Your original request is saved."}</p>`}${model ? `<div class="instruction-meta">${escapeHtml(model)}</div>` : ""}${loop.error ? `<div class="inline-error">${escapeHtml(valueText(loop.error))}</div>` : ""}<div class="instruction-actions"><button id="run-instruction" class="button primary" ${!prepared ? "disabled" : ""}>Run again ↗</button></div><p class="run-hint" id="run-control-hint"></p><div class="instruction-actions"><a class="button quiet small" href="${escapeHtml(scopedURL(`/reports/loops/${encodeURIComponent(loop.id)}`))}" target="_blank" rel="noopener">Request report ↗</a><a class="button quiet small" href="${escapeHtml(scopedURL(`/api/loops/${encodeURIComponent(loop.id)}/download`))}">Evidence ↓</a></div></div></aside><div class="activity-column"><div class="activity-header"><h3>Execution activity</h3><span>${runs.length} ${runs.length === 1 ? "run" : "runs"} · ${escapeHtml(Intl.DateTimeFormat().resolvedOptions().timeZone)}</span></div>${loopEvents.length ? `<section class="run-group"><div class="run-summary"><div><span>Instruction preparation</span>${generating ? badge("preparing") : ""}</div></div><ol class="timeline">${loopEvents.map((event, index) => renderEvent(event, index, `loop-${loop.id}`)).join("")}</ol></section>` : ""}${runs.map((run, index) => renderRun(run, index, runs.length)).join("")}${!runs.length ? `<p class="no-events">${generating ? "Preparing the instruction…" : "This CtrlLoop has no recorded executions yet."}</p>` : ""}</div>`;
   for (const element of $("loop-detail").querySelectorAll("details[data-event-key]")) element.open = openKeys.has(element.dataset.eventKey);
   if (focusedId) $(focusedId)?.focus({ preventScroll: true });
   updateDurations(); renderControl();
@@ -399,7 +408,7 @@ async function connectViewer({ manual = false } = {}) {
     if (!current()) return;
     const url = new URL(scopedURL("/api/desktop"), window.location.href); url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const rfb = new RFB($("desktop-canvas"), url.toString(), { shared: true });
-    state.rfb = rfb; rfb.viewOnly = state.session?.worker?.mode !== "human" || state.session?.worker?.can_control !== true || hasActiveRun(); rfb.focusOnClick = !rfb.viewOnly; rfb.scaleViewport = state.fit; rfb.resizeSession = false; rfb.background = "#070707";
+    state.rfb = rfb; rfb.viewOnly = true; rfb.focusOnClick = false; rfb.scaleViewport = true; rfb.resizeSession = false; rfb.background = "#070707";
     rfb.addEventListener("connect", () => {
       if (!current() || state.rfb !== rfb) return;
       clearViewerTimer("viewerConnectTimer"); state.viewerConnecting = false;
@@ -651,7 +660,7 @@ $("compose-form").addEventListener("submit", async (event) => {
   try {
     const loop = await api("/api/loops", { method: "POST", body: JSON.stringify({ prompt, start }) });
     if (generation !== state.sessionGeneration) return;
-    state.selectedId = loop.id; state.detail = loop; state.view = "loop"; state.tab = "activity"; state.lastDetailSignature = "";
+    state.selectedId = loop.id; state.detail = loop; state.view = "loop"; state.lastDetailSignature = "";
     state.loops = [loop, ...state.loops.filter(item => item.id !== loop.id)];
     $("prompt").value = ""; renderLoops(); renderNavigation(); renderDetail();
     await Promise.all([loadLoops(), loadDetail(loop.id), loadSession()]);
@@ -663,7 +672,6 @@ $("compose-form").addEventListener("submit", async (event) => {
 });
 for (const id of ["loop-list", "recent-loops"]) $(id).addEventListener("click", event => { const item = event.target.closest("[data-loop-id]"); if (item && !state.creating) void selectLoop(item.dataset.loopId); });
 $("loop-detail").addEventListener("click", async (event) => {
-  if (event.target.closest("#open-desktop")) { setLoopTab("desktop"); return; }
   if (event.target.closest("#reuse-request")) { const prompt = state.detail?.prompt || ""; showHome({ focus: true }); $("prompt").value = prompt; return; }
   if (!event.target.closest("#run-instruction") || state.switchingCompany || state.running || hasActiveRun() || state.session?.worker?.mode !== "agent" || state.session?.worker?.status !== "online" || !state.detail?.instruction) return;
   const id = state.detail.id, generation = state.sessionGeneration; state.running = true; renderControl(); $("page-notice").hidden = true;
@@ -690,26 +698,60 @@ $("toggle-sidebar").addEventListener("click", () => setSidebarOpen(!$("app").cla
 document.addEventListener("keydown", event => { if (event.key === "Escape" && $("app").classList.contains("nav-open")) { setSidebarOpen(false); $("toggle-sidebar").focus(); } });
 $("prompt").addEventListener("keydown", event => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); $("compose-form").requestSubmit(); } });
 $("main-content").addEventListener("click", () => { setSidebarOpen(false); });
-for (const name of ["activity", "desktop"]) $("tab-" + name).addEventListener("click", () => setLoopTab(name));
-document.querySelector(".loop-tabs").addEventListener("keydown", event => {
-  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-  event.preventDefault(); const name = event.key === "Home" ? "activity" : event.key === "End" ? "desktop" : state.tab === "activity" ? "desktop" : "activity";
-  setLoopTab(name); $("tab-" + name).focus();
-});
 window.addEventListener("popstate", () => { if (state.session?.authenticated && !state.creating) void openRoute(); });
 document.querySelector(".sidebar-brand").addEventListener("click", event => { event.preventDefault(); if (!state.creating) showHome(); });
 
-$("toggle-control").addEventListener("click", async () => {
-  if (state.changingMode || state.switchingCompany || !["agent", "human"].includes(state.session?.worker?.mode)) return;
-  const generation = state.sessionGeneration;
+async function changeDesktopMode(mode) {
+  const worker = state.session?.worker;
+  if (state.changingMode || state.controlUnconfirmed || state.switchingCompany || state.signingOut || state.running || hasActiveRun() || !worker?.id) return;
+  if (mode === "human" && (worker.mode !== "agent" || !state.rfb || state.viewerConnecting || !desktopIsVisible())) return;
+  if (mode === "agent" && (worker.mode !== "human" || !worker.can_control)) return;
+  const generation = state.sessionGeneration, rfb = state.rfb;
   state.changingMode = true; renderControl();
-  try { await api("/api/worker/mode", { method: "POST", body: JSON.stringify({ mode: state.session?.worker?.mode === "human" ? "agent" : "human" }) }); if (generation === state.sessionGeneration) await loadSession(); }
-  catch (error) { if (generation === state.sessionGeneration && error.status !== 401) notice(error.message, true); }
-  finally { if (generation === state.sessionGeneration) { state.changingMode = false; renderControl(); } }
+  try {
+    await api("/api/worker/mode", { method: "POST", body: JSON.stringify({ mode }) });
+    if (generation === state.sessionGeneration) await loadSession();
+  } catch (error) {
+    if (generation === state.sessionGeneration && error.status !== 401) {
+      notice(error.message, true);
+      try { await loadSession(); } catch { if (generation === state.sessionGeneration) state.controlUnconfirmed = true; }
+    }
+  } finally {
+    if (generation === state.sessionGeneration) {
+      const focusDesktop = document.activeElement === $("desktop-takeover");
+      state.changingMode = false; renderControl();
+      if (mode === "human" && focusDesktop && rfb && state.rfb === rfb && !rfb.viewOnly && desktopIsVisible() && !document.hidden) rfb.focus({ preventScroll: true });
+    }
+  }
+}
+// The first completed click only acquires ownership. It never reaches the guest.
+$("desktop-takeover").addEventListener("click", () => void changeDesktopMode("human"));
+$("toggle-control").addEventListener("click", () => void changeDesktopMode("agent"));
+function updateFullscreenLabel() {
+  const text = document.fullscreenElement || $("desktop-panel").classList.contains("expanded") ? "Exit fullscreen" : "Enter fullscreen";
+  $("fullscreen").title = text; $("fullscreen").setAttribute("aria-label", text);
+}
+function setExpandedDesktop(expanded) {
+  $("desktop-panel").classList.toggle("expanded", expanded);
+  document.body.classList.toggle("desktop-expanded", expanded);
+  updateFullscreenLabel();
+}
+$("fullscreen").addEventListener("click", async () => {
+  if ($("desktop-panel").classList.contains("expanded")) { setExpandedDesktop(false); return; }
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else await $("desktop-panel").requestFullscreen();
+  } catch {
+    // Embedded browsers may disallow native fullscreen; still fill the app viewport.
+    if (desktopIsVisible()) setExpandedDesktop(true);
+  }
 });
-$("fit-view").addEventListener("click", () => { state.fit = !state.fit; if (state.rfb) state.rfb.scaleViewport = state.fit; $("fit-view").setAttribute("aria-pressed", String(state.fit)); $("fit-view").classList.toggle("active", state.fit); $("fit-view").textContent = state.fit ? "Fit" : "1:1"; $("fit-view").title = state.fit ? "Show desktop at actual size" : "Fit desktop to viewer"; });
-$("fullscreen").addEventListener("click", async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else await $("desktop-panel").requestFullscreen(); } catch (error) { notice(`Fullscreen is unavailable: ${error.message}`); } });
-document.addEventListener("fullscreenchange", () => { const text = document.fullscreenElement ? "Exit fullscreen" : "Enter fullscreen"; $("fullscreen").title = text; $("fullscreen").setAttribute("aria-label", text); });
+document.addEventListener("fullscreenchange", updateFullscreenLabel);
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && $("desktop-panel").classList.contains("expanded")) {
+    event.preventDefault(); event.stopPropagation(); setExpandedDesktop(false); $("fullscreen").focus();
+  }
+}, true);
 $("reconnect-viewer").addEventListener("click", () => { void connectViewer({ manual: true }); });
 $("dismiss-notice").addEventListener("click", () => { $("page-notice").hidden = true; });
 document.addEventListener("visibilitychange", () => {
@@ -723,7 +765,7 @@ document.addEventListener("visibilitychange", () => {
   } else { void refresh(); }
   scheduleViewerReconnect();
 });
-document.addEventListener("keydown", (event) => { if (event.key.toLowerCase() === "n" && !event.ctrlKey && !event.metaKey && !event.altKey && !event.target.closest("input, textarea, select, [contenteditable], #desktop-canvas") && state.session?.authenticated) { event.preventDefault(); $("new-loop").click(); } });
+document.addEventListener("keydown", (event) => { if (event.key.toLowerCase() === "n" && !event.ctrlKey && !event.metaKey && !event.altKey && !event.target.closest("input, textarea, select, [contenteditable], .desktop-display") && state.session?.authenticated) { event.preventDefault(); $("new-loop").click(); } });
 window.addEventListener("beforeunload", disconnectViewer);
 setInterval(refresh, 2000);
 setInterval(updateDurations, 1000);
