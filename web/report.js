@@ -37,21 +37,33 @@ const parts = location.pathname.split("/").filter(Boolean);
 const kind = parts[1], identity = parts[2];
 const base = `/api/${kind}/${encodeURIComponent(identity)}`;
 let current;
+let sessionGeneration = 0;
+const personName = (person) => person?.display_name || person?.username || "Earlier workspace member";
+function hideRecord() { current = null; lazyContent.clear(); $("report-content").replaceChildren(); $("report-content").hidden = true; }
+function requireLogin() { sessionGeneration+=1; hideRecord(); $("report-login").hidden=false; $("report-loading").hidden=true; $("report-person").textContent="RUN EVIDENCE"; $("report-workspace").hidden=true; $("report-workspace-name").textContent=""; }
 
 async function fetchJSON(path, options={}) {
+  const generation=sessionGeneration;
   const response = await fetch(path, {credentials:"same-origin",cache:"no-store",...options});
-  if(response.status===401){$("report-login").hidden=false;$("report-loading").hidden=true;$("report-content").hidden=true;return null;}
+  if(response.status===401){if(generation===sessionGeneration)requireLogin();return null;}
   const data = await response.json();
   if(!response.ok) throw new Error(typeof data.detail==="string" ? data.detail : `Request failed (${response.status})`);
   return data;
 }
 $("report-login").addEventListener("submit",async(event)=>{
-  event.preventDefault();$("login-error").textContent="";
+  event.preventDefault();$("login-error").textContent="";$("report-login-submit").disabled=true;sessionGeneration+=1;
   try {
-    const response=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:$("report-password").value})});
-    if(!response.ok) throw new Error((await response.json()).detail || "Sign in failed");
+    const response=await fetch("/api/login",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("report-username").value.trim(),password:$("report-password").value})});
+    if(!response.ok) { const detail=(await response.json()).detail; throw new Error(typeof detail==="string"?detail:Array.isArray(detail)?detail.map(item=>item.msg||"Invalid input").join("; "):"Sign in failed"); }
     $("report-password").value="";$("report-login").hidden=true;await load();
   } catch(error){$("login-error").textContent=error.message;}
+  finally{$("report-login-submit").disabled=false;}
+});
+$("report-workspace").addEventListener("change",async()=>{
+  const workspaceId=$("report-workspace").value;sessionGeneration+=1;hideRecord();$("report-workspace").disabled=true;
+  try {await fetchJSON("/api/session/workspace",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({workspace_id:workspaceId})});await load();}
+  catch(error){$("report-loading").hidden=false;$("report-loading").textContent=error.message;}
+  finally{$("report-workspace").disabled=false;}
 });
 
 function loopData(events) {
@@ -220,10 +232,23 @@ function render(data){
   <section class="report-card"><h2>Screenshots</h2><div class="screenshots">${files.filter(f=>f.path.toLowerCase().endsWith(".png")).map(f=>`<figure><a href="${fileURL(f.path)}" target="_blank" rel="noopener"><img src="${fileURL(f.path)}" loading="lazy" alt="${esc(f.path)}"></a><figcaption>${esc(f.path)}</figcaption></figure>`).join("")||'<p>No screenshots available in the uploaded evidence.</p>'}</div></section>
   <section class="report-card"><h2>Files and complete raw record</h2><ul class="report-files">${files.map(f=>`<li><a href="${fileURL(f.path)}">${esc(f.path)}</a> · ${f.size_bytes.toLocaleString()} bytes</li>`).join("")}</ul>${raw("Worker manifest",data.artifact?.manifest??null)}${raw("Complete worker chronological JSON",events)}${raw("Server record and capture metadata",{...data,worker_events:undefined})}</section>`;
   $("refresh-report").addEventListener("click",load);
+  const attribution=document.createElement("p");attribution.className="report-attribution";
+  attribution.textContent=`Created by ${personName(request.creator)}${run?` · Run started by ${personName(run.initiator)}${run.worker_id?` · Desktop ${run.worker_id}`:""}`:""}`;
+  $("report-content").querySelector(".report-hero > div").append(attribution);
   $("report-content").hidden=false;$("report-loading").hidden=true;
 }
 async function load(){
-  try{const data=await fetchJSON(`${base}/report`);if(data)render(data);}
-  catch(error){$("report-loading").hidden=false;$("report-loading").textContent=`Could not load this report: ${error.message}`;}
+  const generation=sessionGeneration;
+  try{
+    const session=await fetchJSON("/api/session");
+    if(generation!==sessionGeneration)return;
+    if(!session?.authenticated){requireLogin();return;}
+    $("report-person").textContent=personName(session.user);
+    const memberships=session.memberships||[],picker=$("report-workspace");
+    picker.innerHTML=memberships.map(item=>`<option value="${esc(item.workspace_id)}">${esc(item.name)}</option>`).join("");picker.value=session.workspace?.id||"";picker.hidden=memberships.length<=1;
+    $("report-workspace-name").textContent=memberships.length<=1?session.workspace?.name||"":"";
+    const data=await fetchJSON(`${base}/report`);if(data&&generation===sessionGeneration)render(data);
+  }
+  catch(error){if(generation!==sessionGeneration)return;hideRecord();$("report-loading").hidden=false;$("report-loading").textContent=`Could not load this report: ${error.message} You may need to select the workspace that owns it.`;}
 }
 void load();

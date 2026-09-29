@@ -1,6 +1,8 @@
 # [CTRL] Loop MVP
 
-The MVP has a typed-chat website, saved instructions and run history in PostgreSQL, a worker inside the existing Omarchy VM, and an embedded noVNC desktop viewer. OpenAI generates the saved instruction; the worker uses the existing Jev selection rounds and native Cua Driver to select observed windows and controls. Runs have a full-page report and an authenticated ZIP download of their available evidence.
+The application has a shared development website and PostgreSQL database, personal sign-ins, company workspaces, and a separate assigned Omarchy desktop for each member. Workflows and history are shared within a workspace; each run targets its initiator's own worker. OpenAI generates the saved instruction; the worker uses the existing Jev selection rounds and native Cua Driver to select observed windows and controls. Runs have a full-page report and an authenticated ZIP download of their available evidence.
+
+Use [developer onboarding](developer-onboarding.md) for personal access, worker updates and shared-site releases, and [environment configuration](environments.md) for development resource bindings and the disabled production promotion path. Those guides describe the current implementation and outstanding access prerequisites; deployment checkpoints below record what was actually verified.
 
 The live site is [CTRL Loop](https://d1t0sm9jhdinfi.cloudfront.net). The historical X-navigation demonstration **succeeded**: real OpenAI generation, PostgreSQL persistence, delivery to the existing VM, Jev selection, native Chrome input, and observation of the loaded X root page. The authenticated embedded viewer and ownership controls were also verified. [Acceptance evidence](#acceptance-evidence) records the successful run and the earlier errors; authenticated feed contents were not evaluated.
 
@@ -10,7 +12,7 @@ The live site is [CTRL Loop](https://d1t0sm9jhdinfi.cloudfront.net). The histori
 | --- | --- |
 | Website | [`web/`](../web/): static HTML, CSS, and JavaScript; no frontend build or external asset CDN |
 | Application API | [`src/webapp.py`](../src/webapp.py): FastAPI, authentication, instruction generation, delivery, events, and worker ownership |
-| Database | [`src/schema.sql`](../src/schema.sql): `sessions`, `workers`, `loops`, `runs`, and `events` |
+| Database | [`src/schema.sql`](../src/schema.sql): `users`, `workspaces`, `memberships`, `sessions`, `workers`, `loops`, `runs`, and `events` |
 | Worker service | [`src/cloud_worker.py`](../src/cloud_worker.py): outbound HTTPS polling, guest process lock, crash journal, heartbeats, and result delivery |
 | Bounded executor | [`src/worker.py`](../src/worker.py): validates the saved instruction and invokes existing window/control rounds with explicit capability limits |
 | Shared selection pipeline | Existing [`src/pipeline.py`](../src/pipeline.py), [`src/selection.py`](../src/selection.py), [`src/jev_questions.py`](../src/jev_questions.py), and [`src/reporting.py`](../src/reporting.py) |
@@ -27,9 +29,9 @@ The live run exposed a Linux Driver omission in named entry-field values. The [n
 
 ## Request and execution flow
 
-1. Sign in and choose **Create loop**. The server stores the exact user prompt and starts a real LLM request. The response initially has `status: generating`.
+1. Sign in with a personal username/password, select the company workspace, and choose **Create loop**. The server stores the exact user prompt and creator and starts a real LLM request. The response initially has `status: generating`.
 2. The server saves the returned instruction string, response ID, usage, model, and generation timestamp. Only then does the loop become `ready`. Failed or interrupted generation produces an error; it does not substitute an instruction.
-3. Choose **Run instruction**. The server requires a ready instruction, an online assigned worker, agent ownership, and no queued or running task for that worker. PostgreSQL also enforces one active run per worker.
+3. Choose **Run instruction**. The server records the initiator and requires a ready instruction, that member's online assigned worker, agent ownership, and no queued or running task for that worker. PostgreSQL also enforces one active run per worker. Missing assignments and deployment maintenance prevent execution while shared workflows remain available.
 4. The guest worker polls over HTTPS. The server dispatches the instruction read from PostgreSQL. The worker journals the run before acknowledging receipt and invoking the executor.
 5. The executor observes all visible native windows and their controls, and invokes the existing Jev rounds. The X-only, Chrome-only, English-toolbar, and address-field filters have been removed. Jev still chooses only the existing click or typing action; no planner, action scheme, or new Jev question has been introduced.
 6. Native Driver targets fresh snapshot identities. The web executor permits at most four iterations. It does not invent typing content or generate special navigation key sequences. If Jev chooses typing without prepared text, the run stops with `typing_content_unavailable`. The existing CLI can still receive explicit prepared text.
@@ -50,15 +52,15 @@ A guest restart recovers the available JSONL records and creates a partial ZIP, 
 
 ## Access and desktop ownership
 
-This is a **single-owner, single-workspace MVP**, not a multi-tenant account system. Anyone holding the workspace password can see its requests, runs, and assigned desktop. Keep that password private.
+Each person has a personal username/password and workspace membership. Members share requests, run history and reports inside their selected company workspace; their desktop and input control bind to their own assigned worker. Owners manage membership and provide single-use activation codes manually. See [personal website access](developer-onboarding.md#personal-website-access) for activation and migration details.
 
-The deployment creates a random `APP_PASSWORD` in AWS Secrets Manager's `ctrlloop/mvp/app` secret. The private, ignored **`.local/mvp/access.md`** contains the site URL and workspace password for the operator. The ignored **`.local/mvp/deployment-secrets.json`** also contains deployment credentials; do not paste it into chat, logs, source, or an upload bundle. Non-secret deployment URL and resource identifiers are in `.local/mvp/aws.json`.
+The initial single-owner deployment used `APP_PASSWORD` and private operator files under `.local/mvp/`. That password now serves only the explicit legacy development migration into the owner's personal identity; it is not a shared runtime login fallback. Current deployment state lives under ignored `.local/environments/{environment}/`; historical evidence remains in `.local/mvp/`. Credential and activation files remain private. See [environment state and bootstrap configuration](environments.md#configuration-and-local-state).
 
 Login creates a hashed server-side session and a 12-hour `Secure`, `HttpOnly`, `SameSite=Strict` cookie. Mutating browser requests require the configured origin. Provider keys remain server-side. The guest worker receives its delivery token and Jev key; it does not receive the OpenAI or Fleet credentials.
 
-The embedded viewer connects to `/api/desktop` on the application's own origin. The backend authenticates its cookie and origin, obtains the Fleet token server-side, and connects only to the configured namespace and sandbox. The browser does not need a Cua account or receive a broad provider bearer token.
+The embedded viewer connects to `/api/desktop` on the application's own origin. The backend authenticates its cookie, origin and active membership, obtains the Fleet token server-side, and connects only to the signed-in member's assigned namespace and sandbox. The browser does not need a Cua account or receive a broad provider bearer token.
 
-The viewer starts in **View only**. **Take control** is available only when no run is queued or running. Human control belongs to the exact signed-in browser session; another signed-in session remains view-only. **Return to agent** releases ownership before a run can start. JavaScript uses `worker.can_control`, and the WebSocket gateway independently checks session ownership and active-run state before forwarding keyboard, pointer, or clipboard input. This restriction does not rely on the noVNC `viewOnly` flag alone.
+The viewer starts in **View only**. **Take control** is available only when no run is queued or running and the worker is not in maintenance. Human control belongs to the exact signed-in browser session; another session of that account remains view-only. **Return to agent** releases ownership before a run can start. JavaScript uses `worker.can_control`, and the WebSocket gateway independently checks membership, assignment, session ownership and active-run state before forwarding keyboard, pointer, or clipboard input. This restriction does not rely on the noVNC `viewOnly` flag alone.
 
 Signing out releases that session's human ownership. Expired ownership is cleared when session state or ownership is next requested. Closing a browser tab does not automatically return ownership immediately; reopen the website with the same session and return control, or wait for session expiry. External Fleet viewers and separate controller tools are outside this application's ownership coordination; keep them from sending input during worker execution.
 
@@ -108,14 +110,14 @@ Provide a private, Git-ignored `.env.web` with these application settings. `uvic
 | Setting | Value or source |
 | --- | --- |
 | `DATABASE_URL` | Dedicated PostgreSQL database and role; use TLS for remote database access |
-| `APP_PASSWORD` | Private workspace password |
-| `WORKER_TOKEN` | Dedicated token shared only with the assigned guest worker |
+| `APP_ENV` | Explicit `dev` or `prod`; local development uses `dev` |
 | `APP_ORIGIN` | Exact HTTPS browser origin, without a trailing slash |
 | `OPENAI_API_KEY` | Authorized server-side inference key |
 | `OPENAI_MODEL` | `gpt-6-luna` or omitted to use the pinned default |
 | `CUA_CLIENT_ID`, `CUA_CLIENT_SECRET` | Authorized Fleet service credentials, kept server-side |
-| `FLEET_NAMESPACE` | `ctrlloop-omarchy-20260927-1708` for the current desktop |
-| `FLEET_SANDBOX`, `WORKER_ID` | `ctrlloop-omarchy-20260927-1708-e33048ae` for the current desktop |
+| `REPORT_BUCKET` | Selected environment's private evidence bucket, with authorized server-side AWS access |
+
+Personal credentials, memberships and worker routing come from PostgreSQL. Legacy `APP_PASSWORD`, `WORKER_TOKEN` and Fleet target settings are used only by the explicit development bootstrap described in [environments.md](environments.md#first-development-upgrade); do not use them as an implicit local account setup or copy production state into development.
 
 Start the server behind a trusted local HTTPS reverse proxy whose origin matches `APP_ORIGIN`:
 
@@ -125,61 +127,27 @@ uv run --locked uvicorn src.webapp:app --env-file .env.web --host 127.0.0.1 --po
 
 Alternatively, supply a locally trusted certificate using uvicorn's `--ssl-keyfile` and `--ssl-certfile` options and set `APP_ORIGIN` to that HTTPS address. Keep keys under an ignored local directory. Secure cookies and same-origin enforcement remain enabled. A static HTTP server can preview the login assets but cannot provide an authenticated workspace.
 
-Startup applies the idempotent schema in `src/schema.sql` and registers the configured worker. This requires an existing database owned by the application role. `/healthz` performs a database query. A local website alone does not make the cloud worker reachable: end-to-end delivery requires the guest's `CTRLLOOP_API_URL` to point to a reachable HTTPS application origin.
+Startup applies the idempotent schema in `src/schema.sql` and performs an explicitly enabled legacy development migration when needed. This requires an existing database owned by the application role; member and worker provisioning use the [administrator setup](developer-onboarding.md#administrator-migration-and-assignment). `/healthz` performs a database query. A local website alone does not make the cloud worker reachable: end-to-end delivery requires the guest's `CTRLLOOP_API_URL` to point to a reachable HTTPS application origin.
 
 ## AWS deployment
 
-[`scripts/deploy_aws.py`](../scripts/deploy_aws.py) is an environment-specific deployment tool for the existing **`mangorts-dev`** account and **`us-west-1`** VPC. It checks the AWS account and contains explicit existing VPC, subnet, ALB, cluster, secret, and database identities. Review those constants before using it in another environment; this is not a generic infrastructure template.
+Use the [shared website release procedure](developer-onboarding.md#deploy-the-shared-website) and [environment configuration](environments.md). Every deployment explicitly selects `--environment dev` or `--environment prod`; contributor releases use `--release-only` against existing approved resources. Production remains disabled pending its separate configuration and review. The original single-owner commands without an environment selector are historical and have been superseded by those guides.
 
-It creates an isolated application service and database role while reusing the existing development ALB, ECS cluster, and Aurora PostgreSQL cluster. The app runs as one Fargate task with 0.25 vCPU and 1 GiB memory, without a public task IP. A new CloudFront distribution provides HTTPS, disables response caching, forwards session/WebSocket headers, and sends the origin header needed by the isolated ALB listener rule. No new domain is required.
+Development retains the existing `ctrlloop-mvp` service and database identities in `us-west-1`. The application uses one Fargate task, the existing development ALB/ECS/Aurora infrastructure, and a CloudFront HTTPS origin with caching disabled. Current resource state and private credentials live separately under `.local/environments/dev/`; historical checkpoints and evidence remain below and in `.local/mvp/`.
 
-Authenticate the permitted AWS SSO profile and create a separate deployment-tool environment. Runtime dependencies remain in the project lock; boto3 is also used by the application for private run-artifact storage.
+The build uploads an explicit code/dependency/frontend allowlist to private S3 and runs managed CodeBuild, without local Docker. Credentials, `.env*`, `.local`, `.git`, `.venv`, and reports are excluded. Build source expires after seven days; private report storage is separate. Locked dependencies run as a non-root container user, ECR tags are immutable, and deployment pins the selected image digest. A successful build or a returned deploy command is not proof of a healthy rollout; the linked procedure includes the required readback.
 
-```powershell
-aws sso login --profile mangorts-dev
-uv venv --python 3.12 .local/aws-deploy-venv
-uv pip install --python .local/aws-deploy-venv/Scripts/python.exe boto3==1.43.103
-.local/aws-deploy-venv/Scripts/python.exe scripts/deploy_aws.py prepare --profile mangorts-dev --fleet-env C:/Users/Jonat/ctrlloop/.env.fleet
-.local/aws-deploy-venv/Scripts/python.exe scripts/deploy_aws.py database --profile mangorts-dev
-.local/aws-deploy-venv/Scripts/python.exe scripts/deploy_aws.py build --profile mangorts-dev --revision YOUR-UNIQUE-REVISION
-.local/aws-deploy-venv/Scripts/python.exe scripts/deploy_aws.py status --profile mangorts-dev
-```
+Coordinate shared-site releases while instruction generation and desktop runs are idle. Old and new application processes can overlap during an ECS rollout, and startup marks unfinished generation as interrupted. CloudWatch application logs remain under `/ecs/ctrlloop-mvp` with 14-day retention. Infrastructure/bootstrap changes stay under administrator control; `status` is read-only and `database-ready` explicitly completes database initialization.
 
-On Linux, use `.local/aws-deploy-venv/bin/python` for that tool environment. `prepare` stores generated secrets separately from resource state. `database` launches a one-off initializer inside the VPC, using a temporary bootstrap role; `status` removes its extra secret-access policy once it observes a successful initializer exit. The web service uses only the dedicated database credentials.
+## Deploy a member's worker
 
-`build` sends an explicit code/dependency/frontend allowlist to a private encrypted S3 source bucket and starts managed CodeBuild. It does not require local Docker Desktop. Source objects expire after seven days. Credentials, `.env*`, `.local`, `.git`, `.venv`, and reports are excluded. The Docker image installs native build headers needed by locked Linux dependencies, performs `uv sync --locked --no-dev --no-install-project`, and runs the server as a non-root user. ECR tags are immutable, so use a new revision for each build. Deployment resolves that revision to an image digest and pins the ECS task to it.
+Use [Deploy only your worker](developer-onboarding.md#deploy-only-your-worker). The current command requires an explicit environment and member; the original single-owner `--claim` command and `.local/mvp/worker.json` deployment state are historical. Each member's target, claim and deployment state live under `.local/environments/{environment}/workers/{member}/`. Independent Fleet credential access still has the [documented authority and namespace-restriction limitation](developer-onboarding.md#fleet-credential-handoff).
 
-Wait until `status` reports database initialization success and a successful build before deploying:
+[`scripts/deploy_worker.py`](../scripts/deploy_worker.py) verifies the saved assignment against the exact bound sandbox and server worker identity. It preserves that VM and disk. Normal updates reuse the VM's dedicated credentials; administrator-only initial configuration transfers the worker/Jev credentials separately into a mode-0600 `worker.env`. Deployment takes the guest lock, enters maintenance for that worker, refuses active/unsettled runs or human control, and resumes only after successful startup. A failed deployment remains in maintenance for inspection. `--stage-only` prepares code and dependencies without transferring credentials or starting a worker.
 
-```powershell
-.local/aws-deploy-venv/Scripts/python.exe scripts/deploy_aws.py deploy --profile mangorts-dev
-.local/aws-deploy-venv/Scripts/python.exe scripts/deploy_aws.py status --profile mangorts-dev
-```
+The content-derived release lives at `/home/omarchy/ctrlloop-dev/releases/<revision>/` with a fresh locked Python 3.12 environment. The user service **`ctrlloop-worker.service`** runs `python -m src.cloud_worker` independently of the laptop/browser. Its native endpoint is **`http://127.0.0.1:3000/mcp`** in the Omarchy graphical session. Worker state lives at `/home/omarchy/.local/state/ctrlloop-worker/`, and detailed reports at `/home/omarchy/ctrlloop-dev/reports/`; the per-member deployment record identifies its installation logs.
 
-The deploy command starts an ECS rollout; its return is not proof of a healthy site. Check target health, running task count, CloudFront deployment state, HTTPS `/healthz`, and the login page. The deploy helper records its current image/revision and resource identifiers in `.local/mvp/aws.json`. Application logs are in CloudWatch `/ecs/ctrlloop-mvp` with 14-day retention. CodeBuild status includes its own log URL.
-
-Deploy while instruction generation and desktop runs are idle. The configured ECS rolling deployment uses `minimumHealthyPercent=100` and `maximumPercent=200`, so the old and new app processes can overlap temporarily. New-process startup marks unfinished generation as interrupted; this mechanism does not support an uninterrupted rollout during active generation.
-
-## Deploy the worker to the existing VM
-
-[`scripts/deploy_worker.py`](../scripts/deploy_worker.py) deliberately checks the existing claim, namespace, and bound sandbox. It preserves the VM and its disk and does not provision, release, suspend, or recreate a desktop. It expects the local AWS state and deployment-secret files created above.
-
-```powershell
-uv run --locked python scripts/deploy_worker.py --fleet-env C:/Users/Jonat/ctrlloop/.env.fleet --jev-env C:/Users/Jonat/ctrlloop/.env --claim C:/Users/Jonat/ctrlloop/.local/omarchy-fleet/claim.json
-uv run --locked python scripts/deploy_worker.py --fleet-env C:/Users/Jonat/ctrlloop/.env.fleet --jev-env C:/Users/Jonat/ctrlloop/.env --claim C:/Users/Jonat/ctrlloop/.local/omarchy-fleet/claim.json --status
-```
-
-The script creates a content-derived revision directory at `/home/omarchy/ctrlloop-dev/releases/<revision>/`, uploads only the source and locked dependency manifest, and installs a fresh Linux environment with `uv sync --locked --no-dev --python 3.12`. Credentials travel separately into `/home/omarchy/ctrlloop-dev/worker.env`, restricted to mode `0600`.
-
-To prepare only code and dependencies, add **`--stage-only`** to the deployment invocation. This mode uses Fleet access to upload the allowlisted bundle but does not read or transfer the worker token/Jev key, modify the worker service, or start execution. Its asynchronous installation writes `stage.log` and `stage.status`; complete the normal deployment later to configure and start the worker.
-
-The managed user service is **`ctrlloop-worker.service`**, running `python -m src.cloud_worker` independently of the laptop and browser connection. Its environment binds to the existing Omarchy graphical session: `/run/user/1000`, `wayland-1`, `:0`, and the user's D-Bus socket. Native commands use **`http://127.0.0.1:3000/mcp`** inside the VM. The installed local service currently needs no additional loopback token; the adapter can accept `CUA_LOCAL_MCP_TOKEN` if that deployment changes.
-
-The worker records local state at `/home/omarchy/.local/state/ctrlloop-worker/`, detailed run reports at `/home/omarchy/ctrlloop-dev/reports/`, and installation output in the revision's `setup.log`/`setup.status`. Local deployment metadata is saved to `.local/mvp/worker.json`. The `--status` command reads the guest service status and recent journal output. Installation may still be running after the upload command returns; inspect its recorded status.
-
-The VM's existing viewer repair must remain intact: websockify on service port 5900 forwards to WayVNC on loopback port 5902, with WayVNC using `--seat=Hyprland`. The website embeds its own client and proxies this existing stream; it does not replace the compositor or viewer bridge.
-
-The same VM's effective expiry was extended to **September 30, 2026, 2:19:52 PM PDT / `2026-09-30T21:19:52Z`**. See the [lifetime readback and provider contract](vm-lifetime-20260927.md). Deployment and heartbeats do not extend that deadline. Expiry can delete the guest; its reports, Chrome state, and repair backup are not a durable cloud backup.
+The existing viewer repair remains part of each prepared desktop: websockify port 5900 forwards to WayVNC loopback port 5902 with `--seat=Hyprland`. The website proxies that stream; worker updates do not replace the compositor or viewer bridge. The original owner's guest expiry checkpoint is recorded in the [lifetime readback](vm-lifetime-20260927.md); Kevin's separate pool deadline is in [onboarding](developer-onboarding.md#administrator-migration-and-assignment). Deployment and heartbeats do not extend either deadline. Guest-only reports, browser state and repair backups are not durable cloud backups.
 
 ## Failure handling and current limits
 
@@ -187,7 +155,7 @@ The same VM's effective expiry was extended to **September 30, 2026, 2:19:52 PM 
 - Jev receives compact native candidates and the saved instruction. Existing authored window/control/action/settling questions, batching, model pins, and request budgets remain unchanged. Native raw observations are retained locally in the report; they are not all sent to Jev.
 - Fresh snapshot targeting, worker authentication, assigned-desktop authorization, and single-controller ownership remain enforced. Native input is **not automatically replayed** after uncertain delivery or exceptions. Recovery retries only evidence and recorded result delivery. Inspect the desktop before starting a new run after interruption.
 - The worker remains bounded to four iterations with existing transport/request limits. Archives are limited to 100 MiB for upload. Evidence that cannot upload remains local and the result explicitly reports the upload problem; local storage and guest lifetime remain finite.
-- The guest service uses a per-user lock across revisions. The server accepts one queued/running task for its assigned worker. This remains a single-workspace scheduler with one application replica.
+- The guest service uses a per-user lock across revisions. The server accepts one queued/running task per assigned worker; different members can run on their separate desktops concurrently. The application still uses one replica.
 - Generation runs in the web process. A server restart marks incomplete generation as an error; create a new loop to retry. Failure reports preserve the available request, response, and error events and identify missing capture.
 - The viewer proxy and its recovery/ownership behavior remain independent of execution. Fit and fullscreen are display controls; guest-resolution changes are not requested.
 - New run archives are uploaded to private durable storage. Earlier runs that lack worker uploads expose the available server record and identify their missing native/Jev/screenshot evidence. Existing Hermes compatibility remains a separate launch path.
@@ -199,13 +167,17 @@ The website and worker share one application API and the existing PostgreSQL rec
 | Method / path | Purpose |
 | --- | --- |
 | `GET /healthz` | Database-backed service health |
-| `POST /api/login`, `POST /api/logout`, `GET /api/session` | Workspace session and assigned-worker state |
+| `POST /api/login`, `POST /api/logout`, `GET /api/session` | Personal session, workspace membership and assigned-worker state |
+| `POST /api/activate/inspect`, `POST /api/activate` | Review a single-use activation code and set a personal password |
+| `POST /api/session/workspace` | Select an active company membership |
+| `GET /api/memberships`, `POST /api/memberships`, `PATCH /api/memberships/{user_id}` | Owner-only member listing, addition and access changes |
 | `GET /api/loops`, `POST /api/loops` | List saved loops or begin real instruction generation |
 | `GET /api/loops/{id}` | Instruction, generation events, runs, and run events |
 | `POST /api/loops/{id}/runs` | Queue the persisted instruction |
 | `POST /api/worker/mode` | Cookie-authenticated, origin-checked human/agent ownership transition |
 | `WS /api/desktop` | Cookie-authenticated viewer and ownership-filtered input |
 | `POST /api/worker/poll`, `/heartbeat`, `/recover` | Bearer-authenticated assigned worker delivery, liveness, and interrupted-run recovery |
+| `POST /api/worker/deployment` | Bearer-authenticated maintenance transition for the exact worker/environment |
 | `POST /api/worker/runs/{id}/events`, `/finish` | Bearer-authenticated progress and recorded outcome for the assigned worker's run |
 | `POST /api/worker/runs/{id}/artifacts` | Bearer-authenticated, idempotent worker ZIP upload; usable after terminal result for recovery |
 | `GET /api/runs/{id}/report`, `/download` | Authenticated combined run record and downloadable evidence ZIP |

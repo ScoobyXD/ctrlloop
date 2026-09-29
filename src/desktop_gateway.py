@@ -5,6 +5,7 @@ from itertools import groupby
 import json
 import logging
 import os
+import re
 import time
 from uuid import uuid4
 
@@ -118,9 +119,10 @@ class RFBInputFilter:
 fleet_token = FleetToken()
 
 
-async def proxy_desktop(websocket, can_input, session_valid):
-    namespace = os.environ['FLEET_NAMESPACE']
-    sandbox = os.environ['FLEET_SANDBOX']
+async def proxy_desktop(websocket, can_input, session_valid, *, namespace, sandbox):
+    # Targets come only from the authenticated member's database assignment.
+    if not all(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,199}', value) for value in (namespace, sandbox)):
+        raise ValueError('Invalid assigned Fleet desktop')
     upstream = f'wss://run.cua.ai/api/svc/{namespace}/{sandbox}-vnc/websockify'
     connection_id, started = uuid4().hex[:12], time.monotonic()
     parser, remote, first_task = RFBInputFilter(), None, 'connect'
@@ -217,7 +219,9 @@ async def proxy_desktop(websocket, can_input, session_valid):
         raise
     except Exception as error:
         details['error_type'] = type(error).__name__
-        if isinstance(error, ValueError) and first_task == 'browser_input':
+        if isinstance(error, PermissionError):
+            cause, close_code, close_reason = 'access_revoked', 1008, 'Desktop access changed; sign in again'
+        elif isinstance(error, ValueError) and first_task == 'browser_input':
             cause, close_code, close_reason = 'rfb_protocol_error', 1008, 'Unsupported desktop protocol message'
             details.update(parser_phase=parser.phase, message_type=parser.message_type,
                            buffered_bytes=len(parser.pending))

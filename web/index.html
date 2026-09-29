@@ -18,33 +18,59 @@
         <h1>A thought.<br>A little action.</h1>
         <p class="login-description">Turn a request into a saved instruction. Follow every step on your cloud desktop.</p>
         <form id="login-form">
-          <label for="password">Workspace password</label>
+          <label for="username">Username</label>
+          <input id="username" name="username" autocomplete="username" required minlength="2" maxlength="64" placeholder="Your username">
+          <label for="password">Password</label>
           <input id="password" name="password" type="password" autocomplete="current-password" required placeholder="Enter your password">
           <p id="login-error" class="form-error" role="alert" hidden></p>
           <button class="button primary login-submit" id="login-submit" type="submit"><span>Open workspace</span><span aria-hidden="true">↗</span></button>
         </form>
-        <p class="login-note"><span class="tiny-lock" aria-hidden="true">⌑</span> Private workspace · Authorized desktop access</p>
+        <form id="activation-form" hidden>
+          <h2>Activate your account</h2>
+          <p class="login-description">Use the activation code provided by your workspace owner, then choose your own password.</p>
+          <label for="activation-token">Activation code</label>
+          <input id="activation-token" name="token" type="password" autocomplete="off" required spellcheck="false">
+          <button id="inspect-activation" type="button" class="button secondary small">Review account</button>
+          <p id="activation-account" class="activation-account" hidden></p>
+          <label for="activation-password">New password</label>
+          <input id="activation-password" type="password" autocomplete="new-password" required minlength="12" maxlength="500" placeholder="At least 12 characters">
+          <label for="activation-confirm">Confirm password</label>
+          <input id="activation-confirm" type="password" autocomplete="new-password" required minlength="12" maxlength="500">
+          <p id="activation-error" class="form-error" role="alert" hidden></p>
+          <button class="button primary login-submit" id="activation-submit" type="submit" disabled>Activate account ↗</button>
+        </form>
+        <button id="toggle-activation" class="button quiet auth-toggle" type="button">Have an activation code?</button>
+        <p class="login-note"><span class="tiny-lock" aria-hidden="true">⌑</span> Your identity · Your desktop · Shared workflows</p>
       </main>
     </div>
 
     <div id="app" class="app" hidden>
       <header class="app-header">
         <a class="brand" href="/" aria-label="CTRL Loop home"><span class="brand-mark">[CTRL]</span><span>Loop<span class="brand-dot">.</span></span></a>
-        <div class="header-divider"></div><span class="workspace-label">WORKSPACE <span class="preview-pill">MVP</span></span>
-        <div class="header-end"><span id="connection-state" class="connection-state"><i class="status-dot"></i>Connecting</span><button id="logout" class="button quiet small">Sign out</button></div>
+        <div class="header-divider"></div><div class="workspace-context"><label for="workspace-picker">WORKSPACE</label><strong id="workspace-name">Loading…</strong><select id="workspace-picker" hidden aria-label="Current workspace"></select></div>
+        <div class="header-end"><div class="signed-in-person"><strong id="user-name">Signed in</strong><span id="user-role"></span></div><span id="connection-state" class="connection-state"><i class="status-dot"></i>Connecting</span><button id="logout" class="button quiet small">Sign out</button></div>
       </header>
 
       <div class="app-layout">
         <aside class="sidebar" aria-label="Saved loops">
           <button id="new-loop" class="new-loop"><span aria-hidden="true">＋</span> New loop <span class="shortcut">N</span></button>
-          <div class="sidebar-section-label"><h2>YOUR LOOPS</h2><span id="loop-count">0</span></div>
+          <div class="sidebar-section-label"><h2>SHARED WORKFLOWS</h2><span id="loop-count">0</span></div>
           <div id="loop-list" class="loop-list"><p class="list-empty">Loading saved loops…</p></div>
           <footer class="sidebar-footer"><span class="footer-symbol" aria-hidden="true">↳</span><div><strong>Small actions. Real progress.</strong><p>One instruction at a time.</p></div></footer>
         </aside>
 
         <main class="workspace">
           <div id="page-notice" class="notice" role="status" hidden><span id="page-notice-text"></span><button id="dismiss-notice" aria-label="Dismiss notification">×</button></div>
-          <div class="workspace-heading"><div><div class="eyebrow">FROM INTENT TO ACTION</div><h1>Your control room<span>.</span></h1><p>Give your desktop a direction. Watch it happen.</p></div><div class="workspace-coordinate" aria-hidden="true"><span>◌</span> HUMAN + AGENT</div></div>
+          <div class="workspace-heading"><div><div class="eyebrow">FROM INTENT TO ACTION</div><h1>Your control room<span>.</span></h1><p>Share workflows with your workspace. Run them on your own desktop.</p></div><div class="workspace-coordinate" aria-hidden="true"><span>◌</span> HUMAN + AGENT</div></div>
+          <details id="member-management" class="panel members-panel" hidden>
+            <summary>Workspace members <span id="member-count"></span></summary>
+            <div class="members-content"><p class="members-note">Create a personal account for a teammate. Give them the activation code privately; they choose their own password. Desktop assignment is managed separately.</p>
+              <div id="member-list" aria-live="polite"></div>
+              <form id="member-form" class="member-form"><div><label for="member-username">Username</label><input id="member-username" name="username" required minlength="2" maxlength="64" autocomplete="off" spellcheck="false"></div><div><label for="member-display-name">Display name</label><input id="member-display-name" name="display_name" required maxlength="100" autocomplete="off"></div><button id="create-member" class="button secondary" type="submit">Add member</button></form>
+              <p id="member-error" class="form-error" role="alert" hidden></p>
+              <div id="activation-receipt" class="activation-receipt" hidden><strong id="activation-receipt-title">Account created</strong><p>Share this code privately with the named teammate. It is shown only once.</p><label for="member-activation-code">Activation code</label><div class="activation-code-row"><input id="member-activation-code" readonly autocomplete="off" spellcheck="false"><button id="copy-activation" type="button" class="button secondary small">Copy code</button></div><p id="activation-expiry"></p><button id="dismiss-activation" type="button" class="button quiet small">I have saved the code</button></div>
+            </div>
+          </details>
 
           <div class="work-grid">
             <section class="loop-column" aria-label="Loop instructions and activity">
@@ -59,14 +85,14 @@
               </section>
 
               <section id="loop-detail" class="panel detail-panel" aria-label="Selected loop">
-                <div class="empty-detail"><div class="empty-symbol" aria-hidden="true">↳</div><h2>Start your first loop</h2><p>Your generated instruction and its activity will appear here. The desktop is ready to watch on the right.</p><div class="empty-flow"><span>Request</span><i>→</i><span>Instruction</span><i>→</i><span>Action</span></div></div>
+                <div class="empty-detail"><div class="empty-symbol" aria-hidden="true">↳</div><h2>Start a shared workflow</h2><p>Saved instructions and run history are shared with your workspace. Each person runs them on their own assigned desktop.</p><div class="empty-flow"><span>Request</span><i>→</i><span>Instruction</span><i>→</i><span>Action</span></div></div>
               </section>
             </section>
 
             <section class="desktop-column" aria-label="Cloud desktop">
               <section id="desktop-panel" class="panel desktop-panel">
                 <div class="panel-heading desktop-heading"><h2><span class="section-number">02</span> Live desktop</h2><span id="viewer-state" class="viewer-status"><i class="status-dot"></i>Disconnected</span></div>
-                <div class="desktop-toolbar"><div class="desktop-identity"><span class="desktop-icon" aria-hidden="true">▣</span><div><strong>Omarchy workspace</strong><span id="worker-identity">Waiting for assigned worker</span></div></div><div class="viewer-tools"><button id="fit-view" class="icon-button active" title="Fit desktop to viewer" aria-label="Fit desktop to viewer" aria-pressed="true">Fit</button><button id="fullscreen" class="icon-button" title="Enter fullscreen" aria-label="Enter fullscreen"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button></div></div>
+                <div class="desktop-toolbar"><div class="desktop-identity"><span class="desktop-icon" aria-hidden="true">▣</span><div><strong id="desktop-owner">Your Omarchy desktop</strong><span id="worker-identity">Waiting for assigned worker</span></div></div><div class="viewer-tools"><button id="fit-view" class="icon-button active" title="Fit desktop to viewer" aria-label="Fit desktop to viewer" aria-pressed="true">Fit</button><button id="fullscreen" class="icon-button" title="Enter fullscreen" aria-label="Enter fullscreen"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button></div></div>
                 <div class="desktop-display">
                   <div id="desktop-canvas" class="desktop-canvas" aria-label="Remote desktop screen"></div>
                   <div id="viewer-placeholder" class="viewer-placeholder"><div class="monitor-symbol" aria-hidden="true"><span>↳</span></div><h3 id="viewer-placeholder-title">Connecting to your desktop</h3><p id="viewer-placeholder-message">A live view of the assigned workspace will appear here.</p><button id="reconnect-viewer" class="button secondary small" hidden>Reconnect viewer</button></div>

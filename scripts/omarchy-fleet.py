@@ -1,8 +1,8 @@
 # /// script
 # requires-python = ">=3.11,<3.14"
-# dependencies = ["cua-sandbox==0.7.0", "cua-fleet==0.1.17"]
+# dependencies = ["cua-sandbox==0.7.0", "cua-fleet==0.1.17", "python-dotenv==1.2.2"]
 # ///
-"""One disposable Omarchy Fleet trial; see docs/omarchy-fleet-trial.md."""
+"""One explicitly recorded Omarchy Fleet desktop per state directory."""
 
 import argparse
 import asyncio
@@ -16,6 +16,8 @@ import sys
 import uuid
 
 from cua_sandbox import Image, Pool, Sandbox, WarmPoolAutoscaling
+from cua_sandbox.transport.cyclops_http_client import CyclopsHttpClient
+from dotenv import load_dotenv
 from fleet_sdk import (
     CyclopsClient, CyclopsConfiguration, CyclopsCredentials,
     CyclopsTokenProviderConfiguration, SdkError,
@@ -27,25 +29,22 @@ IMAGE = (
     "public.ecr.aws/k5j5w0x5/cua-omarchy-workspace"
     "@sha256:dc448dcc986f443980dfb3586f1b91d8699091ad96a74b369016535f0dbb0342"
 )
-TTL = 6 * 60 * 60
-
-
 def fleet_client():
     config = dict(
         base_url="https://run.cua.ai", pool_poll_interval_ms=2000,
         pool_poll_limit=300, claim_poll_interval_ms=2000, claim_poll_limit=300,
     )
     if token := os.environ.get("FLEETS_TOKEN", "").strip():
-        return CyclopsClient.connect_with_access_token_and_native_http_client(
-            CyclopsTokenProviderConfiguration(**config), token,
+        return CyclopsClient.connect_with_access_token(
+            CyclopsTokenProviderConfiguration(**config), token, CyclopsHttpClient(),
         )
     if not (os.environ.get("CUA_CLIENT_ID") and os.environ.get("CUA_CLIENT_SECRET")):
         raise RuntimeError("Set CUA_CLIENT_ID and CUA_CLIENT_SECRET locally, or FLEETS_TOKEN.")
-    return CyclopsClient.connect_with_native_http_client(CyclopsConfiguration(
+    return CyclopsClient.connect(CyclopsConfiguration(
         **config,
         token_url="https://auth.cua.ai/realms/cyclops-cs/protocol/openid-connect/token",
         credentials=CyclopsCredentials(os.environ["CUA_CLIENT_ID"], os.environ["CUA_CLIENT_SECRET"]),
-    ))
+    ), CyclopsHttpClient())
 
 
 def save(name, value):
@@ -65,28 +64,33 @@ def resource_json(value):
     return json.dumps(value, indent=2, default=encode)
 
 
-async def provision(client, name):
+async def provision(client, name, *, claim_name="omarchy-trial", ttl_hours=6):
     if not name or not re.fullmatch(r"ctrlloop-omarchy-[a-z0-9-]{1,45}", name):
         raise ValueError("Use --pool ctrlloop-omarchy-<unique-lowercase-suffix>.")
     if (STATE / "pool.txt").exists():
-        raise RuntimeError("A trial is already recorded. Use status/verify; inspect it before creating another.")
+        raise RuntimeError("A desktop is already recorded here. Use status/verify; never overwrite its identity.")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,48}", claim_name):
+        raise ValueError("Claim name must be a lowercase DNS label.")
+    if not 1 <= ttl_hours <= 72:
+        raise ValueError("Choose a finite lifetime of 1–72 hours.")
+    ttl = ttl_hours * 3600
     if any(ns.name == name for ns in await client.list_namespaces()):
         raise RuntimeError("That namespace already exists; this script only creates a new dedicated trial.")
     STATE.mkdir(parents=True, exist_ok=True)
     # Record intent before the first write, including if a remote response is interrupted.
     with (STATE / "pool.txt").open("x", encoding="utf-8") as stream:
         stream.write(name + "\n")
-    print(f"Creating one 4 vCPU / 6144 MiB worker in {name}; six-hour pool TTL.", flush=True)
+    print(f"Creating one 4 vCPU / 6144 MiB worker in {name}; {ttl_hours}-hour pool and claim TTL.", flush=True)
     pool = await Pool.apply(
         Image.from_registry(IMAGE, os_type="linux", kind="vm"),
         name=name, replicas=1, cpu=4, memory_mb=6144,
         services={"server": 8000, "mcp": 3000, "vnc": 5900},
         autoscaling=WarmPoolAutoscaling(min_pool_size=1, initial_pool_size=1, max_pool_size=1),
-        ttl_seconds_after_created=TTL,
+        ttl_seconds_after_created=ttl,
     )
     save("pool.json", pool.resource)
     print(f"Pool created at {pool.resource.metadata.creation_timestamp}", flush=True)
-    claim = await pool.create_claim(name="omarchy-trial", ttl_seconds_after_created=TTL)
+    claim = await pool.create_claim(name=claim_name, ttl_seconds_after_created=ttl)
     save("claim.json", claim.to_dict())
     print(f"Claim {claim.name} recorded; waiting for the desktop service...", flush=True)
     sandbox = await claim.wait(time_to_start=1800)
@@ -128,12 +132,17 @@ async def verify(sandbox):
 
 
 async def main(args):
+    global STATE
+    if args.fleet_env:
+        load_dotenv(args.fleet_env, interpolate=False)
+    if args.state_dir:
+        STATE = args.state_dir.expanduser().resolve()
     client = fleet_client()
     if args.command == "access":
         print(f"Fleet access verified: {len(await client.list_namespaces())} namespace(s).")
         return
     if args.command == "create":
-        await provision(client, args.pool)
+        await provision(client, args.pool, claim_name=args.claim_name, ttl_hours=args.ttl_hours)
         return
     name = (STATE / "pool.txt").read_text(encoding="utf-8").strip()
     if args.command == "cleanup":
@@ -241,6 +250,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("access", "create", "status", "verify", "viewer", "cleanup"))
     parser.add_argument("--pool", help="New pool name for create; exact recorded name for cleanup")
+    parser.add_argument("--fleet-env", type=Path, help="Local Fleet credentials file; never copied into a desktop")
+    parser.add_argument("--state-dir", type=Path, help="Dedicated identity/evidence directory; existing identity is never replaced")
+    parser.add_argument("--claim-name", default="omarchy-trial", help="Name for a newly created claim only")
+    parser.add_argument("--ttl-hours", type=int, default=6, help="New pool/claim lifetime, 1–72 hours; never renews existing resources")
     try:
         asyncio.run(main(parser.parse_args()))
     except Exception as error:
