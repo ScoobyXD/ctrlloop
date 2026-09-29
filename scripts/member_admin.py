@@ -59,7 +59,7 @@ async def migrate(db, config, args):
                 tables.append(table)
         if tables:
             await db.execute('LOCK TABLE '+','.join(tables)+' IN ACCESS EXCLUSIVE MODE')
-        if 'runs' in tables and (await (await db.execute("SELECT 1 FROM runs WHERE status IN ('queued','running') LIMIT 1")).fetchone()):
+        if 'runs' in tables and (await (await db.execute("SELECT 1 FROM runs WHERE status IN ('queued','running','paused') LIMIT 1")).fetchone()):
             raise AdministrationError('Finish queued/running runs before the company cutover')
         if 'loops' in tables and (await (await db.execute("SELECT 1 FROM loops WHERE status='generating' LIMIT 1")).fetchone()):
             raise AdministrationError('Finish instruction generation before the company cutover')

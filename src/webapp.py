@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import io
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import secrets
@@ -27,6 +28,7 @@ from .desktop_gateway import proxy_desktop
 from .identity import token_hash, hash_password, check_password, normalize_email
 from .company_migration import migrate_company_schema
 from .account_mail import send_account_mail, delivery_mode
+from .actions import normalize_action
 from .run_artifacts import (MAX_ARCHIVE_BYTES, inspect_archive, store_archive,
                             load_archive, worker_record, evidence_bundle)
 
@@ -271,24 +273,39 @@ def public_run(run):
             if key not in ('request_session_hash', 'dispatch_before', 'loop_status')}
 
 
-async def queue_run(db, loop, principal):
+async def queue_run(db, loop, principal, *, mode='sequence', request_id=None):
     # Both create-and-start and explicit reruns use the same reservation checks.
     if not principal['target_verified']:
         raise HTTPException(409, 'The selected user must verify their email before running a CtrlLoop')
     worker = await assigned_worker(db, principal)
+    if request_id:
+        previous = await (await db.execute('''SELECT * FROM runs WHERE company_id=%s
+            AND initiated_by=%s AND request_id=%s''',
+            (principal['company_id'], acting_user(principal), request_id))).fetchone()
+        if previous:
+            if previous['loop_id'] != loop['id']:
+                raise HTTPException(409, 'This execution request was already used for a different run')
+            return public_run(previous)
     await release_expired_control(db, worker['id'])
     await release_expired_queue(db, worker['id'])
     worker = await assigned_worker(db, principal)
     if worker['mode'] != 'agent': raise HTTPException(409, 'Return desktop control to the worker first')
     if not worker['last_seen'] or (datetime.now(timezone.utc)-worker['last_seen']).total_seconds()>30:
         raise HTTPException(409, 'Worker is offline')
-    active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running')", (worker['id'],))).fetchone()
+    active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running','paused')", (worker['id'],))).fetchone()
     if active or worker['active_run']: raise HTTPException(409, 'The desktop already has an active run')
-    run = await (await db.execute("""INSERT INTO runs(id,company_id,loop_id,worker_id,initiated_by,request_session_hash,dispatch_before)
-        VALUES(%s,%s,%s,%s,%s,%s,now()+interval '5 minutes') RETURNING *""",
-        (uuid4(),principal['company_id'],loop['id'],worker['id'],acting_user(principal),principal['session_hash']))).fetchone()
+    loop = await (await db.execute('SELECT * FROM loops WHERE id=%s AND company_id=%s FOR UPDATE',
+                                  (loop['id'], principal['company_id']))).fetchone()
+    if loop['steps'] is not None and not loop['steps']:
+        raise HTTPException(409, 'Add a step before running this workbench')
+    run = await (await db.execute("""INSERT INTO runs(id,company_id,loop_id,worker_id,initiated_by,
+        request_session_hash,dispatch_before,steps,run_mode,request_id)
+        VALUES(%s,%s,%s,%s,%s,%s,now()+interval '5 minutes',%s,%s,%s) RETURNING *""",
+        (uuid4(),principal['company_id'],loop['id'],worker['id'],acting_user(principal),principal['session_hash'],
+         Jsonb(loop['steps']) if loop['steps'] is not None else None, mode, request_id))).fetchone()
     run['initiator'] = {'id': acting_user(principal), 'email': principal['target_email'], 'display_name': principal['target_display_name']}
-    message = ('Desktop reserved; the instruction will run automatically when ready'
+    message = ('Manual sequence queued for its assigned Omarchy worker' if loop['steps'] is not None else
+               'Desktop reserved; the instruction will run automatically when ready'
                if loop['status'] == 'generating' else 'Saved instruction queued for its assigned Omarchy worker')
     await event(db, loop['id'], 'delivery_queued', message, run_id=run['id'],
                 data={'actor_user_id': str(principal['user_id'])})
@@ -379,9 +396,51 @@ class WorkerDeployment(BaseModel):
     revision: str | None = Field(default=None, max_length=200)
 
 
+class AuthoredStep(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    id: UUID
+    action: dict
+    instruction: str | None = Field(default=None, max_length=2000)
+
+
+def authored_steps(steps):
+    """Only the existing native action representation crosses the worker boundary."""
+    result = []
+    seen = set()
+    for step in steps:
+        if step.id in seen: raise HTTPException(422, 'Every step must have a distinct identity')
+        seen.add(step.id)
+        try: action = normalize_action(step.action)
+        except ValueError as error: raise HTTPException(422, str(error)) from error
+        row = {'id': str(step.id), 'action': action}
+        if step.instruction: row['instruction'] = step.instruction.strip()
+        result.append(row)
+    return result
+
+
 class Prompt(BaseModel):
     prompt: str = Field(min_length=1, max_length=2000)
     start: bool = False
+    steps: list[AuthoredStep] | None = Field(default=None, max_length=100)
+
+
+class LoopUpdate(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    prompt: str = Field(min_length=1, max_length=2000)
+    steps: list[AuthoredStep] = Field(max_length=100)
+    version: int = Field(ge=0)
+
+
+class RunRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    mode: Literal['step', 'sequence'] = 'sequence'
+    request_id: UUID | None = None
+
+
+class RunControl(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    command: Literal['step', 'run', 'pause', 'stop']
+    version: int = Field(ge=0)
 
 
 class Mode(BaseModel):
@@ -390,6 +449,9 @@ class Mode(BaseModel):
 
 class WorkerPoll(BaseModel):
     revision: str = Field(max_length=200)
+    capabilities: list[str] = Field(default_factory=list, max_length=20)
+    run_id: UUID | None = None
+    expected_step: int | None = Field(default=None, ge=0)
 
 
 class WorkerEvent(BaseModel):
@@ -676,9 +738,9 @@ async def update_company_user(user_id: UUID, body: UserUpdate, request: Request)
             other = await (await db.execute("SELECT 1 FROM users WHERE company_id=%s AND id<>%s AND role='company_admin' AND disabled_at IS NULL AND email_verified_at IS NOT NULL LIMIT 1",
                 (identity['company_id'],user_id))).fetchone()
             if not other: raise HTTPException(409, 'Keep at least one verified, active company admin')
-        active = await (await db.execute("SELECT 1 FROM runs WHERE company_id=%s AND initiated_by=%s AND status IN ('queued','running') LIMIT 1",
+        active = await (await db.execute("SELECT 1 FROM runs WHERE company_id=%s AND initiated_by=%s AND status IN ('queued','running','paused') LIMIT 1",
             (identity['company_id'],user_id))).fetchone()
-        if not body.active and active: raise HTTPException(409, 'Wait for this user’s queued or running work to finish before disabling access')
+        if not body.active and active: raise HTTPException(409, 'Stop this user’s queued, running, or paused work before disabling access')
         await db.execute('UPDATE users SET role=%s,disabled_at=' + ('NULL' if body.active else 'now()') + ' WHERE id=%s AND company_id=%s',
             (role,user_id,identity['company_id']))
         if not body.active:
@@ -705,7 +767,7 @@ async def change_mode(body: Mode, request: Request):
         await release_expired_queue(db, worker['id'])
         worker = await assigned_worker(db, identity)
         if worker['mode'] == 'maintenance': raise HTTPException(409, 'Desktop deployment is in progress')
-        active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running')", (worker['id'],))).fetchone()
+        active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running','paused')", (worker['id'],))).fetchone()
         if active: raise HTTPException(409, 'Wait for the active run to finish before changing control')
         if worker['mode'] == 'human' and worker['human_session'] != digest: raise HTTPException(409, 'Another signed-in session owns the desktop')
         await db.execute('UPDATE workers SET mode=%s,human_session=%s WHERE id=%s', (body.mode, digest if body.mode=='human' else None, worker['id']))
@@ -725,9 +787,19 @@ async def list_loops(request: Request):
 async def create_loop(body: Prompt, request: Request):
     prompt = body.prompt.strip()
     if not prompt: raise HTTPException(400, 'Enter a request')
+    steps = authored_steps(body.steps) if body.steps is not None else None
     identity = uuid4()
     async with database() as db:
         principal = await authorize(request, db)
+        if steps is not None:
+            row = await (await db.execute('''INSERT INTO loops(id,prompt,instruction,model,company_id,
+                created_by,status,steps,generated_at) VALUES(%s,%s,%s,'manual',%s,%s,'ready',%s,now()) RETURNING *''',
+                (identity,prompt,prompt,principal['company_id'],acting_user(principal),Jsonb(steps)))).fetchone()
+            row['creator'] = {'id': acting_user(principal), 'email': principal['target_email'], 'display_name': principal['target_display_name']}
+            await event(db, identity, 'steps_saved', 'Authored steps saved',
+                        data={'step_count':len(steps), 'version':0, 'actor_user_id':str(principal['user_id'])})
+            row['runs'] = [await queue_run(db, row, principal, request_id=uuid4())] if body.start else []
+            return row
         busy = await (await db.execute("SELECT count(*) AS count FROM loops WHERE company_id=%s AND status='generating'", (principal['company_id'],))).fetchone()
         if busy['count'] >= 3: raise HTTPException(429, 'Generation is busy; try again shortly')
         row = await (await db.execute('INSERT INTO loops(id,prompt,model,company_id,created_by) VALUES(%s,%s,%s,%s,%s) RETURNING *',
@@ -738,6 +810,30 @@ async def create_loop(body: Prompt, request: Request):
         row['runs'] = [await queue_run(db, row, principal)] if body.start else []
     task = asyncio.create_task(generate_instruction(identity, prompt, principal['company_id'])); generation_tasks.add(task); task.add_done_callback(generation_tasks.discard)
     return row
+
+
+@app.patch('/api/loops/{identity}')
+async def update_loop(identity: UUID, body: LoopUpdate, request: Request):
+    prompt = body.prompt.strip()
+    if not prompt: raise HTTPException(400, 'Enter a workbench name')
+    steps = authored_steps(body.steps)
+    async with database() as db:
+        principal = await authorize(request, db)
+        row = await (await db.execute('SELECT * FROM loops WHERE id=%s AND company_id=%s FOR UPDATE',
+                                    (identity, principal['company_id']))).fetchone()
+        if not row: raise HTTPException(404, 'Loop not found')
+        if row['created_by'] != acting_user(principal) and not principal['is_devadmin']:
+            raise HTTPException(403, 'Only the author can edit this workbench')
+        if row['steps'] is None: raise HTTPException(409, 'Only manual workbenches have editable steps')
+        if row['version'] != body.version: raise HTTPException(409, 'This workbench changed; reload before saving')
+        active = await (await db.execute("SELECT id FROM runs WHERE loop_id=%s AND status IN ('queued','running','paused')",
+                                       (identity,))).fetchone()
+        if active: raise HTTPException(409, 'Stop the active run before editing its steps')
+        row = await (await db.execute('''UPDATE loops SET prompt=%s,instruction=%s,steps=%s,version=version+1
+            WHERE id=%s RETURNING *''', (prompt,prompt,Jsonb(steps),identity))).fetchone()
+        await event(db, identity, 'steps_saved', 'Authored steps saved',
+                    data={'step_count':len(steps), 'version':row['version'], 'actor_user_id':str(principal['user_id'])})
+        return row
 
 
 async def generate_instruction(identity, prompt, company_id):
@@ -808,22 +904,97 @@ async def loop_detail(identity: UUID, request: Request):
             WHERE r.loop_id=%s AND r.company_id=%s ORDER BY r.created_at DESC''', (identity,principal['company_id']))).fetchall()
         row['runs'] = [public_run(run) for run in row['runs']]
         for run in row['runs']:
-            run['events'] = await (await db.execute('SELECT * FROM events WHERE company_id=%s AND run_id=%s ORDER BY created_at',(principal['company_id'],run['id']))).fetchall()
+            run['events'] = await (await db.execute("SELECT * FROM events WHERE company_id=%s AND run_id=%s AND stage<>'step_trace' ORDER BY created_at",(principal['company_id'],run['id']))).fetchall()
         return row
 
 
 @app.post('/api/loops/{identity}/runs')
-async def create_run(identity: UUID, request: Request):
+async def create_run(identity: UUID, request: Request, body: RunRequest | None = None):
     async with database() as db:
         principal = await authorize(request, db)
         loop = await (await db.execute('SELECT * FROM loops WHERE id=%s AND company_id=%s', (identity,principal['company_id']))).fetchone()
         if not loop or loop['status'] != 'ready': raise HTTPException(409, 'A saved instruction is required')
-        return await queue_run(db, loop, principal)
+        if loop['steps'] is not None and (body is None or body.request_id is None):
+            raise HTTPException(422, 'Manual runs require a unique request_id to prevent duplicate execution')
+        return await queue_run(db, loop, principal, mode=body.mode if body else 'sequence',
+                               request_id=body.request_id if body else None)
+
+
+@app.patch('/api/runs/{identity}')
+async def control_run(identity: UUID, body: RunControl, request: Request):
+    async with database() as db:
+        principal = await authorize(request, db)
+        worker = await assigned_worker(db, principal)
+        run = await (await db.execute('''SELECT * FROM runs WHERE id=%s AND company_id=%s
+            AND worker_id=%s AND initiated_by=%s FOR UPDATE''',
+            (identity,principal['company_id'],worker['id'],acting_user(principal)))).fetchone()
+        if not run: raise HTTPException(404, 'Run not found for this desktop')
+        if run['steps'] is None: raise HTTPException(409, 'Step controls require a manual workbench run')
+        if run['status'] not in ('queued','running','paused'):
+            raise HTTPException(409, 'This run has ended; start a new run explicitly to execute again')
+        # Only commands which grant more input need the exact cursor revision.
+        # Pause/stop latch even if the worker claimed a step since the UI poll.
+        if body.command in ('run','step') and run['control_version'] != body.version:
+            raise HTTPException(409, 'Run state changed; refresh its status before continuing')
+        if run['control'] == 'stop':
+            if body.command == 'stop': return public_run(run)
+            raise HTTPException(409, 'A stop request is final; wait for this run to finish')
+        if body.command in ('run','step'):
+            if run['status'] != 'paused' or run['step_in_flight'] is not None:
+                raise HTTPException(409, 'Wait for the current step to reach a pause boundary')
+            if run['next_step'] >= len(run['steps']): raise HTTPException(409, 'Every step has already executed')
+            run = await (await db.execute('''UPDATE runs SET control='run',status='running',run_mode=%s,
+                control_version=control_version+1 WHERE id=%s RETURNING *''',
+                ('step' if body.command == 'step' else 'sequence',identity))).fetchone()
+        elif body.command == 'stop' and run['status'] == 'queued':
+            run = await (await db.execute("""UPDATE runs SET control='stop',status='interrupted',finished_at=now(),
+                request_session_hash=NULL,error='Stopped before dispatch; no steps executed.',
+                control_version=control_version+1 WHERE id=%s RETURNING *""", (identity,))).fetchone()
+        else:
+            # Pause and stop never cancel an in-flight native action. The worker
+            # observes this durable request before claiming its next step.
+            run = await (await db.execute('''UPDATE runs SET control=%s,control_version=control_version+1
+                WHERE id=%s RETURNING *''', (body.command,identity))).fetchone()
+        await event(db,run['loop_id'],'run_control', f'{body.command.capitalize()} requested',run_id=identity,
+                    data={'command':body.command,'control_version':run['control_version'],'requested_version':body.version,
+                          'next_step':run['next_step'],'actor_user_id':str(principal['user_id'])})
+        return public_run(run)
+
+
+async def claim_authored_step(db, worker, body):
+    """Grant native execution at most once; ambiguous delivery is never replayed."""
+    run = await owned_run(db, body.run_id, worker)
+    if run['steps'] is None: raise HTTPException(409, 'This run has no authored steps')
+    if worker['active_run'] != run['id'] or worker['mode'] != 'agent':
+        raise HTTPException(409, 'This worker does not own desktop execution')
+    if body.expected_step is None or body.expected_step != run['next_step']:
+        raise HTTPException(409, 'Step cursor changed; execution cannot be replayed')
+    if run['step_in_flight'] is not None:
+        raise HTTPException(409, 'A step was already dispatched; inspect before starting again')
+    await db.execute('UPDATE workers SET last_seen=now() WHERE id=%s', (worker['id'],))
+    reply = {'step':None, 'step_index':run['next_step'], 'next_step':run['next_step']}
+    if run['control'] == 'stop': return {**reply, 'control':'stop'}
+    if run['next_step'] == len(run['steps']): return {**reply, 'control':'complete'}
+    if run['control'] == 'pause':
+        if run['status'] != 'paused':
+            await db.execute("UPDATE runs SET status='paused',control_version=control_version+1 WHERE id=%s", (run['id'],))
+            await event(db,run['loop_id'],'run_paused','Paused at a step boundary',run_id=run['id'],
+                        data={'next_step':run['next_step']})
+        return {**reply, 'control':'pause'}
+    step = run['steps'][run['next_step']]
+    await db.execute('''UPDATE runs SET step_in_flight=next_step,step_started_at=now(),status='running',
+        control_version=control_version+1 WHERE id=%s''', (run['id'],))
+    await event(db,run['loop_id'],'step_reserved','Authored step dispatched once',run_id=run['id'],
+                data={'step_id':step['id'],'step_index':run['next_step'],'action':step['action']})
+    return {**reply, 'control':'run', 'step':step}
 
 
 @app.post('/api/worker/poll')
 async def worker_poll(body: WorkerPoll, request: Request):
     async with database() as db:
+        if body.run_id is not None:
+            worker = await worker_authorize(request, db)
+            return await claim_authored_step(db,worker,body)
         # Lock the target and real actor, then actor session, then worker/run.
         # Revocation/reset/logout cannot commit between validation and dispatch.
         worker = await worker_authorize(request, db, lock=False)
@@ -856,9 +1027,14 @@ async def worker_poll(body: WorkerPoll, request: Request):
             await interrupt_queued_runs(db, 'Generation failed before dispatch. No actions were sent.',
                                         clause='id=%s AND company_id=%s', params=(run['id'],worker['company_id']))
             return {'run': None}
+        if run['steps'] is not None and 'manual_actions_v1' not in body.capabilities:
+            await interrupt_queued_runs(db, 'This worker needs the manual workbench update before it can execute authored steps. No actions were sent.',
+                                        clause='id=%s AND company_id=%s', params=(run['id'],worker['company_id']))
+            return {'run': None}
         if worker['active_run'] or worker['mode'] != 'agent' or run['loop_status'] != 'ready' or not run['instruction']:
             return {'run': None}
-        await db.execute("UPDATE runs SET status='running',started_at=now(),revision=%s,request_session_hash=NULL WHERE id=%s AND company_id=%s", (body.revision,run['id'],worker['company_id']))
+        updated = await (await db.execute("UPDATE runs SET status='running',started_at=now(),revision=%s,request_session_hash=NULL,control_version=control_version+1 WHERE id=%s AND company_id=%s RETURNING *", (body.revision,run['id'],worker['company_id']))).fetchone()
+        run.update(updated)
         await db.execute('UPDATE workers SET active_run=%s WHERE id=%s', (run['id'],worker['id']))
         await event(db, run['loop_id'], 'delivery_sent', 'Persisted instruction dispatched to the assigned worker',
                     run_id=run['id'], data={'revision': body.revision, 'worker': worker['id'], 'actor_user_id': str(principal['user_id'])})
@@ -883,7 +1059,7 @@ async def worker_deployment(body: WorkerDeployment, request: Request):
                 or body.company_id != worker['company_id'] or body.assigned_user_id != worker['assigned_user_id']):
             raise HTTPException(409, 'Deployment worker or environment does not match the credential')
         await release_expired_queue(db, worker['id'])
-        active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running')", (worker['id'],))).fetchone()
+        active = await (await db.execute("SELECT id FROM runs WHERE worker_id=%s AND status IN ('queued','running','paused')", (worker['id'],))).fetchone()
         if active or worker['active_run'] or worker['mode'] == 'human':
             raise HTTPException(409, 'Desktop must be idle under agent control before deployment')
         if body.phase == 'finish' and worker['mode'] != 'maintenance': raise HTTPException(409, 'Desktop is not in maintenance')
@@ -904,7 +1080,7 @@ async def worker_recover(request: Request):
         rows=await (await db.execute("""UPDATE runs r SET status='interrupted',finished_at=now(),
             error='Worker restarted or delivery was interrupted. Actions were not replayed.' FROM loops l
             WHERE r.loop_id=l.id AND r.worker_id=%s AND r.initiated_by=%s AND l.company_id=%s
-            AND r.status='running' RETURNING r.id,r.loop_id""",
+            AND r.status IN ('running','paused') RETURNING r.id,r.loop_id""",
             (worker['id'],worker['assigned_user_id'],worker['company_id']))).fetchall()
         for row in rows:
             await event(db,row['loop_id'],'interrupted','Worker restarted; inspect the desktop before a new run. No actions replayed.',run_id=row['id'])
@@ -915,7 +1091,7 @@ async def worker_recover(request: Request):
 async def owned_run(db, identity, worker, *, active=True):
     run = await (await db.execute('''SELECT r.* FROM runs r JOIN loops l ON l.id=r.loop_id
         WHERE r.id=%s AND r.worker_id=%s AND r.initiated_by=%s AND l.company_id=%s'''
-        + (" AND r.status='running'" if active else '') + ' FOR UPDATE OF r',
+        + (" AND r.status IN ('running','paused')" if active else '') + ' FOR UPDATE OF r',
         (identity,worker['id'],worker['assigned_user_id'],worker['company_id']))).fetchone()
     if not run: raise HTTPException(409,'Run is not owned by this active worker')
     return run
@@ -926,6 +1102,54 @@ async def worker_event(identity: UUID, body: WorkerEvent, request: Request):
     async with database() as db:
         worker = await worker_authorize(request, db)
         run = await owned_run(db,identity,worker)
+        previous = await (await db.execute('SELECT run_id FROM events WHERE id=%s', (body.id,))).fetchone()
+        if previous:
+            if previous['run_id'] != identity: raise HTTPException(409, 'Event identity belongs to another run')
+            return {'ok':True}
+        if body.stage == 'step_trace':
+            records = body.data.get('events')
+            index = body.data.get('step_index')
+            if (run['steps'] is None or type(index) is not int or index != run['step_in_flight']
+                    or not 0 <= index < len(run['steps']) or body.data.get('step_id') != run['steps'][index]['id']):
+                raise HTTPException(409, 'Trace does not match the dispatched step')
+            if (not isinstance(records, list) or any(not isinstance(record,dict) for record in records)
+                    or len(json.dumps(body.data,ensure_ascii=False).encode('utf-8')) > 2*1024*1024):
+                raise HTTPException(422, 'Step trace must contain bounded existing report records')
+        if body.stage == 'step_finished':
+            index = body.data.get('step_index')
+            if (run['steps'] is None or type(index) is not int or index != run['step_in_flight']
+                    or index != run['next_step'] or not 0 <= index < len(run['steps'])
+                    or body.data.get('step_id') != run['steps'][index]['id']):
+                raise HTTPException(409, 'Step completion does not match the dispatched step')
+            status = body.data.get('status')
+            if status not in ('succeeded','error') or not isinstance(body.data.get('result'), dict):
+                raise HTTPException(422, 'Step completion requires a result and succeeded or error status')
+            finished = datetime.now(timezone.utc)
+            outcome = {key:body.data[key] for key in ('step_id','step_index','status','result','error','duration_ms','started_at','finished_at') if key in body.data}
+            for key in ('started_at','finished_at'):
+                value = outcome.get(key)
+                if value is not None:
+                    try:
+                        if not isinstance(value,str) or len(value)>64 or datetime.fromisoformat(value.replace('Z','+00:00')).utcoffset() is None:
+                            raise ValueError('A worker timestamp must include its timezone')
+                    except ValueError as error:
+                        raise HTTPException(422, 'Step timestamps must be ISO timestamps with a timezone') from error
+            duration = outcome.get('duration_ms')
+            if duration is not None and (type(duration) not in (int,float) or not math.isfinite(duration) or duration<0):
+                raise HTTPException(422, 'Step duration must be a non-negative finite number')
+            # Worker monotonic duration and wall-clock timestamps remain intact.
+            # The reservation and arrival times have a separate server clock.
+            outcome.update(server_started_at=run['step_started_at'].isoformat() if run['step_started_at'] else None,
+                           server_finished_at=finished.isoformat())
+            results = [*run['step_results'],outcome]
+            next_step = index + (1 if status == 'succeeded' else 0)
+            control = run['control']
+            if status != 'succeeded': control = 'stop'
+            elif control == 'run' and run['run_mode'] == 'step' and next_step < len(run['steps']): control = 'pause'
+            state = 'paused' if control == 'pause' and next_step < len(run['steps']) else 'running'
+            await db.execute('''UPDATE runs SET next_step=%s,step_in_flight=NULL,step_started_at=NULL,
+                step_results=%s,control=%s,status=%s,control_version=control_version+1 WHERE id=%s''',
+                (next_step,Jsonb(results),control,state,identity))
         await event(db,run['loop_id'],body.stage,body.message,run_id=identity,data=body.data,event_id=body.id)
     return {'ok':True}
 
@@ -933,15 +1157,21 @@ async def worker_event(identity: UUID, body: WorkerEvent, request: Request):
 @app.post('/api/worker/runs/{identity}/finish')
 async def worker_finish(identity: UUID, body: WorkerResult, request: Request):
     if body.status not in ('succeeded','error','blocked','interrupted','unverified'): raise HTTPException(400,'Invalid run status')
-    if body.status=='succeeded' and body.result.get('verified') is not True: raise HTTPException(400,'Explicit task verification evidence is required')
     async with database() as db:
         worker = await worker_authorize(request, db)
         run = await owned_run(db,identity,worker)
+        if body.status == 'succeeded':
+            if run['steps'] is None:
+                if body.result.get('verified') is not True: raise HTTPException(400,'Explicit task verification evidence is required')
+            elif (run['next_step'] != len(run['steps']) or run['step_in_flight'] is not None
+                  or len(run['step_results']) != len(run['steps'])
+                  or any(step['status'] != 'succeeded' for step in run['step_results'])):
+                raise HTTPException(409, 'Every authored step must finish successfully before completing the run')
         result = {**(run.get('result') or {}), **body.result}
         # Only the authenticated archive endpoint owns durable storage metadata.
         if (run.get('result') or {}).get('artifacts'): result['artifacts'] = run['result']['artifacts']
         else: result.pop('artifacts', None)
-        await db.execute('UPDATE runs SET status=%s,finished_at=now(),error=%s,result=%s WHERE id=%s',(body.status,body.error,Jsonb(result),identity))
+        await db.execute('UPDATE runs SET status=%s,finished_at=now(),error=%s,result=%s,control_version=control_version+1 WHERE id=%s',(body.status,body.error,Jsonb(result),identity))
         await db.execute('UPDATE workers SET active_run=NULL,last_seen=now() WHERE id=%s',(worker['id'],))
         await event(db,run['loop_id'],'observed_result' if body.status=='succeeded' else body.status,body.error or body.result.get('reason') or 'Worker finished; inspect the evidence and reported verification state.',run_id=identity,data=body.result)
     return {'ok':True}
@@ -1044,16 +1274,23 @@ async def report_record(identity, request, *, loop_only=False):
             (loop_id,principal['company_id']))).fetchone()
         if not loop: raise HTTPException(404, 'Request not found')
         events = await (await db.execute('SELECT * FROM events WHERE company_id=%s AND loop_id=%s AND (run_id IS NULL OR run_id=%s) ORDER BY created_at,id', (principal['company_id'],loop_id, None if loop_only else identity))).fetchall()
+    trace_events = [record for item in events if item['stage'] == 'step_trace'
+                    for record in item['data'].get('events',[]) if isinstance(record,dict)]
+    events = [item for item in events if item['stage'] != 'step_trace']
     missing = []
-    if not any(item['stage'] == 'llm_request' for item in events): missing.append('Exact OpenAI request was not captured for this earlier request.')
-    if not any(item['stage'] == 'llm_response' for item in events): missing.append('OpenAI response is unavailable; generation may predate capture or have been interrupted.')
+    if loop['steps'] is None:
+        if not any(item['stage'] == 'llm_request' for item in events): missing.append('Exact OpenAI request was not captured for this earlier request.')
+        if not any(item['stage'] == 'llm_response' for item in events): missing.append('OpenAI response is unavailable; generation may predate capture or have been interrupted.')
     artifact = ((run or {}).get('result') or {}).get('artifacts')
-    if run and not artifact: missing.append('Worker evidence archive has not been uploaded. Only the available server record is included; native traces, Jev payloads and screenshots may be unavailable.')
+    if run and not artifact: missing.append('Worker evidence archive has not been uploaded. Available step traces are included; screenshots and any uncaptured records remain unavailable.')
+    if not artifact:
+        missing.extend(dict.fromkeys(record.get('reason','A live step trace record was not captured.')
+                                     for record in trace_events if record.get('event') == 'capture_gap'))
     if artifact: missing.extend(artifact.get('manifest', {}).get('missing_capture', []))
     if not run: missing.append('No desktop run belongs to this request-only report.')
     return {'loop': loop, 'run': run, 'events': events, 'artifact': artifact,
             'openai_cost_estimate': openai_cost_estimate(loop.get('llm_usage')),
-            'missing_capture': missing, 'worker_events': [],
+            'missing_capture': missing, 'worker_events': trace_events,
             'timing_note': 'Server and worker timestamps are separate clock domains. Only durations measured on one machine are precise.',
             'cost_note': 'Jev input cost is a usage estimate at $0.042 per million input tokens; output is free. No provider invoice is attached.'}
 

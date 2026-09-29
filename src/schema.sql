@@ -80,7 +80,7 @@ CREATE INDEX IF NOT EXISTS workers_company ON workers(company_id);
 CREATE UNIQUE INDEX IF NOT EXISTS one_worker_per_user ON workers(company_id, assigned_user_id) WHERE disabled_at IS NULL;
 CREATE INDEX IF NOT EXISTS loops_company_time ON loops(company_id, created_at);
 CREATE INDEX IF NOT EXISTS runs_company_time ON runs(company_id, created_at);
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_run_per_worker ON runs(worker_id) WHERE status IN ('queued', 'running');
+CREATE UNIQUE INDEX IF NOT EXISTS one_reserved_run_per_worker ON runs(worker_id) WHERE status IN ('queued', 'running', 'paused');
 CREATE INDEX IF NOT EXISTS events_company_loop_time ON events(company_id, loop_id, created_at);
 CREATE INDEX IF NOT EXISTS auth_tokens_company_user ON auth_tokens(company_id, user_id, purpose);
 CREATE INDEX IF NOT EXISTS auth_tokens_expiry ON auth_tokens(expires_at);
@@ -91,3 +91,21 @@ CREATE INDEX IF NOT EXISTS company_migration_audit_company ON company_migration_
 -- This soft reference permits logout/session deletion; dispatch revalidates it.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS request_session_hash text;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS dispatch_before timestamptz;
+
+-- Manual workbenches share the loop/run/event contract. A run owns an immutable
+-- copy of its authored steps; editing a loop can never change dispatched input.
+ALTER TABLE loops ADD COLUMN IF NOT EXISTS steps jsonb;
+ALTER TABLE loops ADD COLUMN IF NOT EXISTS version integer NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS steps jsonb;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS request_id uuid;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS next_step integer NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS step_in_flight integer;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS step_started_at timestamptz;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS step_results jsonb NOT NULL DEFAULT '[]';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS run_mode text NOT NULL DEFAULT 'sequence';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS control text NOT NULL DEFAULT 'run';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS control_version integer NOT NULL DEFAULT 0;
+CREATE UNIQUE INDEX IF NOT EXISTS runs_request_id ON runs(company_id, initiated_by, request_id) WHERE request_id IS NOT NULL;
+-- Create the stronger index before removing its predecessor, so startup never
+-- leaves a gap in the desktop's single active reservation guarantee.
+DROP INDEX IF EXISTS one_active_run_per_worker;

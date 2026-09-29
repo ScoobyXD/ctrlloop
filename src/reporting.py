@@ -200,6 +200,21 @@ class RunReport:
             record.update(_body_fields(record.pop("body")))
         return record
 
+    def snapshot_events(self, *, step_id: str) -> list[dict[str, Any]]:
+        """Copy existing event records for boundary inspection before report close.
+
+        Desktop screenshot payloads remain in the final archive. Their dispatch
+        and return facts are still included here, without inline image bytes.
+        """
+        with self._lock:
+            records = [self._serializable(deepcopy(item)) for item in self._events if item.get("step_id") == step_id]
+        for record in records:
+            if record.get("event") == "native_call_returned" and record.get("tool") == "get_desktop_state":
+                record.pop("body", None)
+                record.pop("body_text", None)
+                record["capture_note"] = "Desktop image payload is available in the final evidence archive."
+        return records
+
     def append(self, event: str, *, _at_ns: int | None = None, **data: Any) -> None:
         if self._closed:
             raise ValueError("Cannot append to a closed run report")

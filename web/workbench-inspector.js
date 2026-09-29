@@ -1,0 +1,272 @@
+// The workbench reads the existing report payload. It does not translate or
+// rewrite recorded Jev questions, desktop observations, or native commands.
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
+const finite = (value) => Number.isFinite(value) && value >= 0;
+const count = (value) => finite(value) ? value.toLocaleString() : "Unavailable";
+const ms = (value) => finite(value) ? `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })} ms` : "Unavailable";
+const usd = (value) => finite(value) ? `$${value.toFixed(8)}` : "Unavailable";
+const cost = (tokens) => finite(tokens) ? tokens * 0.042 / 1000000 : null;
+const human = (value) => String(value ?? "Unavailable").replaceAll("_", " ");
+const date = (value) => value && !Number.isNaN(new Date(value).getTime()) ? new Date(value).toISOString().replace("T", " ") : "Unavailable";
+const asArray = (value) => Array.isArray(value) ? value : [];
+const note = (text) => `<p class="wb-muted">${esc(text)}</p>`;
+const pendingContent = new Map();
+const boundContainers = new WeakSet();
+let nextContentId = 0;
+
+function disclosure(label, render, key = "") {
+  const id = String(++nextContentId);
+  pendingContent.set(id, render);
+  return `<details class="wb-disclosure" data-wb-detail="${id}"${key ? ` data-disclosure="${esc(key)}"` : ""}><summary>${esc(label)}</summary><div class="wb-detail-content"></div></details>`;
+}
+
+function raw(label, value) {
+  return disclosure(label, () => value == null ? note("Unavailable in the captured record.") : `<pre class="wb-output">${esc(JSON.stringify(value, null, 2))}</pre>`);
+}
+
+function facts(values) {
+  return `<dl class="wb-facts">${values.map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>`;
+}
+
+function table(headings, rows) {
+  return `<div class="wb-table-wrap"><table class="wb-detail-table"><thead><tr>${headings.map((heading) => `<th>${esc(heading)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${esc(cell)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+}
+
+function stepResult(run, stepId) {
+  return asArray(run?.step_results).find((item) => item.step_id === stepId)
+    ?? asArray(run?.result?.steps).find((item) => item.step_id === stepId)
+    ?? null;
+}
+
+function scope(report, run, stepId) {
+  const currentRun = run ?? report?.run;
+  const result = stepId ? stepResult(currentRun, stepId) ?? stepResult(report?.run, stepId) : null;
+  return {
+    stepId,
+    run: currentRun,
+    result,
+    events: asArray(report?.worker_events).filter((event) => !stepId || event.step_id === stepId),
+    serverEvents: asArray(report?.events).filter((event) => !stepId || event.data?.step_id === stepId),
+    pipeline: result?.result?.pipeline ?? (!stepId ? currentRun?.result?.pipeline : null),
+  };
+}
+
+function selectionRounds(record) {
+  const rounds = record.events.filter((event) => ["window_selected", "control_selected"].includes(event.event))
+    .flatMap((event) => asArray(event.selections).map((round) => ({ stage: event.event === "window_selected" ? "windows" : "controls", iteration: event.iteration, round })));
+  // A selected step may finish before its worker archive reaches the server.
+  // Saved selection results retain the same questions and returned judgments.
+  const pipelines = record.pipeline ? [record.pipeline] : record.stepId ? [] : asArray(record.run?.step_results).map((item) => item.result?.pipeline).filter(Boolean);
+  const saved = pipelines.flatMap((pipeline) => Object.entries(pipeline.selections ?? {}).flatMap(([stage, items]) => asArray(items).map((round) => ({ stage, iteration: round.iteration, round }))));
+  if (!saved.length) {
+    saved.push(...record.serverEvents.filter((event) => ["jev_selection", "jev_window_selection", "selection"].includes(event.stage))
+      .flatMap((event) => asArray(event.data?.rounds).map((round) => ({ stage: event.stage === "jev_window_selection" ? "windows" : "controls", iteration: round.iteration ?? event.data.iteration, round }))));
+  }
+  for (const entry of saved) {
+    if (!rounds.some((item) => item.stage === entry.stage && item.iteration === entry.iteration && item.round.round === entry.round.round)) rounds.push(entry);
+  }
+  for (const event of record.events.filter((item) => item.operation === "selection.round" && item.event.startsWith("timing_"))) {
+    if (!rounds.some((item) => item.stage === event.stage && item.iteration === event.iteration && item.round.round === event.round)) {
+      rounds.push({ stage: event.stage, iteration: event.iteration, round: { round: event.round, span_id: event.span_id, candidate_count: event.candidate_count } });
+    }
+  }
+  return rounds;
+}
+
+function jevCalls(record, rounds) {
+  const calls = record.events.filter((event) => event.event === "jev_request").map((request) => {
+    const response = record.events.find((event) => ["jev_response", "jev_response_error", "jev_request_unfinished"].includes(event.event) && event.request_id === request.request_id);
+    return { request, response, stage: request.stage, iteration: request.iteration, round: request.round, batch: request.batch, tokens: response?.input_tokens ?? response?.body?.usage?.input_tokens, duration: response?.duration_ms };
+  });
+  for (const entry of rounds) {
+    for (const saved of asArray(entry.round.api_calls)) {
+      const captured = calls.find((call) => (saved.sdk_span_id != null && call.request?.span_id === saved.sdk_span_id)
+        || (call.stage === entry.stage && call.iteration === entry.iteration && call.round === entry.round.round && (call.batch ?? 1) === (saved.batch ?? 1)));
+      if (captured) {
+        captured.saved = saved;
+        captured.tokens ??= saved.input_tokens;
+      } else {
+        calls.push({ saved, stage: entry.stage, iteration: entry.iteration, round: entry.round.round, batch: saved.batch, tokens: saved.input_tokens, duration: null });
+      }
+    }
+  }
+  return calls;
+}
+
+function accounting(record, rounds, calls, stepId) {
+  const declared = stepId ? record.result?.result?.timing?.jev_api_call_count : record.run?.result?.timing?.jev_api_call_count;
+  const started = record.events.some((event) => event.event === "step_started" || (event.event === "timing_started" && event.operation === "workbench.step"));
+  const finished = record.events.some((event) => event.event === "step_finished" || (event.event === "timing_finished" && event.operation === "workbench.step"));
+  const hasCaptureGap = record.events.some((event) => event.event === "capture_gap");
+  const knownCount = finite(declared) && declared >= calls.length ? declared : stepId && started && finished && !hasCaptureGap ? calls.length : null;
+  const tokens = calls.filter((call) => finite(call.tokens)).reduce((sum, call) => sum + call.tokens, 0);
+  const known = calls.filter((call) => finite(call.tokens)).length;
+  const partial = knownCount == null || known < knownCount;
+  const hasUsage = known > 0 || knownCount === 0;
+  const duration = record.result?.duration_ms ?? (stepId
+    ? record.events.find((event) => event.event === "timing_finished" && event.operation === "workbench.step")?.duration_ms
+    : record.run?.result?.timing?.duration_ms);
+  return {
+    callCount: knownCount,
+    capturedCalls: calls.length,
+    inputTokens: hasUsage ? tokens : null,
+    inputCost: hasUsage ? cost(tokens) : null,
+    partial,
+    durationMs: finite(duration) ? duration : null,
+    callsLabel: knownCount != null ? count(knownCount) : calls.length ? `${count(calls.length)} captured` : "Unavailable",
+    tokensLabel: hasUsage ? `${count(tokens)}${partial ? " + unavailable" : ""}` : "Unavailable",
+    costLabel: hasUsage ? `${usd(cost(tokens))}${partial ? " + unavailable" : ""}` : "Unavailable",
+    durationLabel: ms(duration),
+    windowRounds: rounds.filter((entry) => entry.stage === "windows").length,
+    controlRounds: rounds.filter((entry) => entry.stage === "controls").length,
+  };
+}
+
+/** Compact accounting from the existing report, scoped to one authored step. */
+export function stepAccounting(report, run = null, stepId = null) {
+  const record = scope(report, run, stepId);
+  const rounds = selectionRounds(record);
+  return accounting(record, rounds, jevCalls(record, rounds), stepId);
+}
+
+function questions(call) {
+  const inputs = call.request?.body?.questions ?? call.saved?.questions ?? {};
+  const answers = call.response?.body?.answers ?? call.saved?.answers ?? {};
+  if (!Object.keys(inputs).length) return note("Exact question input was not captured.");
+  return Object.entries(inputs).map(([key, question]) => {
+    const answer = answers[key];
+    const instructions = question.instructions;
+    const wording = typeof instructions === "string" ? instructions : instructions?.question;
+    const criteria = question.criteria ?? {};
+    const probabilities = answer?.probabilities ?? {};
+    return disclosure(`${key} · chose ${answer?.choice ?? "Unavailable"}`, () =>
+      `${wording ? `<p class="wb-question">${esc(wording)}</p>` : note("Question text is only available in the exact input below.")}
+      ${facts([["Chosen option", answer?.choice ?? "Unavailable"], ["Confidence", finite(answer?.confidence) ? answer.confidence.toFixed(4) : "Unavailable"]])}
+      ${Object.keys(probabilities).length ? table(["Option", "Probability", "Chosen"], Object.entries(probabilities).map(([option, probability]) => [option, finite(probability) ? `${(probability * 100).toFixed(2)}%` : "Unavailable", option === answer?.choice ? "✓" : ""])) : note("Probabilities unavailable.")}
+      ${raw("Candidate descriptions / option criteria", criteria)}${raw("Exact question and answer", { question, answer: answer ?? null })}`);
+  }).join("");
+}
+
+function renderCall(call, index) {
+  const model = call.request?.body?.model ?? call.saved?.requested_model;
+  const stage = call.stage === "windows" ? "window" : "control";
+  return disclosure(`API call ${index + 1} · ${stage} round ${call.round ?? "?"} · ${ms(call.duration)} · ${count(call.tokens)} input tokens · ${usd(cost(call.tokens))}`, () =>
+    `${facts([["Loop", call.iteration ?? "Unavailable"], ["Round", `${stage} ${call.round ?? "?"}`], ["Batch", call.batch ?? "Unavailable"], ["Pinned model", model ?? "Unavailable"], ["Request UTC", date(call.request?.timestamp)], ["Response UTC", date(call.response?.timestamp)]])}
+    ${!call.request ? note("Recovered from saved selection results. Exact HTTP envelopes and transport timing are unavailable.") : ""}
+    ${raw("Minimal state actually sent to Jev", call.request?.body?.state ?? call.saved?.state)}
+    ${questions(call)}
+    ${raw("Exact call inputs", call.request?.body ?? (call.saved ? { state: call.saved.state, questions: call.saved.questions, model: call.saved.requested_model } : null))}
+    ${raw("Prepared request and transport timing", call.request)}
+    ${raw("Response, usage and transport timing", call.response ?? call.saved)}`);
+}
+
+function renderRound(entry, events) {
+  const round = entry.round;
+  const stage = entry.stage === "windows" ? "Window" : "Control";
+  const duration = events.find((event) => event.event === "timing_finished" && event.span_id === round.span_id)?.duration_ms;
+  return disclosure(`${stage} round ${round.round} · ${count(round.candidate_count)} → ${count(round.winner_count)} candidates · ${ms(duration)}`, () =>
+    `${facts([["Loop", entry.iteration ?? "Unavailable"], ["Groups", count(round.group_count)], ["API calls", Array.isArray(round.api_calls) ? count(round.api_calls.length) : "Unavailable"]])}
+    ${asArray(round.groups).length ? table(["Group question", "Candidates", "Chosen"], round.groups.map((group) => [group.question_key, asArray(group.options).join(", "), group.winner ?? "Unavailable"])) : note("Group evidence unavailable.")}
+    ${round.actions ? raw("Jev action choices for finalists", round.actions) : ""}
+    ${round.settling ? raw("Jev settling choices for finalists", round.settling) : ""}
+    ${raw("Complete recorded round", round)}`);
+}
+
+function renderNativeCalls(events) {
+  const callIds = [...new Set(events.filter((event) => ["native_call_intent", "native_call_sent", "native_call_returned", "native_call_error"].includes(event.event)).map((event) => event.call_id))];
+  return callIds.map((id) => {
+    const evidence = events.filter((event) => event.call_id === id && event.event.startsWith("native_call_"));
+    const sent = evidence.find((event) => event.event === "native_call_sent");
+    const returned = evidence.find((event) => event.event === "native_call_returned");
+    const error = evidence.find((event) => event.event === "native_call_error");
+    const first = evidence[0];
+    return disclosure(`CUA ${first.tool ?? first.method ?? "call"} · ${id} · ${error ? "error" : returned ? "returned" : sent ? "return unavailable" : "dispatch uncertain"}`, () =>
+      `${facts([["Command sent UTC", date(sent?.timestamp)], ["Duration", ms(error?.duration_ms ?? returned?.duration_ms)], ["Loop", first.iteration ?? "Unavailable"]])}${raw("Arguments, dispatch and returned result", evidence)}`);
+  }).join("") || note("No native command evidence is available yet.");
+}
+
+function renderObservations(record) {
+  const observations = record.events.filter((event) => ["windows_discovered", "window_observed", "controls_observed", "desktop_observed"].includes(event.event));
+  const selected = record.events.filter((event) => ["window_selected", "control_selected"].includes(event.event));
+  return `${observations.map((event) => raw(`${human(event.event)} · loop ${event.iteration ?? "?"}`, event)).join("") || note("Raw observations are unavailable until the worker evidence archive is uploaded.")}
+    ${selected.map((event) => raw(`${human(event.event)} · loop ${event.iteration ?? "?"}`, { ...event, selections: undefined })).join("")}
+    ${record.pipeline ? raw("Saved selected window, control and observation coverage", { window: record.pipeline.window, control: record.pipeline.control, snapshot_id: record.pipeline.snapshot_id, observation: record.pipeline.observation }) : ""}`;
+}
+
+function operation(event) {
+  const known = { window_discovery: "CUA/UIA get windows", window_selection: "Jev window selection", foreground_activation: "CUA focus", control_acquisition: "CUA/UIA get controls", control_selection: "Jev control selection", action_dispatch: "CUA action dispatch", native_action: "CUA action return", settling_wait: "Settling wait", "workbench.step": "Authored step total", "loop.cycle": "Loop cycle including return / capture" };
+  return event.operation === "selection.round" ? `Jev ${event.stage === "windows" ? "window" : "control"} round ${event.round}` : known[event.operation] ?? human(event.operation);
+}
+
+function renderTiming(record) {
+  const events = record.events;
+  const spans = events.filter((event) => event.event === "timing_finished");
+  const visible = spans.filter((event) => ["workbench.step", "loop.cycle", "window_discovery", "window_selection", "foreground_activation", "control_acquisition", "control_selection", "selection.round", "action_dispatch", "settling_wait"].includes(event.operation));
+  const boundaries = events.filter((event) => ["loop_started", "loop_finished", "step_started", "step_finished", "native_call_sent"].includes(event.event));
+  const rows = visible.map((event) => {
+    const startedAt = event.started_at ?? (event.timestamp && finite(event.elapsed_ms) && finite(event.started_elapsed_ms)
+      ? new Date(new Date(event.timestamp).getTime() - event.elapsed_ms + event.started_elapsed_ms).toISOString() : null);
+    return { at: event.started_elapsed_ms, cells: [date(startedAt), operation(event), ms(event.duration_ms), ms(event.started_elapsed_ms)] };
+  });
+  for (const event of boundaries) {
+    if (event.event === "native_call_sent" && !["click", "type_text", "press_key", "hotkey"].includes(event.tool)) continue;
+    const boundary = event.event === "loop_started" ? `Loop ${event.iteration} starts · current state`
+      : event.event === "loop_finished" ? `Loop ${event.iteration} ${event.completed_action_loop === false ? "attempt stopped" : "ends"}`
+      : event.event === "native_call_sent" ? `CUA ${human(event.tool)} sent · loop ${event.iteration ?? "?"}`
+      : human(event.event);
+    rows.push({ at: event.elapsed_ms, cells: [date(event.timestamp), boundary, event.event === "loop_finished" ? ms(event.duration_ms) : "—", ms(event.elapsed_ms)] });
+  }
+  rows.sort((left, right) => (left.at ?? Infinity) - (right.at ?? Infinity));
+  return `${facts([["Step start · worker UTC", date(record.result?.started_at)], ["Step finish · worker UTC", date(record.result?.finished_at)], ["Step total", ms(record.result?.duration_ms)], ["Run start · server UTC", date(record.run?.started_at)], ["Run finish · server UTC", date(record.run?.finished_at)], ["Run worker duration", ms(record.run?.result?.timing?.duration_ms)]])}
+    ${note("Step identity and loop numbers are separate. A loop starts at current-state acquisition and ends when the final CUA input command is sent. Nested spans overlap; do not add their durations. Server and worker timestamps use separate clocks.")}
+    ${rows.length ? table(["Worker UTC", "Operation / boundary", "Duration", "Run elapsed"], rows.map((row) => row.cells)) : note("Precise stage and loop timing is not available yet.")}
+    ${raw("Every captured timing span and boundary", events.filter((event) => event.event.startsWith("timing_") || ["step_started", "step_finished", "loop_started", "loop_finished", "native_call_sent"].includes(event.event)))}`;
+}
+
+/** Return compact HTML; call bindStepInspector after mounting it. */
+export function renderStepInspector({ step, run = null, report = null, loading = false, error = "", reportURL = "", downloadURL = "" } = {}) {
+  pendingContent.clear();
+  if (!step) return note("Select a step to inspect its result.");
+  const record = scope(report, run, step.id);
+  const result = record.result;
+  const pipeline = record.pipeline;
+  const rounds = selectionRounds(record);
+  const calls = jevCalls(record, rounds);
+  const totals = accounting(record, rounds, calls, step.id);
+  const output = pipeline?.action_result;
+  const reason = result?.error ?? result?.result?.error ?? result?.result?.reason ?? pipeline?.reason;
+  const resultLabel = result?.status === "succeeded" ? step.action?.tool === "read" ? "Read completed" : output?.effect === "confirmed" ? "Command sent" : "Sent · unverified" : human(result?.status);
+  const actionLabel = step.action ? `${human(step.action.tool)} ${step.action.target ?? (step.action.tool === "press_key" ? step.action.key : "current focus")}` : "Recorded step";
+  const requested = record.events.filter((event) => event.event === "action_requested");
+  const links = `${reportURL ? `<a class="button quiet small" href="${esc(reportURL)}" target="_blank" rel="noopener">Full timeline & report ↗</a>` : ""}${downloadURL ? `<a class="button quiet small" href="${esc(downloadURL)}">Evidence ZIP ↓</a>` : ""}`;
+  return `<div class="wb-inspector">
+    <p class="wb-muted">Recorded action: ${esc(actionLabel)}</p>
+    ${result ? `<p class="wb-outcome"><strong>${esc(resultLabel)}</strong>${reason ? ` · ${esc(reason)}` : ""}</p>` : note("This step has no completed result yet.")}
+    ${typeof output?.text === "string" ? `<div class="wb-read-result"><strong>Read text</strong><pre class="wb-output">${esc(output.text)}</pre><p class="wb-muted">${esc(output.source ?? "Recorded desktop text")}</p></div>` : ""}
+    ${facts([["Step time", totals.durationLabel], ["Jev calls", totals.callsLabel], ["Input tokens", totals.tokensLabel], ["Input cost", totals.costLabel]])}
+    ${loading ? '<p class="wb-muted" role="status">Loading captured evidence…</p>' : ""}
+    ${error ? `<p class="inline-error" role="alert">${esc(error)}</p>` : ""}
+    ${disclosure("Action & result", () => `${raw("Authored step", step)}${requested.map((event) => raw(`Action requested · loop ${event.iteration ?? "?"}`, event)).join("")}${raw("Returned action / read result", output)}${raw("Step outcome", result)}${renderNativeCalls(record.events)}`, `step-${step.id}-action`)}
+    ${disclosure(`Jev selection · ${totals.windowRounds} captured window rounds · ${totals.controlRounds} captured control rounds`, () => `${note("Candidates are windows or controls. Groups contain up to 10 candidates. Each round batches group questions into one API call where the request limit permits; split batches remain explicit. Input costs use $0.042 per million tokens; output is free.")}${rounds.map((entry) => renderRound(entry, record.events)).join("") || note("No completed selection round is available.")}${calls.map(renderCall).join("") || note("No captured API calls. Missing evidence does not establish zero calls, tokens or cost.")}`, `step-${step.id}-jev`)}
+    ${disclosure("Observed state & candidates", () => renderObservations(record), `step-${step.id}-state`)}
+    ${disclosure("Timings & evidence", () => `${renderTiming(record)}${asArray(report?.missing_capture).length ? `<p class="wb-muted">Run capture gaps</p><ul>${report.missing_capture.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>` : ""}${raw("Complete events for this step", record.events)}${raw("Server progress for this step", record.serverEvents)}`, `step-${step.id}-timing`)}
+    ${links ? `<div class="instruction-actions">${links}</div>` : ""}
+  </div>`;
+}
+
+/** Hydrate disclosure content only when opened, keeping large traces off the DOM. */
+export function bindStepInspector(container) {
+  if (boundContainers.has(container)) return;
+  boundContainers.add(container);
+  container.addEventListener("toggle", (event) => {
+    const details = event.target;
+    if (!details.matches?.("details[data-wb-detail]")) return;
+    const slot = details.querySelector(":scope > .wb-detail-content");
+    if (!details.open) {
+      for (const child of slot.querySelectorAll("[data-wb-detail]")) pendingContent.delete(child.dataset.wbDetail);
+      slot.replaceChildren();
+      return;
+    }
+    if (!slot.childNodes.length) slot.innerHTML = pendingContent.get(details.dataset.wbDetail)?.() ?? "";
+  }, true);
+}

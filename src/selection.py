@@ -369,12 +369,15 @@ class ChoiceSelector:
         self, original_request: str | dict[str, Any], candidates: Sequence[Candidate], *, stage: str,
         report: "RunReport | None" = None,
         settling_context: dict[str, Any] | None = None,
+        requested_action: str | None = None,
     ) -> Selection:
         """Select with the original request or the caller's shared loop state."""
         with report.span("selection", stage=stage) if report else nullcontext({}):
             with report.span("selection.validation") if report else nullcontext({}):
                 if stage not in {"windows", "controls"}:
                     raise ValueError("Selection stage must be windows or controls.")
+                if requested_action not in {None, "click", "type_text", "press_key", "read"}:
+                    raise ValueError("Unsupported authored action.")
                 request_text = (
                     original_request.get("original_request")
                     if isinstance(original_request, dict) else original_request
@@ -388,8 +391,9 @@ class ChoiceSelector:
                     raise ValueError("Candidate keys must be unique within a selection.")
             rounds: list[dict[str, Any]] = []
             settling_ms = None
-            action = None
-            include_settling = stage == "controls" and settling_context is not None
+            action = requested_action
+            include_settling = stage == "controls" and settling_context is not None and requested_action != "read"
+            possible_actions = (requested_action,) if requested_action else ("click", "type_text")
             while current and (len(current) > 1 or stage == "controls"):
                 round_number = len(rounds) + 1
                 round_id = f"{stage}_r{round_number}"
@@ -406,17 +410,18 @@ class ChoiceSelector:
                         timing_keys = {}
                         if final_round and stage == "controls":
                             for candidate_index, candidate in enumerate(current):
-                                key = f"{round_id}_action_{candidate_index}"
-                                action_keys[candidate.key] = key
-                                questions[key] = Choice(
-                                    instructions={
-                                        "question": ACTION,
-                                        "candidate": {candidate.key: candidate.description},
-                                    },
-                                    criteria={"click": None, "type_text": None},
-                                )
+                                if requested_action is None:
+                                    key = f"{round_id}_action_{candidate_index}"
+                                    action_keys[candidate.key] = key
+                                    questions[key] = Choice(
+                                        instructions={
+                                            "question": ACTION,
+                                            "candidate": {candidate.key: candidate.description},
+                                        },
+                                        criteria={"click": None, "type_text": None},
+                                    )
                                 if include_settling:
-                                    for possible_action in ("click", "type_text"):
+                                    for possible_action in possible_actions:
                                         key = f"{round_id}_settling_{candidate_index}_{possible_action}"
                                         timing_keys[candidate.key, possible_action] = key
                                         questions[key] = Choice(
@@ -464,7 +469,7 @@ class ChoiceSelector:
                             "round": round_number,
                             "round_id": round_id,
                         }
-                        if final_round and stage == "controls":
+                        if final_round and stage == "controls" and requested_action is None:
                             round_trace["actions"] = {
                                 candidate.key: {
                                     "question_key": action_keys[candidate.key],
@@ -481,7 +486,7 @@ class ChoiceSelector:
                                         "choice": chosen[timing_keys[candidate.key, possible_action]],
                                         "milliseconds": SETTLING_MS[chosen[timing_keys[candidate.key, possible_action]]],
                                     }
-                                    for possible_action in ("click", "type_text")
+                                    for possible_action in possible_actions
                                 }
                                 for candidate in current
                             }

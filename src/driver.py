@@ -104,6 +104,7 @@ class CuaDriver:
         self._claim_lock: Any = None
         self._started = self._closed = self._broken = self._session_started = False
         self._snapshot: dict[str, Any] | None = None
+        self._desktop_observed = False
         self.report = report
 
     def _acquire_claim_lock(self, reference: dict[str, Any] | None = None) -> None:
@@ -320,6 +321,15 @@ class CuaDriver:
         return args
 
     def _validate_target(self, tool: str, args: dict[str, Any]) -> None:
+        if args.get("scope") == "desktop" and tool in {"type_text", "press_key"}:
+            scope = self.tools.get(tool, {}).get("inputSchema", {}).get("properties", {}).get("scope", {})
+            if "desktop" not in scope.get("enum", []):
+                raise DriverError("This Driver does not advertise current-focus desktop input for this action. Supply an explicit target.",
+                                  code="current_focus_unsupported", tool=tool)
+            if not self._desktop_observed or set(args) & {"pid", "window_id", "element_token", "element_index", "snapshot_id", "target", "x", "y"}:
+                raise DriverError("Observe the desktop before sending an authored action to current focus.",
+                                  code="current_focus_observation_required", tool=tool)
+            return
         snapshot = self._snapshot
         if not snapshot or any(args.get(key) != snapshot.get(key) for key in ("pid", "window_id")):
             raise DriverError("Observe and select a fresh window control before acting.", code="stale_element_token", tool=tool)
@@ -427,6 +437,7 @@ class CuaDriver:
         if tool == "get_window_state" or self.tools[tool].get("annotations", {}).get("readOnlyHint") is not True:
             # Invalidate BEFORE dispatch: interrupted input may already land.
             self._snapshot = None
+            self._desktop_observed = False
         try:
             result = await self._rpc("tools/call", {"name": tool, "arguments": args})
             payload = self._payload(tool, result)
@@ -451,6 +462,8 @@ class CuaDriver:
             raise
         if tool == "get_window_state":
             self._snapshot = deepcopy(payload)
+        elif tool == "get_desktop_state":
+            self._desktop_observed = True
         return payload, result
 
     async def call(self, tool: str, arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:

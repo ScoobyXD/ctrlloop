@@ -6,6 +6,8 @@ The loop connects to an existing Fleet claim. It does not provision, renew, rele
 
 The **[CTRL] Loop website** adds company accounts, email verification and personal email/password login, company administration, PostgreSQL persistence, an assigned per-user VM, real `gpt-6-luna` instruction generation, and the existing `jev-1.13.0` executor. Each account belongs to one company; platform devadmins can explicitly administer other companies after a verified-account operator grant. See [company accounts, migration, email configuration and VM assignment](docs/company-accounts.md), and [MVP APIs and runtime behavior](docs/mvp.md). This source change is local; it does not establish what is deployed or migrate live data.
 
+The browser app also has a [manual action workbench](docs/workbench.md): author and reorder click, exact-text typing, key press, and text-read steps; execute one step or a sequence; pause or stop at a step boundary; inspect each step's existing Jev and native evidence. Open **Action workbench** in the sidebar. Manual sequences use the existing loop/run APIs and do not call the instruction-generation model.
+
 ## Run
 
 Use Python 3.11–3.13 and `uv` from this repository:

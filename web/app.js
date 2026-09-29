@@ -1,5 +1,7 @@
+import { createWorkbench } from './workbench.js';
+
 const $ = (id) => document.getElementById(id);
-const activeStatuses = new Set(["queued", "pending", "delivering", "delivered", "acknowledged", "running", "processing", "selecting", "executing", "verifying"]);
+const activeStatuses = new Set(["queued", "pending", "delivering", "delivered", "acknowledged", "running", "paused", "processing", "selecting", "executing", "verifying"]);
 const errorStatuses = new Set(["error", "failed", "blocked", "unverified", "rejected", "cancelled", "canceled", "expired", "interrupted"]);
 const stageLabels = {
   user_request: "User request", request: "User request", llm_generation: "LLM generation",
@@ -16,6 +18,14 @@ const state = { session: null, sessionGeneration: 0, signingOut: false, loops: [
 Object.assign(state, { view: "home", controlUnconfirmed: false, switchingCompany: false, members: [], savingMember: false, savingCompany: false, authBusy: false, authView: "login", resetToken: null, companies: [], companyContext: null, userContext: null });
 const emptyDetail = $("loop-detail").innerHTML;
 let viewerModule;
+const workbench = createWorkbench($('workbench'), {
+  api, session: () => state.session, scopedURL,
+  onSaved: detail => {
+    state.detail = detail; state.selectedId = detail.id; state.view = 'loop';
+    renderNavigation();
+  },
+  onRefresh: async id => { await Promise.all([loadDetail(id), loadLoops(), loadSession()]); },
+});
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
@@ -30,7 +40,7 @@ function statusClass(status) { return errorStatuses.has(status) ? "error" : acti
 function badge(status) { return `<span class="badge ${statusClass(status)}">${escapeHtml(humanize(status))}</span>`; }
 function getRuns() { return Array.isArray(state.detail?.runs) ? state.detail.runs : []; }
 function hasActiveRun() { return Boolean(state.session?.worker?.active_run || state.session?.worker?.queued_run) || getRuns().some((run) => run.worker_id === state.session?.worker?.id && activeStatuses.has(run.status)); }
-function desktopIsVisible() { return ["loop", "desktop"].includes(state.view); }
+function desktopIsVisible() { return ["loop", "desktop", "workbench"].includes(state.view); }
 function autoStartPending() { return getRuns().some(run => run.status === "queued" && run.worker_id === state.session?.worker?.id); }
 function personName(person) { return person?.display_name || person?.email || "Earlier company member"; }
 function canManageCompany() { return state.session?.user?.is_devadmin === true || state.session?.company?.role === "company_admin"; }
@@ -47,6 +57,7 @@ function scopedURL(path) {
   return url.pathname + url.search;
 }
 function resetCompanyView() {
+  workbench.reset();
   disconnectViewer(); state.loops = []; state.detail = null; state.selectedId = null; state.members = [];
   state.creating = false; state.running = false; state.changingMode = false; state.savingMember = false; state.savingCompany = false; $("save-company").disabled = false; state.viewerFailure = "";
   $("create-loop").disabled = state.switchingCompany; $("create-loop").innerHTML = 'Start CtrlLoop <span aria-hidden="true">↗</span>'; $("prompt").disabled = false;
@@ -190,21 +201,29 @@ function renderControl() {
   const hint = $("run-control-hint");
   if (hint) { hint.textContent = human ? canControl ? "Return control to the agent to run this instruction." : "Your other session must return desktop control before a run can start." : !state.session?.worker?.id ? "Desktop provisioning pending. You can run this CtrlLoop once a desktop is assigned to you." : state.session?.worker?.status !== "online" ? "Waiting for your assigned worker to come online." : state.detail?.status === "generating" ? autoStartPending() ? "Preparing the instruction. Execution will start automatically." : "Preparing the saved instruction. No execution is currently queued." : "Watch this run on the live desktop beside the instruction. Recorded steps appear below."; }
   if (hint && maintenance) hint.textContent = "Worker deployment in progress. Run and control access will resume when deployment completes.";
+  if (state.view === 'workbench' || state.detail?.steps) workbench.render();
 }
 
 
 function renderNavigation(writeHistory = true) {
   $("home-view").hidden = state.view !== "home";
-  $("loop-view").hidden = !["loop", "desktop"].includes(state.view);
+  $("loop-view").hidden = !["loop", "desktop", "workbench"].includes(state.view);
   $("loop-workspace").classList.toggle("desktop-only", state.view === "desktop");
-  $("loop-progress").hidden = state.view !== "loop";
+  $("loop-progress").hidden = state.view !== "loop" || Boolean(state.detail?.steps);
   $("company-view").hidden = state.view !== "company";
   $("home-nav").classList.toggle("selected", state.view === "home");
   $("home-nav").toggleAttribute("aria-current", state.view === "home");
   if (state.view === "home") $("home-nav").setAttribute("aria-current", "page");
   $("company-nav").classList.toggle("selected", state.view === "company");
-  $("breadcrumb-page").textContent = state.view === "loop" ? "CtrlLoop" : state.view === "desktop" ? "Desktop" : state.view === "company" ? "People & access" : "Home";
-  $("activity-view").hidden = state.view !== "loop";
+  const manual = state.view === 'workbench' || (state.view === 'loop' && Boolean(state.detail?.steps));
+  $('workbench-nav').classList.toggle('selected', manual);
+  $('workbench-nav').toggleAttribute('aria-current', manual);
+  if (manual) $('workbench-nav').setAttribute('aria-current', 'page');
+  $('workbench').hidden = !manual;
+  $('loop-detail').hidden = manual;
+  $('loop-workspace').classList.toggle('workbench-layout', manual);
+  $("breadcrumb-page").textContent = manual ? 'Action workbench' : state.view === "loop" ? "CtrlLoop" : state.view === "desktop" ? "Desktop" : state.view === "company" ? "People & access" : "Home";
+  $("activity-view").hidden = !['loop','workbench'].includes(state.view);
   const desktopVisible = desktopIsVisible();
   if (!desktopVisible) {
     setExpandedDesktop(false);
@@ -213,26 +232,37 @@ function renderNavigation(writeHistory = true) {
   if (!desktopVisible && (state.viewerWanted || state.rfb || state.viewerConnecting)) disconnectViewer();
   if (desktopVisible && state.session?.worker?.id && !state.viewerWanted && !state.signingOut) void connectViewer({ manual: true });
   if (writeHistory) {
-    const route = state.view === "loop" && state.selectedId ? `#loop/${encodeURIComponent(state.selectedId)}` : state.view === "desktop" ? "#desktop" : state.view === "company" ? "#company" : "#home";
+    const route = state.view === "loop" && state.selectedId ? `#loop/${encodeURIComponent(state.selectedId)}` : state.view === 'workbench' ? '#workbench' : state.view === "desktop" ? "#desktop" : state.view === "company" ? "#company" : "#home";
     if (location.hash !== route) history.pushState(null, "", route);
   }
   setSidebarOpen(false);
 }
 function showHome({ focus = false, fromHistory = false } = {}) {
+  workbench.deactivate();
   state.view = "home"; state.selectedId = null; state.detail = null; state.lastDetailSignature = "";
   renderNavigation(!fromHistory); renderLoops(); renderControl();
   if (focus) { $("prompt").focus(); $("compose-panel").scrollIntoView({ behavior: "smooth", block: "center" }); }
 }
 function showDesktop(fromHistory = false) {
+  workbench.deactivate();
   state.view = "desktop"; state.selectedId = null; state.detail = null;
   $("loop-title").textContent = state.session?.user?.is_devadmin ? $("desktop-owner").textContent : "Your desktop"; $("loop-reference").textContent = "COMPANY / DESKTOP";
   $("loop-heading-status").replaceChildren(); renderNavigation(!fromHistory); renderLoops(); renderControl();
 }
+function showWorkbench(fromHistory = false) {
+  state.view = 'workbench'; state.selectedId = null; state.detail = null;
+  $('loop-title').textContent = 'One step at a time.';
+  $('loop-reference').textContent = 'MANUAL SEQUENCE';
+  $('loop-heading-status').replaceChildren();
+  workbench.open(); renderNavigation(!fromHistory); renderLoops(); renderControl();
+}
 async function openRoute() {
+  if (location.hash === '#workbench') { showWorkbench(true); return; }
   if (location.hash === "#desktop") { showDesktop(true); return; }
   const route = location.hash.match(/^#loop\/([^/]+)(\/desktop)?$/);
   if (route) { await selectLoop(decodeURIComponent(route[1]), { fromHistory: true }); return; }
   if (location.hash === "#company" && canManageCompany()) {
+    workbench.deactivate();
     state.view = "company"; state.selectedId = null; renderNavigation(false); renderLoops(); $("member-management").open = true; return;
   }
   showHome({ fromHistory: true });
@@ -263,6 +293,7 @@ function renderLoops() {
   $("loop-list").innerHTML = state.loops.map(loop => `<button class="loop-list-item ${String(loop.id) === String(state.selectedId) ? "selected" : ""}" data-loop-id="${escapeHtml(loop.id)}" ${String(loop.id) === String(state.selectedId) ? 'aria-current="page"' : ""}><span class="loop-icon" aria-hidden="true">↳</span><span class="list-title">${escapeHtml(loop.prompt || "Untitled CtrlLoop")}</span><span class="list-item-meta"><i class="status-dot ${errorStatuses.has(loop.status) ? "error" : loop.status === "generating" ? "warn" : ""}"></i>${escapeHtml(humanize(loop.status))}<time title="${escapeHtml(formatDate(loop.created_at))}">${escapeHtml(validDate(loop.created_at)?.toLocaleDateString(undefined, { month: "short", day: "numeric" }) || "—")}</time></span></button>`).join("");
 }
 async function selectLoop(id, { fromHistory = false } = {}) {
+  if (state.selectedId !== id) workbench.deactivate();
   state.selectedId = id; state.detail = null; state.view = "loop"; state.lastDetailSignature = "";
   $("loop-progress").replaceChildren();
   $("loop-title").textContent = state.loops.find(loop => String(loop.id) === String(id))?.prompt || "Loading CtrlLoop…";
@@ -297,6 +328,12 @@ function renderRun(run, index, total) {
 function renderDetail() {
   if (!state.detail) return;
   const loop = state.detail;
+  if (Array.isArray(loop.steps)) {
+    $('loop-title').textContent = loop.prompt;
+    $('loop-reference').textContent = 'MANUAL SEQUENCE';
+    $('loop-heading-status').replaceChildren();
+    workbench.update(loop); renderNavigation(false); return;
+  }
   const signature = JSON.stringify(loop);
   if (signature === state.lastDetailSignature) return;
   state.lastDetailSignature = signature;
@@ -680,10 +717,12 @@ $("loop-detail").addEventListener("click", async (event) => {
   finally { if (generation === state.sessionGeneration) { state.running = false; renderControl(); } }
 });
 $("home-desktop").addEventListener("click", () => { if (!state.creating) showDesktop(); });
+$('workbench-nav').addEventListener('click', () => { if (!state.creating) showWorkbench(); });
 $("new-loop").addEventListener("click", () => { if (!state.creating) showHome({ focus: true }); });
 $("home-nav").addEventListener("click", () => { if (!state.creating) showHome(); });
 $("company-nav").addEventListener("click", () => {
   if (!canManageCompany() || state.creating) return;
+  workbench.deactivate();
   state.view = "company"; state.selectedId = null; renderNavigation(); renderLoops(); $("member-management").open = true;
 });
 const mobileNavigation = matchMedia("(max-width: 600px)");

@@ -11,6 +11,9 @@ from uuid import UUID, uuid4
 import httpx2
 from .reporting import RunReport, package_report
 from .worker import execute_instruction
+from .actions import action_instruction
+from .driver import CuaDriver
+from .selection import PINNED_MODEL
 
 
 class WorkerAssignmentError(RuntimeError):
@@ -215,7 +218,7 @@ async def main():
                         await send('/api/worker/recover', {})
                         recovery_needed = False
                     try:
-                        payload = await send('/api/worker/poll', {'revision': revision})
+                        payload = await send('/api/worker/poll', {'revision': revision, 'capabilities': ['manual_actions_v1']})
                     except Exception:
                         # A lost poll response may have committed delivery in the DB.
                         recovery_needed = True
@@ -255,10 +258,134 @@ async def main():
                         delivery_record(pending, 'event_queued', body=body)
                         await flush_events(pending)
 
+                    async def execute_steps():
+                        """One server grant and one durable completion per authored step."""
+                        expected_step = int(run.get('next_step', 0))
+                        results = []
+                        final = {'status': 'interrupted', 'steps': results, 'run_id': identity,
+                                 'completion': {'verified': False, 'source': 'authored_sequence'}}
+                        driver = None
+                        prior_control = None
+                        report.append('run_started', run_id=identity, request=run['instruction'],
+                                      backend='cua_driver', worker='local_omarchy', jev_model=PINNED_MODEL,
+                                      mode='manual_actions', steps=run['steps'])
+
+                        async def emit_trace(step_id, step_index):
+                            records = report.snapshot_events(step_id=step_id)
+                            chunk, size, chunk_index = [], 0, 0
+                            for record in records:
+                                encoded_size = len(json.dumps(record, ensure_ascii=False).encode('utf-8'))
+                                if encoded_size > 900_000:
+                                    record = {key: record[key] for key in ('timestamp', 'elapsed_ms', 'step_id', 'step_index', 'iteration') if key in record} | {
+                                        'event': 'capture_gap', 'original_event': record.get('event'),
+                                        'reason': 'This record exceeds the live inspector limit; its full contents remain in the final evidence archive.',
+                                        'original_bytes': encoded_size,
+                                    }
+                                    encoded_size = len(json.dumps(record).encode('utf-8'))
+                                if chunk and size + encoded_size > 900_000:
+                                    await emit({'stage': 'step_trace', 'message': 'Captured step evidence',
+                                                'step_id': step_id, 'step_index': step_index, 'chunk_index': chunk_index,
+                                                'events': chunk})
+                                    chunk, size, chunk_index = [], 0, chunk_index + 1
+                                chunk.append(record)
+                                size += encoded_size
+                            if chunk:
+                                await emit({'stage': 'step_trace', 'message': 'Captured step evidence',
+                                            'step_id': step_id, 'step_index': step_index, 'chunk_index': chunk_index,
+                                            'events': chunk})
+                        try:
+                            driver = CuaDriver(local_endpoint=os.environ.get('CUA_LOCAL_MCP_URL', 'http://127.0.0.1:3000/mcp'),
+                                               local_token=os.environ.get('CUA_LOCAL_MCP_TOKEN'), report=report)
+                            with report.span('driver_initialization'):
+                                await driver.start()
+                            report.append('driver_connected', **driver.session_info)
+                            while True:
+                                # A lost response ends this execution. Retrying a grant
+                                # could replay an action that was already authorized.
+                                boundary = await send('/api/worker/poll', {
+                                    'revision': revision, 'run_id': identity, 'expected_step': expected_step,
+                                })
+                                control = boundary.get('control')
+                                if control == 'pause':
+                                    await asyncio.sleep(1)
+                                    continue
+                                if control == 'stop':
+                                    final.update(error='Stopped at an authored step boundary; completed actions were not replayed.',
+                                                 code='sequence_stopped')
+                                    break
+                                if control == 'complete':
+                                    final.update(status='succeeded')
+                                    break
+                                step = boundary.get('step')
+                                step_index = boundary.get('step_index')
+                                if control != 'run' or not isinstance(step, dict) or step_index != expected_step:
+                                    raise WorkerAssignmentError('Invalid authored-step delivery; no command was sent')
+                                step_id = step['id']
+                                pending['active_step'] = {'step_id': step_id, 'step_index': step_index,
+                                                          'state': 'granted_not_replayable'}
+                                write_journal(pending)
+                                started = perf_counter_ns()
+                                started_at = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+                                with report.span('workbench.step', step_id=step_id, step_index=step_index):
+                                    report.append('step_started', step_id=step_id, step_index=step_index,
+                                                  action=step['action'])
+                                    await emit({'stage': 'step_started', 'message': f'Executing step {step_index + 1}',
+                                                'step_id': step_id, 'step_index': step_index, 'action': step['action']})
+                                    step_result = await execute_instruction(
+                                        action_instruction(step['action']), emit, run_id=identity, report=report,
+                                        action=step['action'], step_id=step_id, step_index=step_index, finalize_report=False,
+                                        driver=driver, prior_control=prior_control,
+                                    )
+                                    succeeded = step_result.get('status') == 'succeeded'
+                                    prior_control = step_result.get('pipeline', {}).get('last_control', prior_control)
+                                    finished_at = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+                                    completed = {'step_id': step_id, 'step_index': step_index,
+                                                 'status': 'succeeded' if succeeded else 'error', 'result': step_result,
+                                                 'error': step_result.get('error'),
+                                                 'started_at': started_at, 'finished_at': finished_at,
+                                                 'duration_ms': (perf_counter_ns() - started) / 1_000_000}
+                                    results.append(completed)
+                                    report.append('step_finished', **completed)
+                                    pending['active_step']['state'] = 'completed'
+                                    pending['active_step']['result'] = step_result
+                                    write_journal(pending)
+                                await emit_trace(step_id, step_index)
+                                await emit({'stage': 'step_finished',
+                                            'message': f'Step {step_index + 1} ' + (
+                                                'sent (application effect unverified)' if succeeded and
+                                                step_result.get('pipeline', {}).get('action_result', {}).get('effect') == 'unverifiable'
+                                                else 'completed' if succeeded else 'stopped'),
+                                            **completed})
+                                if not succeeded:
+                                    final.update(status=step_result.get('status', 'error'),
+                                                 error=step_result.get('error', 'The authored action could not be confirmed.'),
+                                                 code=step_result.get('code', 'step_failed'))
+                                    break
+                                expected_step += 1
+                        except BaseException as error:
+                            final.update(status='interrupted' if isinstance(error, asyncio.CancelledError) else 'error',
+                                         error='The sequence stopped; no authored action was retried.',
+                                         code='sequence_interrupted', error_type=type(error).__name__)
+                            raise
+                        finally:
+                            if driver is not None:
+                                try:
+                                    with report.span('driver_cleanup'):
+                                        await driver.close()
+                                except Exception as error:
+                                    final['cleanup_error'] = getattr(error, 'code', type(error).__name__)
+                                    report.append('driver_cleanup_error', code=final['cleanup_error'])
+                            report.append('run_finished', result=final)
+                            final['report_path'] = str(report.path)
+                            final['report_directory'] = str(report.requests_path)
+                            final['timing'] = await asyncio.to_thread(report.close)
+                        return final
+
                     try:
                         await emit({'stage': 'delivery_acknowledged', 'message': 'VM received and journaled the persisted instruction',
                                     'instruction': run['instruction'], 'revision': revision})
-                        result = await execute_instruction(run['instruction'], emit, run_id=identity, report=report)
+                        result = (await execute_steps() if run.get('steps') else
+                                  await execute_instruction(run['instruction'], emit, run_id=identity, report=report))
                         status = 'succeeded' if result.get('verified') is True else result.get('status', 'error')
                         if status not in {'succeeded', 'blocked', 'unverified', 'interrupted', 'error'}:
                             status = 'unverified'

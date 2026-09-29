@@ -66,6 +66,7 @@
       <a class="brand sidebar-brand" href="#home" aria-label="CtrlLoop home"><span class="brand-symbol">[↳]</span>ctrl<span>loop</span><i></i></a>
       <div class="company-context"><span class="technical-label">COMPANY</span><strong id="company-name">Loading…</strong></div>
       <button id="new-loop" class="new-loop"><span aria-hidden="true">＋</span> New CtrlLoop <kbd>N</kbd></button>
+      <button id="workbench-nav" class="nav-item"><span aria-hidden="true">↦</span> Action workbench</button>
       <button id="home-nav" class="nav-item selected" aria-current="page"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m3 9 7-6 7 6v8h-5v-5H8v5H3Z"/></svg>Home<span class="nav-arrow" aria-hidden="true">↗</span></button>
       <div class="sidebar-section-label"><h2>CTRLLOOPS</h2><span id="loop-count">0</span></div>
       <div id="loop-list" class="loop-list"><p class="list-empty">Loading CtrlLoops…</p></div>
@@ -93,7 +94,7 @@
           <div class="loop-page-heading"><div><div class="eyebrow" id="loop-reference">CTRLLOOP</div><h1 id="loop-title">Loading CtrlLoop…</h1></div><div id="loop-heading-status"></div></div>
           <div id="loop-progress"></div>
           <div id="loop-workspace" class="loop-workspace">
-          <section id="activity-view" aria-label="Request and execution activity"><div id="loop-detail" class="detail-panel"><p class="loading-message">Loading CtrlLoop…</p></div></section>
+          <section id="activity-view" aria-label="Request and execution activity"><div id="workbench" hidden></div><div id="loop-detail" class="detail-panel"><p class="loading-message">Loading CtrlLoop…</p></div></section>
           <section id="desktop-view" aria-label="Live desktop">
             <section id="desktop-panel" class="panel desktop-panel">
               <div class="panel-heading desktop-heading"><h2>Your live desktop</h2><div class="viewer-tools"><span id="viewer-state" class="viewer-status"><i class="status-dot"></i>Disconnected</span><button id="fullscreen" class="icon-button" title="Enter fullscreen" aria-label="Enter fullscreen"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button></div></div>
