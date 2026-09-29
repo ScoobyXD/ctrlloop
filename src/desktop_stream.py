@@ -25,7 +25,8 @@ from .desktop_gateway import RFBInputFilter
 
 PROTOCOL = 'ctrlloop-direct-v1'
 INPUT_SECONDS = 2
-CHECK_SECONDS = 10
+CHECK_SECONDS = 5
+POLICY_CHECK_SECONDS = 7
 IDENTITY_KEYS = ('worker_id', 'company_id', 'assigned_user_id', 'environment')
 logger = logging.getLogger('ctrlloop.desktop')
 # Library tracebacks / DEBUG frame logs can contain the credential-bearing
@@ -360,10 +361,11 @@ class _Viewer:
                 async def watchdog():
                     while True:
                         await asyncio.sleep(CHECK_SECONDS)
-                        # 10-second interval plus a 2-second TOTAL exchange
-                        # budget, including lock contention, bounds revocation
-                        # detection to 12 seconds even during continuous input.
-                        async with asyncio.timeout(INPUT_SECONDS):
+                        # Check more often while allowing ordinary API latency.
+                        # The 5-second interval plus a 7-second TOTAL exchange
+                        # budget still bounds revocation detection to 12 seconds.
+                        # Input grants retain their separate 2-second deadline.
+                        async with asyncio.timeout(POLICY_CHECK_SECONDS):
                             async with policy_lock:
                                 await policy.send(_json({'op': 'check'}))
                                 permission = await receive_policy()

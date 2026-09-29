@@ -18,7 +18,7 @@ The 120-second expiry limits **new connection admission**. Fleet expiry or revoc
 
 The shared RFB parser separates viewing traffic from keyboard, pointer, and clipboard input. Each input batch requires current human ownership for that session and no active agent run. The backend retains the existing ownership locks until the guest acknowledges the batch. The guest's shorter input deadline and shared worker action lock prevent a delayed grant from overlapping agent execution. The gate tracks forwarded key/button presses and explicitly sends their release events during teardown and before worker input starts; closing a socket alone does not establish that input was released. Browser `viewOnly` remains a UI setting; the guest enforces permission independently.
 
-The guest checks ongoing view access every 10 seconds with a bounded exchange and closes established streams on logout, revoked access, company/context changes, or reassignment. Detection plus teardown is bounded to 15 seconds under a functioning guest event loop. A failed policy/API connection closes the stream and refuses further input. These checks, rather than URL expiry alone, enforce revocation.
+The guest checks ongoing view access every 5 seconds with a 7-second total exchange deadline and closes established streams on logout, revoked access, company/context changes, or reassignment. Detection plus teardown is bounded to 15 seconds under a functioning guest event loop. Input authorization retains its separate 2-second deadline. A failed policy/API connection closes the stream and refuses further input. These checks, rather than URL expiry alone, enforce revocation.
 
 ## Rollout and recovery
 

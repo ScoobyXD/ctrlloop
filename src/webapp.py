@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 import zipfile
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import httpx2
@@ -934,7 +935,9 @@ async def loop_detail(identity: UUID, request: Request):
         row['runs'] = [public_run(run) for run in row['runs']]
         for run in row['runs']:
             run['events'] = await (await db.execute("SELECT * FROM events WHERE company_id=%s AND run_id=%s AND stage<>'step_trace' ORDER BY created_at",(principal['company_id'],run['id']))).fetchall()
-        return row
+    # Large run histories must not stall desktop policy replies. Release the
+    # database transaction before encoding the same response in a worker thread.
+    return await asyncio.to_thread(lambda: JSONResponse(content=jsonable_encoder(row)))
 
 
 @app.post('/api/loops/{identity}/runs')
