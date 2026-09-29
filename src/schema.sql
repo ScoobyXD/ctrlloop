@@ -99,6 +99,10 @@ ALTER TABLE loops ADD COLUMN IF NOT EXISTS version integer NOT NULL DEFAULT 0;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS steps jsonb;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS request_id uuid;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS next_step integer NOT NULL DEFAULT 0;
+-- Execution bounds retain the full authored snapshot and its original indices.
+-- A NULL end_step on an older run means the end of its saved steps.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS start_step integer NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS end_step integer;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS step_in_flight integer;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS step_started_at timestamptz;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS step_results jsonb NOT NULL DEFAULT '[]';

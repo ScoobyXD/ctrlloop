@@ -3,8 +3,8 @@
 from typing import Any
 
 
-def normalize_action(action: Any) -> dict[str, str]:
-    """Validate one explicit action; never infer a tool or generated text."""
+def normalize_action(action: Any, *, allow_incomplete: bool = False) -> dict[str, str]:
+    """Validate one action; drafts may omit required content until execution."""
     if not isinstance(action, dict) or set(action) - {"tool", "target", "text", "key"}:
         raise ValueError("An action must contain only tool, target, text, and key fields.")
     tool = action.get("tool")
@@ -17,17 +17,17 @@ def normalize_action(action: Any) -> dict[str, str]:
             raise ValueError("The target must contain at most 2000 characters.")
         if target.strip():
             normalized["target"] = target.strip()
-    if tool in {"click", "read"} and "target" not in normalized:
+    if not allow_incomplete and tool in {"click", "read"} and "target" not in normalized:
         raise ValueError("Click and read actions need a target description.")
     for field, limit in (("text", 20000), ("key", 100)):
         value = action.get(field)
         if value is not None:
-            if not isinstance(value, str) or not 1 <= len(value) <= limit:
+            if not isinstance(value, str) or not (0 if allow_incomplete else 1) <= len(value) <= limit:
                 raise ValueError(f"{field.capitalize()} must contain 1–{limit} characters.")
             normalized[field] = value
-    if tool == "type_text" and "text" not in normalized:
+    if not allow_incomplete and tool == "type_text" and "text" not in normalized:
         raise ValueError("Type actions need the exact text to send.")
-    if tool == "press_key" and ("key" not in normalized or not normalized["key"].strip()):
+    if not allow_incomplete and tool == "press_key" and ("key" not in normalized or not normalized["key"].strip()):
         raise ValueError("Press key actions need a key such as Enter or Tab.")
     if "text" in normalized and tool != "type_text":
         raise ValueError("Only type_text actions accept text.")

@@ -74,14 +74,17 @@
     </aside>
 
     <div class="main-shell">
-      <header class="app-header"><button id="toggle-sidebar" class="icon-button mobile-menu" aria-label="Toggle navigation" aria-expanded="false"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14"/></svg></button><div class="breadcrumb"><span id="breadcrumb-company">Company</span><span aria-hidden="true">/</span><strong id="breadcrumb-page">Home</strong></div><div class="header-end"><span id="connection-state" class="connection-state"><i class="status-dot"></i>Connecting</span><time id="system-clock" class="system-clock"></time></div></header>
+      <header class="app-header">
+        <button id="toggle-sidebar" class="icon-button mobile-menu" aria-label="Toggle navigation" aria-expanded="false"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14"/></svg></button>
+        <div class="breadcrumb"><span id="breadcrumb-company">Company</span><span aria-hidden="true">/</span><strong id="breadcrumb-page">Home</strong></div>
+        <section id="admin-context" class="admin-context" hidden aria-label="Company and desktop">
+          <div class="admin-context-fields"><div><label class="sr-only" for="admin-company">Company</label><select id="admin-company" title="Company"></select></div><div><label class="sr-only" for="admin-user">Person / assigned desktop</label><select id="admin-user" title="Person / assigned desktop"><option value="">Choose a person</option></select></div><button id="admin-home" class="button quiet small" type="button" title="Return to my company and desktop">My desktop ↗</button></div>
+        </section>
+        <div class="header-end"><span id="connection-state" class="connection-state"><i class="status-dot"></i>Connecting</span><time id="system-clock" class="system-clock"></time></div>
+      </header>
       <main id="main-content" class="main-content" tabindex="-1">
         <div id="page-notice" class="notice" role="status" hidden><span id="page-notice-text"></span><button id="dismiss-notice" aria-label="Dismiss notification">×</button></div>
-        <section id="admin-context" class="panel admin-context" hidden aria-label="Platform administration context">
-            <div><strong>Devadmin · all companies</strong><p id="admin-context-summary">Choose a company and a person to access their assigned desktop.</p></div>
-            <div class="admin-context-fields"><div><label for="admin-company">Company</label><select id="admin-company"></select></div><div><label for="admin-user">Person / assigned desktop</label><select id="admin-user"><option value="">Choose a person</option></select></div><button id="admin-home" class="button secondary small" type="button">My company &amp; desktop</button></div>
-          </section>
-                  <section id="home-view" class="home-view" aria-label="Home">
+        <section id="home-view" class="home-view" aria-label="Home">
           <div class="home-hero"><div class="hero-copy"><div class="eyebrow"><span class="crosshair" aria-hidden="true">＋</span> THE NEXT MOVE IS YOURS</div><h1>Intent.<br>Into <span>action.</span></h1><p>Give your desktop a direction.<br>Follow every step from here.</p></div>
             <div class="loop-schematic" aria-hidden="true"><svg viewBox="0 0 360 330"><defs><pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse"><path d="M30 0H0V30" fill="none" stroke="#242424" stroke-width=".6"/></pattern></defs><rect width="360" height="330" fill="url(#grid)"/><g fill="none" stroke="#505050" stroke-width=".8"><path d="M0 165h360M180 0v330"/><circle cx="180" cy="165" r="120"/><circle cx="180" cy="165" r="83" stroke-dasharray="3 6"/><circle cx="180" cy="165" r="43"/><path d="M54 39l252 252M54 291 306 39" stroke="#292929"/></g><g fill="none" stroke="#ff641a"><path d="M180 45a120 120 0 0 1 104 180" stroke-width="2"/><path d="m280 215 4 10 10-5" stroke-width="2"/><circle cx="180" cy="45" r="4" fill="#ff641a"/><path d="M165 149h-8v32h8m30-32h8v32h-8m-23-16h17" stroke-width="3"/></g><g fill="#a4a4a4" font-family="monospace" font-size="10"><text x="193" y="20">01 / OBSERVE</text><text x="230" y="284">02 / DECIDE</text><text x="4" y="178">03 / ACT</text><text x="286" y="319">↺ REPEAT</text></g><g stroke="#ababab"><path d="M1 13V1h12m334 0h12v12M1 317v12h12m334 0h12v-12"/></g></svg><span class="schematic-caption">THE CONTROL LOOP</span></div>
           </div>
@@ -91,19 +94,23 @@
         </section>
 
         <section id="loop-view" class="loop-view" hidden aria-label="Selected CtrlLoop">
-          <div class="loop-page-heading"><div><div class="eyebrow" id="loop-reference">CTRLLOOP</div><h1 id="loop-title">Loading CtrlLoop…</h1></div><div id="loop-heading-status"></div></div>
+          <div id="loop-page-heading" class="loop-page-heading"><div><div class="eyebrow" id="loop-reference">CTRLLOOP</div><h1 id="loop-title">Loading CtrlLoop…</h1></div><div id="loop-heading-status"></div></div>
           <div id="loop-progress"></div>
           <div id="loop-workspace" class="loop-workspace">
           <section id="activity-view" aria-label="Request and execution activity"><div id="workbench" hidden></div><div id="loop-detail" class="detail-panel"><p class="loading-message">Loading CtrlLoop…</p></div></section>
           <section id="desktop-view" aria-label="Live desktop">
             <section id="desktop-panel" class="panel desktop-panel">
-              <div class="panel-heading desktop-heading"><h2>Your live desktop</h2><div class="viewer-tools"><span id="viewer-state" class="viewer-status"><i class="status-dot"></i>Disconnected</span><button id="fullscreen" class="icon-button" title="Enter fullscreen" aria-label="Enter fullscreen"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button></div></div>
-              <div class="desktop-toolbar"><div class="desktop-identity"><span class="desktop-icon" aria-hidden="true">▣</span><div><strong id="desktop-owner">Your Omarchy desktop</strong><span id="worker-identity">Waiting for assigned worker</span></div></div></div>
+              <div class="panel-heading desktop-heading">
+                <div class="desktop-identity"><h2>Live desktop</h2><span id="desktop-owner">Your Omarchy desktop</span></div>
+                <div class="viewer-tools">
+                  <button id="toggle-control" class="button secondary small control-mode" type="button" aria-describedby="control-mode-description" aria-pressed="false"><span id="control-mode-icon" aria-hidden="true">◉</span><span id="control-mode-label">View only</span></button>
+                  <span id="control-mode-description" class="sr-only">Click the desktop to take control.</span>
+                  <details id="connection-details" class="system-details"><summary>Connection details</summary><dl><div><dt>Company</dt><dd id="desktop-company">—</dd></div><div><dt>Assigned worker</dt><dd id="worker-detail-id">—</dd></div><div><dt>Instruction model</dt><dd id="model-detail-id">—</dd></div><div><dt>Selection model</dt><dd id="jev-detail-id">—</dd></div><div><dt>Connection</dt><dd>Authenticated noVNC viewer</dd></div></dl></details>
+                  <span id="viewer-state" class="viewer-status"><i class="status-dot"></i>Disconnected</span><button id="fullscreen" class="icon-button" title="Enter fullscreen" aria-label="Enter fullscreen"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button>
+                </div>
+              </div>
               <div class="desktop-display"><div id="desktop-canvas" class="desktop-canvas" aria-label="Remote desktop screen"></div><button id="desktop-takeover" class="desktop-takeover" aria-label="Click desktop to take control" aria-describedby="control-mode-description" hidden></button><div id="viewer-placeholder" class="viewer-placeholder"><div class="monitor-symbol" aria-hidden="true">[↳]</div><h3 id="viewer-placeholder-title">Connecting to your desktop</h3><p id="viewer-placeholder-message">Your live desktop opens automatically alongside the request.</p><button id="reconnect-viewer" class="button secondary small" hidden>Reconnect</button></div></div>
-              <div class="desktop-control-bar"><div class="control-mode"><span id="control-mode-icon" aria-hidden="true">◉</span><div><strong id="control-mode-label">View only</strong><span id="control-mode-description">Click the desktop to take control.</span></div></div><button id="toggle-control" class="button secondary small" hidden>Return to agent ↗</button></div>
             </section>
-            <div class="desktop-meta"><span id="worker-status">Checking worker</span><span id="worker-last-seen"></span></div><p class="desktop-note" id="desktop-scope-note">This is your assigned desktop. Other company members run CtrlLoops on their own desktops.</p>
-            <details class="system-details"><summary>Connection details</summary><dl><div><dt>Assigned worker</dt><dd id="worker-detail-id">—</dd></div><div><dt>Instruction model</dt><dd id="model-detail-id">—</dd></div><div><dt>Selection model</dt><dd id="jev-detail-id">—</dd></div><div><dt>Connection</dt><dd>Authenticated noVNC viewer</dd></div></dl></details>
           </section>
           </div>
         </section>

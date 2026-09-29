@@ -273,7 +273,12 @@ def public_run(run):
             if key not in ('request_session_hash', 'dispatch_before', 'loop_status')}
 
 
-async def queue_run(db, loop, principal, *, mode='sequence', request_id=None):
+def run_step_end(run):
+    """Older manual runs execute through the end of their immutable snapshot."""
+    return run['end_step'] if run.get('end_step') is not None else len(run['steps'])
+
+
+async def queue_run(db, loop, principal, *, mode='sequence', start_step=0, request_id=None):
     # Both create-and-start and explicit reruns use the same reservation checks.
     if not principal['target_verified']:
         raise HTTPException(409, 'The selected user must verify their email before running a CtrlLoop')
@@ -283,7 +288,10 @@ async def queue_run(db, loop, principal, *, mode='sequence', request_id=None):
             AND initiated_by=%s AND request_id=%s''',
             (principal['company_id'], acting_user(principal), request_id))).fetchone()
         if previous:
-            if previous['loop_id'] != loop['id']:
+            requested_end = (start_step + 1 if mode == 'single' else len(previous['steps'])) if previous['steps'] is not None else None
+            previous_end = run_step_end(previous) if previous['steps'] is not None else None
+            if (previous['loop_id'] != loop['id'] or previous['start_step'] != start_step
+                    or previous_end != requested_end):
                 raise HTTPException(409, 'This execution request was already used for a different run')
             return public_run(previous)
     await release_expired_control(db, worker['id'])
@@ -296,19 +304,33 @@ async def queue_run(db, loop, principal, *, mode='sequence', request_id=None):
     if active or worker['active_run']: raise HTTPException(409, 'The desktop already has an active run')
     loop = await (await db.execute('SELECT * FROM loops WHERE id=%s AND company_id=%s FOR UPDATE',
                                   (loop['id'], principal['company_id']))).fetchone()
-    if loop['steps'] is not None and not loop['steps']:
-        raise HTTPException(409, 'Add a step before running this workbench')
+    end_step = None
+    if loop['steps'] is not None:
+        if not loop['steps']: raise HTTPException(409, 'Add a step before running this workbench')
+        if not 0 <= start_step < len(loop['steps']):
+            raise HTTPException(422, 'Choose an existing step as the starting point')
+        end_step = start_step + 1 if mode == 'single' else len(loop['steps'])
+        # Drafts can contain unfinished steps. Only executable actions in the
+        # requested range cross the worker boundary; other rows stay as evidence.
+        for index in range(start_step, end_step):
+            try: normalize_action(loop['steps'][index]['action'])
+            except ValueError as error:
+                raise HTTPException(422, f'Step {index + 1}: {error}') from error
+    elif start_step != 0 or mode != 'sequence':
+        raise HTTPException(422, 'Step execution requires a manual workbench')
     run = await (await db.execute("""INSERT INTO runs(id,company_id,loop_id,worker_id,initiated_by,
-        request_session_hash,dispatch_before,steps,run_mode,request_id)
-        VALUES(%s,%s,%s,%s,%s,%s,now()+interval '5 minutes',%s,%s,%s) RETURNING *""",
+        request_session_hash,dispatch_before,steps,run_mode,request_id,start_step,end_step,next_step)
+        VALUES(%s,%s,%s,%s,%s,%s,now()+interval '5 minutes',%s,%s,%s,%s,%s,%s) RETURNING *""",
         (uuid4(),principal['company_id'],loop['id'],worker['id'],acting_user(principal),principal['session_hash'],
-         Jsonb(loop['steps']) if loop['steps'] is not None else None, mode, request_id))).fetchone()
+         Jsonb(loop['steps']) if loop['steps'] is not None else None, mode, request_id,
+         start_step,end_step,start_step))).fetchone()
     run['initiator'] = {'id': acting_user(principal), 'email': principal['target_email'], 'display_name': principal['target_display_name']}
     message = ('Manual sequence queued for its assigned Omarchy worker' if loop['steps'] is not None else
                'Desktop reserved; the instruction will run automatically when ready'
                if loop['status'] == 'generating' else 'Saved instruction queued for its assigned Omarchy worker')
     await event(db, loop['id'], 'delivery_queued', message, run_id=run['id'],
-                data={'actor_user_id': str(principal['user_id'])})
+                data={'actor_user_id': str(principal['user_id']), 'start_step':start_step,
+                      'end_step':end_step, 'mode':mode})
     return public_run(run)
 
 
@@ -404,13 +426,13 @@ class AuthoredStep(BaseModel):
 
 
 def authored_steps(steps):
-    """Only the existing native action representation crosses the worker boundary."""
+    """Persist drafts in the same action representation used for execution."""
     result = []
     seen = set()
     for step in steps:
         if step.id in seen: raise HTTPException(422, 'Every step must have a distinct identity')
         seen.add(step.id)
-        try: action = normalize_action(step.action)
+        try: action = normalize_action(step.action, allow_incomplete=True)
         except ValueError as error: raise HTTPException(422, str(error)) from error
         row = {'id': str(step.id), 'action': action}
         if step.instruction: row['instruction'] = step.instruction.strip()
@@ -433,7 +455,8 @@ class LoopUpdate(BaseModel):
 
 class RunRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    mode: Literal['step', 'sequence'] = 'sequence'
+    mode: Literal['step', 'sequence', 'single'] = 'sequence'
+    start_step: int = Field(default=0, ge=0)
     request_id: UUID | None = None
 
 
@@ -917,6 +940,7 @@ async def create_run(identity: UUID, request: Request, body: RunRequest | None =
         if loop['steps'] is not None and (body is None or body.request_id is None):
             raise HTTPException(422, 'Manual runs require a unique request_id to prevent duplicate execution')
         return await queue_run(db, loop, principal, mode=body.mode if body else 'sequence',
+                               start_step=body.start_step if body else 0,
                                request_id=body.request_id if body else None)
 
 
@@ -942,7 +966,7 @@ async def control_run(identity: UUID, body: RunControl, request: Request):
         if body.command in ('run','step'):
             if run['status'] != 'paused' or run['step_in_flight'] is not None:
                 raise HTTPException(409, 'Wait for the current step to reach a pause boundary')
-            if run['next_step'] >= len(run['steps']): raise HTTPException(409, 'Every step has already executed')
+            if run['next_step'] >= run_step_end(run): raise HTTPException(409, 'Every selected step has already executed')
             run = await (await db.execute('''UPDATE runs SET control='run',status='running',run_mode=%s,
                 control_version=control_version+1 WHERE id=%s RETURNING *''',
                 ('step' if body.command == 'step' else 'sequence',identity))).fetchone()
@@ -971,10 +995,12 @@ async def claim_authored_step(db, worker, body):
         raise HTTPException(409, 'Step cursor changed; execution cannot be replayed')
     if run['step_in_flight'] is not None:
         raise HTTPException(409, 'A step was already dispatched; inspect before starting again')
+    if not run['start_step'] <= run['next_step'] <= run_step_end(run):
+        raise HTTPException(409, 'Step cursor is outside the selected execution range')
     await db.execute('UPDATE workers SET last_seen=now() WHERE id=%s', (worker['id'],))
     reply = {'step':None, 'step_index':run['next_step'], 'next_step':run['next_step']}
     if run['control'] == 'stop': return {**reply, 'control':'stop'}
-    if run['next_step'] == len(run['steps']): return {**reply, 'control':'complete'}
+    if run['next_step'] == run_step_end(run): return {**reply, 'control':'complete'}
     if run['control'] == 'pause':
         if run['status'] != 'paused':
             await db.execute("UPDATE runs SET status='paused',control_version=control_version+1 WHERE id=%s", (run['id'],))
@@ -1145,8 +1171,8 @@ async def worker_event(identity: UUID, body: WorkerEvent, request: Request):
             next_step = index + (1 if status == 'succeeded' else 0)
             control = run['control']
             if status != 'succeeded': control = 'stop'
-            elif control == 'run' and run['run_mode'] == 'step' and next_step < len(run['steps']): control = 'pause'
-            state = 'paused' if control == 'pause' and next_step < len(run['steps']) else 'running'
+            elif control == 'run' and run['run_mode'] == 'step' and next_step < run_step_end(run): control = 'pause'
+            state = 'paused' if control == 'pause' and next_step < run_step_end(run) else 'running'
             await db.execute('''UPDATE runs SET next_step=%s,step_in_flight=NULL,step_started_at=NULL,
                 step_results=%s,control=%s,status=%s,control_version=control_version+1 WHERE id=%s''',
                 (next_step,Jsonb(results),control,state,identity))
@@ -1163,10 +1189,10 @@ async def worker_finish(identity: UUID, body: WorkerResult, request: Request):
         if body.status == 'succeeded':
             if run['steps'] is None:
                 if body.result.get('verified') is not True: raise HTTPException(400,'Explicit task verification evidence is required')
-            elif (run['next_step'] != len(run['steps']) or run['step_in_flight'] is not None
-                  or len(run['step_results']) != len(run['steps'])
+            elif (run['next_step'] != run_step_end(run) or run['step_in_flight'] is not None
+                  or [step['step_index'] for step in run['step_results']] != list(range(run['start_step'], run_step_end(run)))
                   or any(step['status'] != 'succeeded' for step in run['step_results'])):
-                raise HTTPException(409, 'Every authored step must finish successfully before completing the run')
+                raise HTTPException(409, 'Every selected step must finish successfully before completing the run')
         result = {**(run.get('result') or {}), **body.result}
         # Only the authenticated archive endpoint owns durable storage metadata.
         if (run.get('result') or {}).get('artifacts'): result['artifacts'] = run['result']['artifacts']

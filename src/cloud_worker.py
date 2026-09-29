@@ -263,12 +263,15 @@ async def main():
                         expected_step = int(run.get('next_step', 0))
                         results = []
                         final = {'status': 'interrupted', 'steps': results, 'run_id': identity,
+                                 'start_step': run.get('start_step', 0),
+                                 'end_step': run.get('end_step') if run.get('end_step') is not None else len(run['steps']),
                                  'completion': {'verified': False, 'source': 'authored_sequence'}}
                         driver = None
                         prior_control = None
                         report.append('run_started', run_id=identity, request=run['instruction'],
                                       backend='cua_driver', worker='local_omarchy', jev_model=PINNED_MODEL,
-                                      mode='manual_actions', steps=run['steps'])
+                                      mode='manual_actions', steps=run['steps'],
+                                      start_step=final['start_step'], end_step=final['end_step'])
 
                         async def emit_trace(step_id, step_index):
                             records = report.snapshot_events(step_id=step_id)

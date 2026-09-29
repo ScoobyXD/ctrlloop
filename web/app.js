@@ -142,18 +142,13 @@ function renderSession() {
   $("admin-user").value = state.session?.target_user_id || "";
   const target = state.members.find(member => String(member.user_id) === String(state.session?.target_user_id));
   const targetName = target ? personName(target) : state.session?.target_user_id === user?.id ? personName(user) : state.session?.target_user_id ? "Selected person" : "No person selected";
-  $("admin-context-summary").textContent = `${company?.name || "Company"} · ${targetName}. Actions use this company and the selected person’s assigned desktop.`;
   $("desktop-owner").textContent = user?.is_devadmin ? `${targetName}’s desktop` : `${personName(user)}’s desktop`;
-  $("desktop-scope-note").textContent = user?.is_devadmin ? `Current company: ${company?.name || "Company"}. This viewer and all new runs use ${targetName}’s assigned desktop.` : "This is your assigned desktop. Other company members run CtrlLoops on their own desktops.";
+  $("desktop-company").textContent = company?.name || "No company";
   if (state.view === "desktop") $("loop-title").textContent = user?.is_devadmin ? `${targetName}’s desktop` : "Your desktop";
   $("model-label").textContent = model.label;
   $("model-detail-id").textContent = model.label;
   $("jev-detail-id").textContent = state.session?.jev_model || worker?.jev_model || "Not reported";
-  $("worker-identity").textContent = worker?.id || "No desktop assigned";
   $("worker-detail-id").textContent = worker?.id || "Not assigned yet";
-  $("worker-status").textContent = worker ? `Your worker · ${humanize(worker.status)}${worker.mode === "maintenance" ? " · Worker deployment in progress" : ""}` : "No desktop assigned to the selected account";
-  $("worker-last-seen").textContent = worker?.last_seen ? `Last seen ${formatTime(worker.last_seen)}` : "";
-  $("worker-last-seen").title = worker?.last_seen ? formatDate(worker.last_seen, { second: "2-digit", timeZoneName: "short" }) : "";
   $("fullscreen").disabled = !worker;
   if (!worker) {
     if (state.rfb || state.viewerConnecting || state.viewerWanted) disconnectViewer();
@@ -170,7 +165,7 @@ function renderControl() {
   const canControl = state.session?.worker?.can_control === true && !state.controlUnconfirmed;
   const active = hasActiveRun();
   const disabled = !state.session?.worker?.id || (!human && !agent) || state.controlUnconfirmed || state.changingMode || state.switchingCompany || state.running || active || (human && !canControl);
-  $("control-mode-label").textContent = maintenance ? "Deployment in progress" : canControl ? "You have control" : "View only";
+  $("control-mode-label").textContent = state.changingMode ? "Switching…" : maintenance ? "Deployment in progress" : canControl ? "Return to agent ↗" : "View only";
   $("control-mode-description").textContent = !state.session?.worker ? "Waiting for a desktop to be assigned to you." : maintenance ? "Runs and control will resume after worker deployment." : state.changingMode ? "Switching desktop control…" : canControl ? "Return control when you're ready to run a loop." : human ? "Another session of your account controls this desktop." : active ? "The agent is running. Control is available when it finishes." : "Click the desktop to take control.";
   $("control-mode-icon").textContent = canControl ? "↖" : "◉";
   if (state.controlUnconfirmed) {
@@ -178,9 +173,10 @@ function renderControl() {
     $("control-mode-description").textContent = "Desktop input is paused until ownership can be confirmed.";
   }
   $("control-mode-icon").parentElement.classList.toggle("human", canControl);
-  $("toggle-control").textContent = state.changingMode ? "Switching…" : "Return to agent ↗";
-  $("toggle-control").hidden = !canControl;
-  $("toggle-control").disabled = disabled;
+  $("toggle-control").disabled = disabled || (!canControl && (!state.rfb || state.viewerConnecting));
+  $("toggle-control").setAttribute("aria-pressed", String(canControl));
+  $("toggle-control").setAttribute("aria-label", canControl ? "You have control. Return to agent" : `${$("control-mode-label").textContent}. Take control`);
+  $("toggle-control").title = $("control-mode-description").textContent;
   const inputEnabled = human && canControl && !disabled;
   const takeover = $("desktop-takeover");
   takeover.hidden = inputEnabled || !state.rfb || state.viewerConnecting;
@@ -216,6 +212,8 @@ function renderNavigation(writeHistory = true) {
   if (state.view === "home") $("home-nav").setAttribute("aria-current", "page");
   $("company-nav").classList.toggle("selected", state.view === "company");
   const manual = state.view === 'workbench' || (state.view === 'loop' && Boolean(state.detail?.steps));
+  $('loop-page-heading').hidden = manual;
+  $('main-content').classList.toggle('compact-workspace', manual);
   $('workbench-nav').classList.toggle('selected', manual);
   $('workbench-nav').toggleAttribute('aria-current', manual);
   if (manual) $('workbench-nav').setAttribute('aria-current', 'page');
@@ -765,7 +763,15 @@ async function changeDesktopMode(mode) {
 }
 // The first completed click only acquires ownership. It never reaches the guest.
 $("desktop-takeover").addEventListener("click", () => void changeDesktopMode("human"));
-$("toggle-control").addEventListener("click", () => void changeDesktopMode("agent"));
+$("toggle-control").addEventListener("click", () => void changeDesktopMode(state.session?.worker?.can_control ? "agent" : "human"));
+document.addEventListener("click", event => {
+  const details = $("connection-details");
+  if (details.open && !details.contains(event.target)) details.open = false;
+});
+document.addEventListener("keydown", event => {
+  const details = $("connection-details");
+  if (event.key === "Escape" && details.open) { details.open = false; details.querySelector("summary").focus(); }
+});
 function updateFullscreenLabel() {
   const text = document.fullscreenElement || $("desktop-panel").classList.contains("expanded") ? "Exit fullscreen" : "Enter fullscreen";
   $("fullscreen").title = text; $("fullscreen").setAttribute("aria-label", text);

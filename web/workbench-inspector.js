@@ -229,6 +229,8 @@ export function renderStepInspector({ step, run = null, report = null, loading =
   if (!step) return note("Select a step to inspect its result.");
   const record = scope(report, run, step.id);
   const result = record.result;
+  const stepIndex = asArray(record.run?.steps).findIndex(item => item.id === step.id);
+  const excluded = Array.isArray(record.run?.steps) && (stepIndex < (record.run.start_step ?? 0) || stepIndex >= (record.run.end_step ?? record.run.steps.length));
   const pipeline = record.pipeline;
   const rounds = selectionRounds(record);
   const calls = jevCalls(record, rounds);
@@ -241,7 +243,7 @@ export function renderStepInspector({ step, run = null, report = null, loading =
   const links = `${reportURL ? `<a class="button quiet small" href="${esc(reportURL)}" target="_blank" rel="noopener">Full timeline & report ↗</a>` : ""}${downloadURL ? `<a class="button quiet small" href="${esc(downloadURL)}">Evidence ZIP ↓</a>` : ""}`;
   return `<div class="wb-inspector">
     <p class="wb-muted">Recorded action: ${esc(actionLabel)}</p>
-    ${result ? `<p class="wb-outcome"><strong>${esc(resultLabel)}</strong>${reason ? ` · ${esc(reason)}` : ""}</p>` : note("This step has no completed result yet.")}
+    ${result ? `<p class="wb-outcome"><strong>${esc(resultLabel)}</strong>${reason ? ` · ${esc(reason)}` : ""}</p>` : note(excluded ? "This step was not included in this run." : "This step has no completed result yet.")}
     ${typeof output?.text === "string" ? `<div class="wb-read-result"><strong>Read text</strong><pre class="wb-output">${esc(output.text)}</pre><p class="wb-muted">${esc(output.source ?? "Recorded desktop text")}</p></div>` : ""}
     ${facts([["Step time", totals.durationLabel], ["Jev calls", totals.callsLabel], ["Input tokens", totals.tokensLabel], ["Input cost", totals.costLabel]])}
     ${loading ? '<p class="wb-muted" role="status">Loading captured evidence…</p>' : ""}
