@@ -5,6 +5,7 @@ reads only that user's delivery credential and the authorized local Jev key.
 The guest service never receives Fleet credentials or OpenAI credentials.
 """
 import argparse
+import ast
 import asyncio
 import hashlib
 import io
@@ -23,6 +24,39 @@ from dotenv import dotenv_values, load_dotenv
 from worker_target import load_target, save_private
 
 ROOT=Path(__file__).resolve().parents[1]
+
+GATE_HEALTH = '''import json, shlex, subprocess, sys, time, urllib.request
+target = json.loads(sys.argv[1])
+if subprocess.run(['systemctl', '--user', 'is-active', '--quiet', 'omarchy-websockify.service']).returncode == 0:
+    raise SystemExit('The unguarded desktop bridge is still running')
+legacy = subprocess.run(['systemctl', '--user', 'is-enabled', 'omarchy-websockify.service'],capture_output=True,text=True)
+if legacy.stdout.strip() != 'masked':
+    raise SystemExit('The unguarded desktop bridge must remain masked')
+if len(sys.argv) > 2:
+    revision = sys.argv[2]
+else:
+    configured = subprocess.check_output(['systemctl', '--user', 'show', 'ctrlloop-worker', '-p', 'Environment', '--value'],text=True)
+    values = dict(item.split('=', 1) for item in shlex.split(configured) if '=' in item)
+    revision = values.get('CTRLLOOP_REVISION')
+if not revision:
+    raise SystemExit('The installed worker has no explicit revision')
+expected = {'protocol':'ctrlloop-direct-v1', 'revision':revision, 'worker_id':target['id'],
+            'environment':target['environment'], 'company_id':target['company_id'],
+            'assigned_user_id':target['assigned_user_id']}
+deadline = time.monotonic() + 60
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:5900/health', timeout=3) as response:
+            health = json.load(response)
+        if isinstance(health, dict) and all(health.get(key) == value for key, value in expected.items()):
+            print('Direct desktop gate is ready for the assigned worker revision')
+            break
+    except Exception:
+        pass
+    time.sleep(1)
+else:
+    raise SystemExit('Direct desktop gate is not ready for this assignment and revision; maintenance remains enabled')
+'''
 
 DEPLOYMENT_PHASE = '''import hmac, json, pathlib, sys, urllib.request, urllib.error
 target, phase = json.loads(sys.argv[1]), sys.argv[2]
@@ -58,7 +92,7 @@ print('Worker deployment phase: '+phase)
 '''
 
 
-def bundle(ref=None):
+def bundle(ref=None, *, require_direct=True):
     paths=[ROOT/'pyproject.toml',ROOT/'uv.lock',*sorted((ROOT/'src').glob('*.py'))]
     if ref:
         commit=subprocess.check_output(['git','rev-parse','--verify',ref+'^{commit}'],cwd=ROOT,text=True).strip()
@@ -67,6 +101,14 @@ def bundle(ref=None):
         items=[(name,subprocess.check_output(['git','show',f'{commit}:{name}'],cwd=ROOT)) for name in sorted(names)]
     else:
         items=[(path.relative_to(ROOT).as_posix(),path.read_bytes()) for path in paths]
+    if require_direct:
+        contents = dict(items)
+        gate = contents.get('src/desktop_stream.py', b'')
+        worker = ast.parse(contents.get('src/cloud_worker.py', b''))
+        if (b'ctrlloop-direct-v1' not in gate
+                or not any(isinstance(node, ast.ImportFrom) and node.module == 'desktop_stream'
+                           for node in ast.walk(worker))):
+            raise SystemExit('Selected revision has no compatible direct desktop gate. Deploy a direct-streaming worker revision; older --source-ref values cannot be rolled back onto this endpoint.')
     digest=hashlib.sha256()
     stream=io.BytesIO()
     with tarfile.open(fileobj=stream,mode='w:gz') as archive:
@@ -92,7 +134,7 @@ async def main(args):
         assigned_origin = urlsplit(target['api_url'])
         if (previous.hostname, previous.port or 443) == (assigned_origin.hostname, assigned_origin.port or 443):
             raise ValueError('Previous application URL must differ from the new assignment origin')
-    revision,archive=bundle(args.source_ref)
+    revision,archive=bundle(args.source_ref, require_direct=not (args.status or args.resume))
     remote=f'/home/omarchy/ctrlloop-dev/releases/{revision}'
     async with Sandbox.from_dict(reference) as sandbox:
         if sandbox.name!=target['id']:raise RuntimeError('Refusing a sandbox outside the recorded user assignment')
@@ -150,9 +192,12 @@ uv sync --locked --no-dev --python 3.12
         elif not await sandbox.files.exists(env_path):
             raise RuntimeError('Administrator must configure the initial dedicated worker credentials')
         await sandbox.files.write_text(control+'/deployment_phase.py',DEPLOYMENT_PHASE)
+        await sandbox.files.write_text(control+'/gate_health.py',GATE_HEALTH)
         phase=f'python {shlex.quote(control+"/deployment_phase.py")} {shlex.quote(json.dumps(target))}'
+        health=f'python {shlex.quote(control+"/gate_health.py")} {shlex.quote(json.dumps(target))}'
         if args.resume:
-            result=await sandbox.shell.run('flock -n /home/omarchy/ctrlloop-dev/deploy.lock '+phase+' finish')
+            recovery=health+' && '+phase+' finish'
+            result=await sandbox.shell.run('flock -n /home/omarchy/ctrlloop-dev/deploy.lock bash -c '+shlex.quote(recovery))
             if not result.success:raise RuntimeError('Maintenance release refused; inspect the worker')
             print(json.dumps({'worker_id':target['id'],'status':'maintenance_released'}));return
         service=f'''[Unit]
@@ -166,6 +211,7 @@ EnvironmentFile={env_path}
 Environment=CTRLLOOP_REVISION={revision}
 ExecStart={remote}/.venv/bin/python -m src.cloud_worker
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=5
 UMask=0077
 NoNewPrivileges=true
@@ -185,6 +231,17 @@ exec 9>/home/omarchy/ctrlloop-dev/deploy.lock
 flock -n 9
 {begin}
 test ! -e /home/omarchy/.local/state/ctrlloop-worker/active-run.json
+# Retire the service-wide input bridge before installing or starting the gate.
+if systemctl --user is-active --quiet omarchy-websockify.service || systemctl --user cat omarchy-websockify.service >/dev/null 2>&1; then
+    systemctl --user disable --now omarchy-websockify.service
+fi
+ln -sfn /dev/null /home/omarchy/.config/systemd/user/omarchy-websockify.service
+touch /home/omarchy/ctrlloop-dev/direct-streaming-required
+systemctl --user daemon-reload
+if systemctl --user is-active --quiet omarchy-websockify.service; then
+    echo 'The unguarded desktop bridge did not stop' >&2
+    exit 1
+fi
 cd {shlex.quote(remote)}
 tar -xzf {shlex.quote(control+'/source.tar.gz')}
 uv sync --locked --no-dev --python 3.12
@@ -195,6 +252,7 @@ systemctl --user daemon-reload
 systemctl --user enable ctrlloop-worker
 systemctl --user restart ctrlloop-worker
 systemctl --user is-active ctrlloop-worker
+{health} {shlex.quote(revision)}
 {phase} finish
 '''
         await sandbox.files.write_text(control+'/setup.sh',setup)

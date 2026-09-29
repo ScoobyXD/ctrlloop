@@ -76,6 +76,18 @@ CREATE TABLE IF NOT EXISTS company_migration_audit (
 );
 CREATE INDEX IF NOT EXISTS users_company ON users(company_id);
 CREATE INDEX IF NOT EXISTS sessions_company_user ON sessions(company_id, user_id);
+-- Session bindings for Fleet's existing signed service credentials. Store only
+-- the credential hash, never the signed URL. This is not another signing API.
+-- Snapshot the assignment so moving a worker cannot redirect an open viewer.
+CREATE TABLE IF NOT EXISTS desktop_connections (
+    token_hash text PRIMARY KEY CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    session_hash text NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE,
+    worker_id text NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+    company_id uuid NOT NULL, assigned_user_id uuid NOT NULL,
+    fleet_namespace text NOT NULL, fleet_claim text NOT NULL,
+    admission_expires_at timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS desktop_connections_session ON desktop_connections(session_hash);
 CREATE INDEX IF NOT EXISTS workers_company ON workers(company_id);
 CREATE UNIQUE INDEX IF NOT EXISTS one_worker_per_user ON workers(company_id, assigned_user_id) WHERE disabled_at IS NULL;
 CREATE INDEX IF NOT EXISTS loops_company_time ON loops(company_id, created_at);
