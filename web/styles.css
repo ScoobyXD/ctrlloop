@@ -51,11 +51,6 @@ button svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.4
 .sidebar-section-label h2{font:inherit;margin:0}
 .sidebar-section-label>span{letter-spacing:0}
 .loop-list{display:flex;flex-direction:column;gap:5px;overflow:auto;min-height:80px;flex:1;padding:0 0 14px;scrollbar-width:thin;scrollbar-color:#3d3d3d transparent}
-.loop-list-entry{flex-shrink:0}
-.loop-list-entry .loop-list-item{width:100%}
-.loop-sidebar-archive{display:block;margin:0 10px 6px auto;padding:4px 8px;border:1px solid #353535;border-radius:3px;background:none;color:#a5a5a1;font-size:12px}
-.loop-sidebar-archive:hover{border-color:var(--accent);color:var(--text);background:#22160f}
-.loop-sidebar-archive:disabled{opacity:.5;cursor:wait}
 .loop-list-item{display:grid;grid-template-columns:14px minmax(0,1fr);column-gap:10px;align-items:start;text-align:left;background:none;border:1px solid transparent;border-left:2px solid transparent;padding:12px 10px;color:#a5a5a1;flex-shrink:0}
 .loop-list-item:hover{background:#181818;color:var(--text)}
 .loop-list-item.selected{background:#22160f;border-color:#35241a;border-left-color:var(--accent);color:var(--text)}
@@ -539,3 +534,6 @@ button svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.4
 .wb-history select { min-width: 0; }
 @media (max-width: 1150px) { .workbench-layout { grid-template-columns: minmax(310px, 1fr) minmax(0, 1.15fr); gap: 16px; } }
 @media (max-width: 920px) { .workbench-layout { grid-template-columns: minmax(0,1fr); } .workbench-layout #desktop-view { position: static; } }
+
+.loop-configuration-actions{display:flex;justify-content:center;align-items:center;gap:12px;flex-wrap:wrap;margin:20px 0}
+.loop-configuration-actions .button{border:1px solid #45413c;padding:12px 24px;min-width:140px}

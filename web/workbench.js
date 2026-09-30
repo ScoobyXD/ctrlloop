@@ -160,7 +160,6 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     host.innerHTML = `<section class="wb panel" aria-label="Manual action workbench">
       <header class="wb-header"><div class="wb-heading"><h2>Action workbench</h2><span class="technical-label" role="status">${history ? 'RUN SNAPSHOT' : record?.saving ? 'SAVING…' : dirty ? record?.local ? 'DRAFT ON THIS DEVICE' : 'UNSAVED' : 'SAVED'}</span></div>
       <div class="wb-header-tools">${run && step ? `<button class="button quiet small" data-wb="inspect" aria-expanded="${inspector}" aria-controls="wb-inspector">${inspector ? '▾' : '▸'} Inspect selected step</button>` : ''}
-      ${detail?.id ? `<button class="button quiet small" data-wb="${detail.archived_at ? 'restore' : 'archive'}" ${busy || record?.saving || (detail.runs || []).some(active) ? 'disabled' : ''}>${detail.archived_at ? 'Recover' : 'Archive'}</button>${detail.archived_at ? `<button class="button quiet small" data-wb="delete" ${busy ? 'disabled' : ''}>Delete permanently</button>` : ''}` : ''}
       ${(detail?.runs?.length || 0) ? `<details class="wb-history" data-disclosure="history"><summary>Recorded runs (${detail.runs.length})</summary><div class="wb-history-menu"><label for="wb-run-select">Inspect saved steps</label><select id="wb-run-select"><option value="" ${!displayedRun ? 'selected' : ''}>Current draft</option>${[...detail.runs].sort((a,b) => String(b.created_at).localeCompare(String(a.created_at))).map((item,index) => `<option value="${esc(item.id)}" ${displayedRun === item.id ? 'selected' : ''}>${index === 0 ? 'Most recent · ' : ''}${esc(new Date(item.created_at).toLocaleString())} · ${esc(item.status)}</option>`).join('')}</select></div></details>` : ''}</div>
       ${run ? `<div class="wb-run-meta"><span>${esc(run.status)} · ${completed.filter(item => item.status === 'succeeded').length}/${(run.end_step ?? run.steps?.length ?? steps.length) - (run.start_step ?? 0)} steps</span><span>${esc(runTiming)}</span></div><p class="wb-muted wb-run-accounting">Jev: ${esc(totals.callsLabel)} calls · ${esc(totals.tokensLabel)} input tokens · ${esc(totals.costLabel)}</p>` : ''}</header>
       <div id="wb-inspector" ${inspector ? '' : 'hidden'}>${inspector && step && inspectedRun ? renderStepInspector({step: inspectedRun.steps?.find(s => s.id === step.id) || step,run:inspectedRun,report:inspection.data,loading:inspection.loading,error:inspection.error,reportURL: scopedURL(`/reports/runs/${encodeURIComponent(inspectedRun.id)}`),downloadURL: scopedURL(`/api/runs/${encodeURIComponent(inspectedRun.id)}/download`)}) : ''}${inspector && inspection.error ? `<button class="button quiet small" data-wb="retry-evidence" data-run-id="${esc(inspectedRun.id)}">Retry evidence</button>` : ''}</div>
@@ -188,7 +187,8 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
         ${['type_text','press_key'].includes(step.action.tool) ? `<details class="wb-target" data-disclosure="target"><summary>${step.action.target ? 'Target: ' + esc(step.action.target) : 'Use current focus'}</summary><label for="wb-target">Target (optional)</label><input id="wb-target" maxlength="2000" value="${esc(step.action.target || '')}" placeholder="Leave empty to use current focus" ${locked ? 'disabled' : ''}></details>` : ''}
         <datalist id="wb-keys"><option value="Enter"><option value="Tab"><option value="Escape"><option value="Backspace"></datalist>
       </div>` : '<p class="wb-muted wb-empty">Add a step to begin.</p>'}
-    </section>`;
+    </section>
+    <div class="loop-configuration-actions">${detail?.id ? `<button class="button quiet small" data-wb="${detail.archived_at ? 'restore' : 'archive'}" ${busy || record?.saving || (detail.runs || []).some(active) ? 'disabled' : ''}>${detail.archived_at ? 'Recover' : 'Archive'}</button>${detail.archived_at ? `<button class="button quiet small" data-wb="delete" ${busy ? 'disabled' : ''}>Delete permanently</button>` : ''}` : ''}</div>`;
     for (const element of host.querySelectorAll('details')) if ((element.dataset.disclosure || element.id) && openDetails.has(element.dataset.disclosure || element.id)) element.open = true;
     for (const element of host.querySelectorAll('[data-timing-key]')) if (timingDisclosure.has(element.dataset.timingKey)) element.open = timingDisclosure.get(element.dataset.timingKey);
     bindStepInspector(host.querySelector('#wb-inspector'));
@@ -362,5 +362,5 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     const menu = host.querySelector('.wb-history[open]');
     if (event.key === 'Escape' && menu) { menu.open = false; menu.querySelector('summary').focus(); }
   });
-  return {open, update, render, reset, deactivate, archive: () => archiveCommand('archive')};
+  return {open, update, render, reset, deactivate};
 }
