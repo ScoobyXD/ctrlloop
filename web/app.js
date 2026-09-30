@@ -25,7 +25,20 @@ const workbench = createWorkbench($('workbench'), {
     renderNavigation();
   },
   onRefresh: async id => { await Promise.all([loadDetail(id), loadLoops(), loadSession()]); },
+  onArchive: changeLoopArchive,
 });
+
+async function changeLoopArchive(id, action) {
+  const generation = state.sessionGeneration;
+  await api(`/api/loops/${encodeURIComponent(id)}${action === 'delete' ? '' : `/${action}`}`, {method: action === 'delete' ? 'DELETE' : 'POST'});
+  if (generation !== state.sessionGeneration) return;
+  if (action === 'delete') {
+    if (state.selectedId === id) { workbench.reset(); showHome(); }
+    await Promise.all([loadLoops(), loadArchivedLoops(), loadSession()]);
+  } else {
+    await Promise.all([loadLoops(), loadArchivedLoops(), loadDetail(id)]);
+  }
+}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
@@ -191,12 +204,13 @@ function renderControl() {
   const runButton = $("run-instruction");
   if (runButton) {
     runButton.hidden = state.detail?.status === "generating" || active;
-    runButton.disabled = state.switchingCompany || state.running || active || !agent || !state.detail?.instruction || state.detail?.status !== "ready" || state.session?.worker?.status !== "online";
+    runButton.disabled = state.switchingCompany || state.running || active || !agent || !state.detail?.instruction || state.detail?.archived_at || state.detail?.status !== "ready" || state.session?.worker?.status !== "online";
     runButton.textContent = state.running ? "Starting…" : active ? "Run in progress" : getRuns().length ? "Run again ↗" : "Start CtrlLoop ↗";
   }
   const hint = $("run-control-hint");
   if (hint) { hint.textContent = human ? canControl ? "Return control to the agent to run this instruction." : "Your other session must return desktop control before a run can start." : !state.session?.worker?.id ? "Desktop provisioning pending. You can run this CtrlLoop once a desktop is assigned to you." : state.session?.worker?.status !== "online" ? "Waiting for your assigned worker to come online." : state.detail?.status === "generating" ? autoStartPending() ? "Preparing the instruction. Execution will start automatically." : "Preparing the saved instruction. No execution is currently queued." : "Watch this run on the live desktop beside the instruction. Recorded steps appear below."; }
   if (hint && maintenance) hint.textContent = "Worker deployment in progress. Run and control access will resume when deployment completes.";
+  if (hint && state.detail?.archived_at) hint.textContent = "This CtrlLoop is archived. Recover it to start new runs.";
   if (state.view === 'workbench' || state.detail?.steps) workbench.render();
 }
 
@@ -374,7 +388,6 @@ function renderDetail() {
   const executed = latest && !activeStatuses.has(latest.status) && !errorStatuses.has(latest.status);
   const progress = `<div class="progress-strip" aria-label="CtrlLoop progress"><div class="progress-step done"><span><i>✓</i></span><div><strong>Request</strong><small>Saved to company</small></div></div><div class="progress-step ${prepared ? "done" : generating ? "current" : ""}"><span><i>${prepared ? "✓" : "02"}</i></span><div><strong>Prepare</strong><small>${prepared ? "Instruction ready" : generating ? "Generating…" : "Needs attention"}</small></div></div><div class="progress-step ${executed ? "done" : prepared && latest && activeStatuses.has(latest.status) ? "current" : ""}"><span><i>${executed ? "✓" : "03"}</i></span><div><strong>Execute</strong><small>${generating && latest?.status === "queued" ? "Starts automatically" : latest ? escapeHtml(humanize(latest.status)) : "Not started"}</small></div></div></div>`;
   $("loop-progress").innerHTML = progress;
-  const archiveAction = loop.archived_at ? "Recover" : "Archive";
   const archiveButton = loop.archived_at ? `<button id="archive-loop" class="button quiet small" data-archive-action="restore">Recover</button>` : `<button id="archive-loop" class="button quiet small" data-archive-action="archive">Archive</button>`;
   const permanentDeleteButton = loop.archived_at ? `<button id="delete-loop" class="button quiet small" type="button">Delete permanently</button>` : "";
   $("loop-detail").innerHTML = `<aside class="request-summary"><div class="detail-heading"><h2>Request & instruction</h2><button id="reuse-request" class="button quiet small" title="Use this request in a new CtrlLoop">Reuse ↗</button></div><div class="request-block"><div class="content-label"><span>REQUEST</span></div><p class="request-text">${escapeHtml(loop.prompt)}</p><p class="workflow-attribution">Created by ${escapeHtml(personName(loop.creator))}<br>${escapeHtml(formatDate(loop.created_at))}</p></div><div class="instruction-block"><div class="content-label"><span>INSTRUCTION</span><span>${prepared ? "SAVED" : "PENDING"}</span></div>${prepared ? `<p class="instruction-text">${escapeHtml(loop.instruction)}</p>` : `<p class="instruction-missing">${generating ? autoStartPending() ? "Preparing your instruction. Execution will start automatically on your assigned desktop." : "Preparing the saved instruction. No execution is currently queued." : "An instruction could not be prepared. Your original request is saved."}</p>`}${model ? `<div class="instruction-meta">${escapeHtml(model)}</div>` : ""}${loop.error ? `<div class="inline-error">${escapeHtml(valueText(loop.error))}</div>` : ""}<div class="instruction-actions"><button id="run-instruction" class="button primary" ${!prepared || loop.archived_at ? "disabled" : ""}>Run again ↗</button>${archiveButton}${permanentDeleteButton}</div><p class="run-hint" id="run-control-hint">${loop.archived_at ? "This CtrlLoop is archived. Recover it to start new runs." : ""}</p><div class="instruction-actions"><a class="button quiet small" href="${escapeHtml(scopedURL(`/reports/loops/${encodeURIComponent(loop.id)}`))}" target="_blank" rel="noopener">Request report ↗</a><a class="button quiet small" href="${escapeHtml(scopedURL(`/api/loops/${encodeURIComponent(loop.id)}/download`))}">Evidence ↓</a></div></div></aside><div class="activity-column"><div class="activity-header"><h3>Execution activity</h3><span>${runs.length} ${runs.length === 1 ? "run" : "runs"} · ${escapeHtml(Intl.DateTimeFormat().resolvedOptions().timeZone)}</span></div>${loopEvents.length ? `<section class="run-group"><div class="run-summary"><div><span>Instruction preparation</span>${generating ? badge("preparing") : ""}</div></div><ol class="timeline">${loopEvents.map((event, index) => renderEvent(event, index, `loop-${loop.id}`)).join("")}</ol></section>` : ""}${runs.map((run, index) => renderRun(run, index, runs.length)).join("")}${!runs.length ? `<p class="no-events">${generating ? "Preparing the instruction…" : "This CtrlLoop has no recorded executions yet."}</p>` : ""}</div>`;
@@ -738,22 +751,15 @@ $("loop-detail").addEventListener("click", async (event) => {
   if (event.target.closest("#archive-loop")) {
     const action = event.target.closest("#archive-loop").dataset.archiveAction;
     const id = state.detail.id;
-    const endpoint = action === "archive" ? `/api/loops/${encodeURIComponent(id)}/archive` : `/api/loops/${encodeURIComponent(id)}/restore`;
     try {
-      await api(endpoint, { method: "POST" });
-      await Promise.all([loadLoops(), loadArchivedLoops(), loadDetail(id)]);
-      if (state.view === "archived") renderArchivedLoops();
+      await changeLoopArchive(id, action);
     } catch (error) { notice(action === "archive" ? `Couldn’t archive this CtrlLoop: ${error.message}` : `Couldn’t restore this CtrlLoop: ${error.message}`, true); }
     return;
   }
   if (event.target.closest("#delete-loop")) {
     const id = state.detail.id;
     try {
-      await api(`/api/loops/${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (state.selectedId === id) state.selectedId = null;
-      state.detail = null;
-      await Promise.all([loadLoops(), loadArchivedLoops(), loadSession()]);
-      showHome();
+      await changeLoopArchive(id, 'delete');
     } catch (error) { notice(`Couldn’t delete this CtrlLoop: ${error.message}`, true); }
     return;
   }

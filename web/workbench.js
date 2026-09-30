@@ -8,7 +8,7 @@ const summary = step => `${label[step.action.tool] || step.action.tool} ${step.a
 const duration = ms => Number.isFinite(ms) ? `${Math.round(ms).toLocaleString()} ms` : 'Timing unavailable';
 
 // The editor owns drafts only. The existing run API owns execution and its cursor.
-export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefresh}) {
+export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefresh, onArchive}) {
   let detail = null, draft = null, selected = null, busy = false, dirty = false, inspector = false;
   let error = '', requestId = null;
   let displayedRun = null, signature = '', epoch = 0, startStep = null, record = null, saveTimer = null;
@@ -109,13 +109,13 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
   function editable() {
     const value = session();
     const author = !detail || detail.created_by === value?.target_user_id || value?.user?.is_devadmin;
-    return !busy && !historical() && author && !(detail?.runs || []).some(active);
+    return !busy && !historical() && author && !detail?.archived_at && !detail?.deleted_at && !(detail?.runs || []).some(active);
   }
   function render(force = false) {
     if (!draft) return;
     const run = currentRun(), live = latestRun(), locked = !editable(), worker = session()?.worker, history = historical(), steps = shownSteps();
     const workerState = worker ? [worker.id,worker.mode,worker.status,worker.active_run,worker.queued_run] : null;
-    const stateKey = JSON.stringify([draft,selected,startStep,displayedRun,dirty,busy,Boolean(record?.saving),record?.error,locked,inspector,detail?.runs,workerState,error,[...reports].map(([id,value]) => [id,value.key,value.loading,value.error])]);
+    const stateKey = JSON.stringify([draft,selected,startStep,displayedRun,dirty,busy,Boolean(record?.saving),record?.error,locked,inspector,detail?.archived_at,detail?.runs,workerState,error,[...reports].map(([id,value]) => [id,value.key,value.loading,value.error])]);
     if (!force && signature === stateKey) return;
     signature = stateKey;
     const focused = host.contains(document.activeElement) ? document.activeElement : null;
@@ -127,7 +127,7 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     const inspection = reportState(inspectedRun);
     const current = live?.step_in_flight ?? live?.next_step ?? 0;
     const awaiting = active(live), paused = live?.status === 'paused';
-    const runnable = !busy && !history && worker?.mode === 'agent' && worker?.status === 'online' && (!worker?.active_run || worker.active_run === live?.id) && (!worker?.queued_run || worker.queued_run === live?.id);
+    const runnable = !busy && !history && !detail?.archived_at && !detail?.deleted_at && worker?.mode === 'agent' && worker?.status === 'online' && (!worker?.active_run || worker.active_run === live?.id) && (!worker?.queued_run || worker.queued_run === live?.id);
     const canStart = runnable && !awaiting && (!dirty || !locked) && draft.steps.length > 0;
     const canResume = runnable && paused;
     const startIndex = Math.max(0, draft.steps.findIndex(item => item.id === startStep));
@@ -160,12 +160,14 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     host.innerHTML = `<section class="wb panel" aria-label="Manual action workbench">
       <header class="wb-header"><div class="wb-heading"><h2>Action workbench</h2><span class="technical-label" role="status">${history ? 'RUN SNAPSHOT' : record?.saving ? 'SAVING…' : dirty ? record?.local ? 'DRAFT ON THIS DEVICE' : 'UNSAVED' : 'SAVED'}</span></div>
       <div class="wb-header-tools">${run && step ? `<button class="button quiet small" data-wb="inspect" aria-expanded="${inspector}" aria-controls="wb-inspector">${inspector ? '▾' : '▸'} Inspect selected step</button>` : ''}
+      ${detail?.id ? `<button class="button quiet small" data-wb="${detail.archived_at ? 'restore' : 'archive'}" ${busy || record?.saving || (detail.runs || []).some(active) ? 'disabled' : ''}>${detail.archived_at ? 'Recover' : 'Archive'}</button>${detail.archived_at ? `<button class="button quiet small" data-wb="delete" ${busy ? 'disabled' : ''}>Delete permanently</button>` : ''}` : ''}
       ${(detail?.runs?.length || 0) ? `<details class="wb-history" data-disclosure="history"><summary>Recorded runs (${detail.runs.length})</summary><div class="wb-history-menu"><label for="wb-run-select">Inspect saved steps</label><select id="wb-run-select"><option value="" ${!displayedRun ? 'selected' : ''}>Current draft</option>${[...detail.runs].sort((a,b) => String(b.created_at).localeCompare(String(a.created_at))).map((item,index) => `<option value="${esc(item.id)}" ${displayedRun === item.id ? 'selected' : ''}>${index === 0 ? 'Most recent · ' : ''}${esc(new Date(item.created_at).toLocaleString())} · ${esc(item.status)}</option>`).join('')}</select></div></details>` : ''}</div>
       ${run ? `<div class="wb-run-meta"><span>${esc(run.status)} · ${completed.filter(item => item.status === 'succeeded').length}/${(run.end_step ?? run.steps?.length ?? steps.length) - (run.start_step ?? 0)} steps</span><span>${esc(runTiming)}</span></div><p class="wb-muted wb-run-accounting">Jev: ${esc(totals.callsLabel)} calls · ${esc(totals.tokensLabel)} input tokens · ${esc(totals.costLabel)}</p>` : ''}</header>
       <div id="wb-inspector" ${inspector ? '' : 'hidden'}>${inspector && step && inspectedRun ? renderStepInspector({step: inspectedRun.steps?.find(s => s.id === step.id) || step,run:inspectedRun,report:inspection.data,loading:inspection.loading,error:inspection.error,reportURL: scopedURL(`/reports/runs/${encodeURIComponent(inspectedRun.id)}`),downloadURL: scopedURL(`/api/runs/${encodeURIComponent(inspectedRun.id)}/download`)}) : ''}${inspector && inspection.error ? `<button class="button quiet small" data-wb="retry-evidence" data-run-id="${esc(inspectedRun.id)}">Retry evidence</button>` : ''}</div>
       <label class="sr-only" for="wb-name">Sequence name</label><input id="wb-name" class="wb-name" maxlength="2000" value="${esc(draft.prompt)}" ${locked ? 'disabled' : ''}>
       <div class="wb-controls">${paused ? `<button class="button primary small" data-wb="run" ${canResume ? '' : 'disabled'}>Continue ▷</button><button class="button secondary small" data-wb="step" ${canResume ? '' : 'disabled'}>Next step ↦</button>` : `<button class="button primary small" data-wb="run" ${canStart ? '' : 'disabled'}>Run from this point ▷</button><button class="button secondary small" data-wb="single" ${canStart ? '' : 'disabled'}>Run only this step ↦</button>`}<button class="button quiet small" data-wb="pause" ${awaiting && !paused && !finishing ? '' : 'hidden'} ${!busy && !history && awaiting && !paused && live.control === 'run' ? '' : 'disabled'}>Pause</button><button class="button quiet small" data-wb="stop" ${awaiting && !finishing ? '' : 'hidden'} ${!busy && !history && awaiting && live.control !== 'stop' ? '' : 'disabled'}>Stop</button></div>
       <p class="wb-status" role="status">${esc(busy ? 'Saving command…' : runReason)}</p>
+      ${detail?.archived_at ? '<p class="wb-muted" role="status">This CtrlLoop is archived. Recover it to edit or start new runs.</p>' : ''}
       ${error ? `<p class="inline-error" role="alert">${esc(error)}</p>` : ''}
       ${record?.error ? `<p class="inline-error" role="alert">Couldn’t save to your account. ${esc(record.error)} ${record.local ? 'Your draft is kept on this device.' : 'Keep this page open until you can save.'}</p>` : ''}
       ${run?.error ? `<p class="inline-error" role="status">${esc(run.error)}</p>` : ''}
@@ -273,6 +275,7 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
   }
   async function command(name) {
     if (busy || historical()) return;
+    if (detail?.archived_at || detail?.deleted_at) return;
     clearTimeout(saveTimer); saveTimer = null;
     const started = context(); busy = true; error = ''; render();
     const acceptRun = next => {
@@ -298,6 +301,20 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
       if (current(started)) await onRefresh(detail?.id);
     } catch (failure) { if (current(started)) error = failure.message; }
     finally { if (current(started)) { busy = false; render(true); } }
+  }
+  async function archiveCommand(action) {
+    if (busy || !detail?.id) return;
+    clearTimeout(saveTimer); saveTimer = null;
+    const started = context(); busy = true; error = ''; render();
+    try {
+      // Preserve authored changes before making the saved loop read-only.
+      if (action === 'archive' && dirty) {
+        const saved = await save(started);
+        if (!saved || !current(started)) return;
+      }
+      await onArchive(detail.id, action);
+    } catch (failure) { if (current(started)) error = failure.message; }
+    finally { if (current(started)) { busy = false; render(true); scheduleSave(); } }
   }
   host.addEventListener('input', event => {
     if (!editable()) return;
@@ -326,6 +343,7 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     if (select) { selected = select.dataset.selectStep; render(true); return; }
     const button = event.target.closest('[data-wb]'); if (!button || button.disabled) return;
     const name = button.dataset.wb;
+    if (['archive','restore','delete'].includes(name)) { void archiveCommand(name); return; }
     if (['run','step','single','pause','stop','save'].includes(name)) { void command(name); return; }
     if (name === 'inspect') { inspector = !inspector; render(true); return; }
     if (name === 'retry-evidence') { reports.delete(button.dataset.runId || currentRun()?.id); render(true); return; }
