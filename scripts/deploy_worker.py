@@ -40,6 +40,10 @@ else:
     revision = values.get('CTRLLOOP_REVISION')
 if not revision:
     raise SystemExit('The installed worker has no explicit revision')
+release = '/home/omarchy/ctrlloop-dev/releases/' + revision
+import pathlib
+if pathlib.Path(release, 'src/desktop_display.py').exists():
+    subprocess.run([release + '/.venv/bin/python', '-m', 'src.desktop_display', '--verify'], cwd=release, check=True)
 expected = {'protocol':'ctrlloop-direct-v2', 'revision':revision, 'worker_id':target['id'],
             'environment':target['environment'], 'company_id':target['company_id'],
             'assigned_user_id':target['assigned_user_id']}
@@ -247,6 +251,9 @@ tar -xzf {shlex.quote(control+'/source.tar.gz')}
 uv sync --locked --no-dev --python 3.12
 .venv/bin/python -m compileall -q src
 test ! -e /home/omarchy/.local/state/ctrlloop-worker/active-run.json
+if test -f src/desktop_display.py; then
+    .venv/bin/python -m src.desktop_display
+fi
 {install_env}cp {shlex.quote(control+'/ctrlloop-worker.service')} /home/omarchy/.config/systemd/user/ctrlloop-worker.service
 systemctl --user daemon-reload
 systemctl --user enable ctrlloop-worker

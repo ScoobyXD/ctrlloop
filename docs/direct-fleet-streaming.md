@@ -12,6 +12,10 @@ A disconnected viewer obtains a new URL for every attempt. Retries use delays of
 
 The 120-second expiry limits **new connection admission**. Fleet expiry or revocation does not by itself terminate an established WebSocket. An otherwise authorized stream can stay open beyond the URL's expiry, but never beyond its CtrlLoop session deadline; it fetches a fresh URL whenever it must reconnect.
 
+Worker deployment now applies a **1280 × 720** source-resolution experiment through `src/desktop_display.py`, under the existing maintenance guard. It changes the guest's existing Hyprland monitor rule before WayVNC captures the screen, preserving 60 Hz and scale 1. Browser fit/fullscreen remain local scaling; image quality, compression and capture frame-rate settings are unchanged. The source pixel count falls from 2,073,600 to 921,600 (55.6% fewer); this is not a measured frame-rate or bandwidth improvement.
+
+The helper requires the known single `Virtual-1` desktop and monitor rule, backs up `~/.config/hypr/monitors.lua` under `~/.local/state/ctrlloop-worker/display/`, and restores the prior configuration if live geometry verification fails. Deployment and maintenance recovery for releases containing this helper verify both the persistent rule and live dimensions; recovery of an older installed release retains its previous policy. Stage-only uploads do not resize the desktop. To end the experiment, revise the deployment's display policy before restoring the saved monitor configuration and reloading Hyprland, so the next deployment does not reapply 720p.
+
 An explicit human/agent mode change closes the old viewer before the request and reconnects after the resulting session state is checked, including recovery from an uncertain response. A successful takeover restores keyboard focus when the user has not focused another control. Other viewer reconnect attempts pause during the mode change.
 
 ## Enforced ownership and revocation
