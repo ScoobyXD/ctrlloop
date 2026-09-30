@@ -108,6 +108,8 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS dispatch_before timestamptz;
 -- copy of its authored steps; editing a loop can never change dispatched input.
 ALTER TABLE loops ADD COLUMN IF NOT EXISTS steps jsonb;
 ALTER TABLE loops ADD COLUMN IF NOT EXISTS version integer NOT NULL DEFAULT 0;
+ALTER TABLE loops ADD COLUMN IF NOT EXISTS archived_at timestamptz;
+ALTER TABLE loops ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS steps jsonb;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS request_id uuid;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS next_step integer NOT NULL DEFAULT 0;

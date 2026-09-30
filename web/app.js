@@ -14,7 +14,7 @@ const stageLabels = {
   completed: "Run completed", error: "Error", failed: "Run failed",
 };
 const viewerRetryDelays = [1000, 2000, 4000, 8000, 15000];
-const state = { session: null, sessionGeneration: 0, signingOut: false, loops: [], detail: null, selectedId: null, creating: false, running: false, changingMode: false, pollBusy: false, rfb: null, viewerGeneration: 0, viewerConnecting: false, viewerWanted: false, viewerRetryCount: 0, viewerRetryTimer: null, viewerConnectTimer: null, viewerStableTimer: null, viewerSessionController: null, viewerFailure: "", lastDetailSignature: "", lastListSignature: "" };
+const state = { session: null, sessionGeneration: 0, signingOut: false, loops: [], archivedLoops: [], detail: null, selectedId: null, creating: false, running: false, changingMode: false, pollBusy: false, rfb: null, viewerGeneration: 0, viewerConnecting: false, viewerWanted: false, viewerRetryCount: 0, viewerRetryTimer: null, viewerConnectTimer: null, viewerStableTimer: null, viewerSessionController: null, viewerFailure: "", lastDetailSignature: "", lastListSignature: "" };
 Object.assign(state, { view: "home", controlUnconfirmed: false, switchingCompany: false, members: [], savingMember: false, savingCompany: false, authBusy: false, authView: "login", resetToken: null, companies: [], companyContext: null, userContext: null });
 const emptyDetail = $("loop-detail").innerHTML;
 let viewerModule;
@@ -203,6 +203,7 @@ function renderControl() {
 
 function renderNavigation(writeHistory = true) {
   $("home-view").hidden = state.view !== "home";
+  $("archived-view").hidden = state.view !== "archived";
   $("loop-view").hidden = !["loop", "desktop", "workbench"].includes(state.view);
   $("loop-workspace").classList.toggle("desktop-only", state.view === "desktop");
   $("loop-progress").hidden = state.view !== "loop" || Boolean(state.detail?.steps);
@@ -210,6 +211,9 @@ function renderNavigation(writeHistory = true) {
   $("home-nav").classList.toggle("selected", state.view === "home");
   $("home-nav").toggleAttribute("aria-current", state.view === "home");
   if (state.view === "home") $("home-nav").setAttribute("aria-current", "page");
+  $("archived-nav").classList.toggle("selected", state.view === "archived");
+  $("archived-nav").toggleAttribute("aria-current", state.view === "archived");
+  if (state.view === "archived") $("archived-nav").setAttribute("aria-current", "page");
   $("company-nav").classList.toggle("selected", state.view === "company");
   const manual = state.view === 'workbench' || (state.view === 'loop' && Boolean(state.detail?.steps));
   $('loop-page-heading').hidden = manual;
@@ -220,7 +224,7 @@ function renderNavigation(writeHistory = true) {
   $('workbench').hidden = !manual;
   $('loop-detail').hidden = manual;
   $('loop-workspace').classList.toggle('workbench-layout', manual);
-  $("breadcrumb-page").textContent = manual ? 'Action workbench' : state.view === "loop" ? "CtrlLoop" : state.view === "desktop" ? "Desktop" : state.view === "company" ? "People & access" : "Home";
+  $("breadcrumb-page").textContent = manual ? 'Action workbench' : state.view === "loop" ? "CtrlLoop" : state.view === "desktop" ? "Desktop" : state.view === "company" ? "People & access" : state.view === "archived" ? "Archived" : "Home";
   $("activity-view").hidden = !['loop','workbench'].includes(state.view);
   const desktopVisible = desktopIsVisible();
   if (!desktopVisible) {
@@ -230,7 +234,7 @@ function renderNavigation(writeHistory = true) {
   if (!desktopVisible && (state.viewerWanted || state.rfb || state.viewerConnecting)) disconnectViewer();
   if (desktopVisible && state.session?.worker?.id && !state.viewerWanted && !state.signingOut) void connectViewer({ manual: true });
   if (writeHistory) {
-    const route = state.view === "loop" && state.selectedId ? `#loop/${encodeURIComponent(state.selectedId)}` : state.view === 'workbench' ? '#workbench' : state.view === "desktop" ? "#desktop" : state.view === "company" ? "#company" : "#home";
+    const route = state.view === "loop" && state.selectedId ? `#loop/${encodeURIComponent(state.selectedId)}` : state.view === 'workbench' ? '#workbench' : state.view === "desktop" ? "#desktop" : state.view === "company" ? "#company" : state.view === "archived" ? "#archived" : "#home";
     if (location.hash !== route) history.pushState(null, "", route);
   }
   setSidebarOpen(false);
@@ -240,6 +244,12 @@ function showHome({ focus = false, fromHistory = false } = {}) {
   state.view = "home"; state.selectedId = null; state.detail = null; state.lastDetailSignature = "";
   renderNavigation(!fromHistory); renderLoops(); renderControl();
   if (focus) { $("prompt").focus(); $("compose-panel").scrollIntoView({ behavior: "smooth", block: "center" }); }
+}
+function showArchived(fromHistory = false) {
+  workbench.deactivate();
+  state.view = "archived"; state.selectedId = null; state.detail = null; state.lastDetailSignature = "";
+  renderNavigation(!fromHistory); renderArchivedLoops(); renderControl();
+  void loadArchivedLoops();
 }
 function showDesktop(fromHistory = false) {
   workbench.deactivate();
@@ -256,6 +266,7 @@ function showWorkbench(fromHistory = false) {
 }
 async function openRoute() {
   if (location.hash === '#workbench') { showWorkbench(true); return; }
+  if (location.hash === '#archived') { showArchived(true); return; }
   if (location.hash === "#desktop") { showDesktop(true); return; }
   const route = location.hash.match(/^#loop\/([^/]+)(\/desktop)?$/);
   if (route) { await selectLoop(decodeURIComponent(route[1]), { fromHistory: true }); return; }
@@ -280,6 +291,19 @@ async function loadLoops() {
   if (generation !== state.sessionGeneration || !state.session) return;
   state.loops = Array.isArray(response) ? response : response?.loops || [];
   renderLoops();
+}
+async function loadArchivedLoops() {
+  const generation = state.sessionGeneration;
+  const response = await api("/api/loops?archived=true");
+  if (generation !== state.sessionGeneration || !state.session) return;
+  state.archivedLoops = Array.isArray(response) ? response : response?.loops || [];
+  renderArchivedLoops();
+}
+function renderArchivedLoops() {
+  const archiveCount = state.archivedLoops.length;
+  $("archived-count").textContent = String(archiveCount).padStart(2, "0");
+  if (!archiveCount) { $("archived-loops").innerHTML = '<p class="list-empty">No archived CtrlLoops yet.</p>'; return; }
+  $("archived-loops").innerHTML = state.archivedLoops.map(loop => `<button class="recent-loop" data-loop-id="${escapeHtml(loop.id)}"><span class="recent-loop-index">ARCHIVE / ${String(loop.id).slice(0, 8).toUpperCase()}</span><span class="recent-loop-arrow" aria-hidden="true">↗</span><span class="recent-loop-title">${escapeHtml(loop.prompt || "Untitled CtrlLoop")}</span><span class="recent-loop-meta"><i class="status-dot ${errorStatuses.has(loop.status) ? "error" : loop.status === "generating" ? "warn" : ""}"></i>${escapeHtml(humanize(loop.status))}<span>·</span>${escapeHtml(validDate(loop.archived_at || loop.created_at)?.toLocaleDateString(undefined, { month: "short", day: "numeric" }) || "")}</span></button>`).join("");
 }
 function renderLoops() {
   renderHome();
@@ -350,7 +374,10 @@ function renderDetail() {
   const executed = latest && !activeStatuses.has(latest.status) && !errorStatuses.has(latest.status);
   const progress = `<div class="progress-strip" aria-label="CtrlLoop progress"><div class="progress-step done"><span><i>✓</i></span><div><strong>Request</strong><small>Saved to company</small></div></div><div class="progress-step ${prepared ? "done" : generating ? "current" : ""}"><span><i>${prepared ? "✓" : "02"}</i></span><div><strong>Prepare</strong><small>${prepared ? "Instruction ready" : generating ? "Generating…" : "Needs attention"}</small></div></div><div class="progress-step ${executed ? "done" : prepared && latest && activeStatuses.has(latest.status) ? "current" : ""}"><span><i>${executed ? "✓" : "03"}</i></span><div><strong>Execute</strong><small>${generating && latest?.status === "queued" ? "Starts automatically" : latest ? escapeHtml(humanize(latest.status)) : "Not started"}</small></div></div></div>`;
   $("loop-progress").innerHTML = progress;
-  $("loop-detail").innerHTML = `<aside class="request-summary"><div class="detail-heading"><h2>Request & instruction</h2><button id="reuse-request" class="button quiet small" title="Use this request in a new CtrlLoop">Reuse ↗</button></div><div class="request-block"><div class="content-label"><span>REQUEST</span></div><p class="request-text">${escapeHtml(loop.prompt)}</p><p class="workflow-attribution">Created by ${escapeHtml(personName(loop.creator))}<br>${escapeHtml(formatDate(loop.created_at))}</p></div><div class="instruction-block"><div class="content-label"><span>INSTRUCTION</span><span>${prepared ? "SAVED" : "PENDING"}</span></div>${prepared ? `<p class="instruction-text">${escapeHtml(loop.instruction)}</p>` : `<p class="instruction-missing">${generating ? autoStartPending() ? "Preparing your instruction. Execution will start automatically on your assigned desktop." : "Preparing the saved instruction. No execution is currently queued." : "An instruction could not be prepared. Your original request is saved."}</p>`}${model ? `<div class="instruction-meta">${escapeHtml(model)}</div>` : ""}${loop.error ? `<div class="inline-error">${escapeHtml(valueText(loop.error))}</div>` : ""}<div class="instruction-actions"><button id="run-instruction" class="button primary" ${!prepared ? "disabled" : ""}>Run again ↗</button></div><p class="run-hint" id="run-control-hint"></p><div class="instruction-actions"><a class="button quiet small" href="${escapeHtml(scopedURL(`/reports/loops/${encodeURIComponent(loop.id)}`))}" target="_blank" rel="noopener">Request report ↗</a><a class="button quiet small" href="${escapeHtml(scopedURL(`/api/loops/${encodeURIComponent(loop.id)}/download`))}">Evidence ↓</a></div></div></aside><div class="activity-column"><div class="activity-header"><h3>Execution activity</h3><span>${runs.length} ${runs.length === 1 ? "run" : "runs"} · ${escapeHtml(Intl.DateTimeFormat().resolvedOptions().timeZone)}</span></div>${loopEvents.length ? `<section class="run-group"><div class="run-summary"><div><span>Instruction preparation</span>${generating ? badge("preparing") : ""}</div></div><ol class="timeline">${loopEvents.map((event, index) => renderEvent(event, index, `loop-${loop.id}`)).join("")}</ol></section>` : ""}${runs.map((run, index) => renderRun(run, index, runs.length)).join("")}${!runs.length ? `<p class="no-events">${generating ? "Preparing the instruction…" : "This CtrlLoop has no recorded executions yet."}</p>` : ""}</div>`;
+  const archiveAction = loop.archived_at ? "Recover" : "Archive";
+  const archiveButton = loop.archived_at ? `<button id="archive-loop" class="button quiet small" data-archive-action="restore">Recover</button>` : `<button id="archive-loop" class="button quiet small" data-archive-action="archive">Archive</button>`;
+  const permanentDeleteButton = loop.archived_at ? `<button id="delete-loop" class="button quiet small" type="button">Delete permanently</button>` : "";
+  $("loop-detail").innerHTML = `<aside class="request-summary"><div class="detail-heading"><h2>Request & instruction</h2><button id="reuse-request" class="button quiet small" title="Use this request in a new CtrlLoop">Reuse ↗</button></div><div class="request-block"><div class="content-label"><span>REQUEST</span></div><p class="request-text">${escapeHtml(loop.prompt)}</p><p class="workflow-attribution">Created by ${escapeHtml(personName(loop.creator))}<br>${escapeHtml(formatDate(loop.created_at))}</p></div><div class="instruction-block"><div class="content-label"><span>INSTRUCTION</span><span>${prepared ? "SAVED" : "PENDING"}</span></div>${prepared ? `<p class="instruction-text">${escapeHtml(loop.instruction)}</p>` : `<p class="instruction-missing">${generating ? autoStartPending() ? "Preparing your instruction. Execution will start automatically on your assigned desktop." : "Preparing the saved instruction. No execution is currently queued." : "An instruction could not be prepared. Your original request is saved."}</p>`}${model ? `<div class="instruction-meta">${escapeHtml(model)}</div>` : ""}${loop.error ? `<div class="inline-error">${escapeHtml(valueText(loop.error))}</div>` : ""}<div class="instruction-actions"><button id="run-instruction" class="button primary" ${!prepared || loop.archived_at ? "disabled" : ""}>Run again ↗</button>${archiveButton}${permanentDeleteButton}</div><p class="run-hint" id="run-control-hint">${loop.archived_at ? "This CtrlLoop is archived. Recover it to start new runs." : ""}</p><div class="instruction-actions"><a class="button quiet small" href="${escapeHtml(scopedURL(`/reports/loops/${encodeURIComponent(loop.id)}`))}" target="_blank" rel="noopener">Request report ↗</a><a class="button quiet small" href="${escapeHtml(scopedURL(`/api/loops/${encodeURIComponent(loop.id)}/download`))}">Evidence ↓</a></div></div></aside><div class="activity-column"><div class="activity-header"><h3>Execution activity</h3><span>${runs.length} ${runs.length === 1 ? "run" : "runs"} · ${escapeHtml(Intl.DateTimeFormat().resolvedOptions().timeZone)}</span></div>${loopEvents.length ? `<section class="run-group"><div class="run-summary"><div><span>Instruction preparation</span>${generating ? badge("preparing") : ""}</div></div><ol class="timeline">${loopEvents.map((event, index) => renderEvent(event, index, `loop-${loop.id}`)).join("")}</ol></section>` : ""}${runs.map((run, index) => renderRun(run, index, runs.length)).join("")}${!runs.length ? `<p class="no-events">${generating ? "Preparing the instruction…" : "This CtrlLoop has no recorded executions yet."}</p>` : ""}</div>`;
   for (const element of $("loop-detail").querySelectorAll("details[data-event-key]")) element.open = openKeys.has(element.dataset.eventKey);
   if (focusedId) $(focusedId)?.focus({ preventScroll: true });
   updateDurations(); renderControl();
@@ -470,7 +497,7 @@ async function refresh() {
   state.pollBusy = true;
   try {
     if (!await loadSession()) return;
-    await Promise.all([loadLoops(), state.selectedId ? loadDetail() : Promise.resolve()]);
+    await Promise.all([loadLoops(), loadArchivedLoops(), state.selectedId ? loadDetail() : Promise.resolve()]);
     if (desktopIsVisible() && state.session?.worker?.id && !state.viewerWanted && !state.viewerFailure) void connectViewer({ manual: true });
   } catch (error) { if (error.status !== 401) setConnection(false); }
   finally { state.pollBusy = false; }
@@ -480,7 +507,7 @@ async function boot() {
   try {
     if (!await loadSession()) return;
     if (generation !== state.sessionGeneration) return;
-    await Promise.all([loadLoops(), loadAdminCompanies()]);
+    await Promise.all([loadLoops(), loadArchivedLoops(), loadAdminCompanies()]);
     if (generation !== state.sessionGeneration) return;
     if (canManageCompany()) await loadMembers();
     if (generation !== state.sessionGeneration) return;
@@ -609,7 +636,7 @@ async function switchContext(companyId, userId) {
   $("create-loop").disabled = true; renderSession();
   try {
     if (!await loadSession()) return;
-    await Promise.all([loadLoops(), loadMembers()]);
+    await Promise.all([loadLoops(), loadArchivedLoops(), loadMembers()]);
   } catch (error) {
     state.companyContext = previous.companyId; state.userContext = previous.userId;
     if (state.session) {
@@ -705,10 +732,32 @@ $("compose-form").addEventListener("submit", async (event) => {
     if (generation === state.sessionGeneration) { state.creating = false; $("create-loop").innerHTML = 'Start CtrlLoop <span aria-hidden="true">↗</span>'; $("prompt").disabled = false; renderControl(); }
   }
 });
-for (const id of ["loop-list", "recent-loops"]) $(id).addEventListener("click", event => { const item = event.target.closest("[data-loop-id]"); if (item && !state.creating) void selectLoop(item.dataset.loopId); });
+for (const id of ["loop-list", "recent-loops", "archived-loops"]) $(id).addEventListener("click", event => { const item = event.target.closest("[data-loop-id]"); if (item && !state.creating) void selectLoop(item.dataset.loopId); });
 $("loop-detail").addEventListener("click", async (event) => {
   if (event.target.closest("#reuse-request")) { const prompt = state.detail?.prompt || ""; showHome({ focus: true }); $("prompt").value = prompt; return; }
-  if (!event.target.closest("#run-instruction") || state.switchingCompany || state.running || hasActiveRun() || state.session?.worker?.mode !== "agent" || state.session?.worker?.status !== "online" || !state.detail?.instruction) return;
+  if (event.target.closest("#archive-loop")) {
+    const action = event.target.closest("#archive-loop").dataset.archiveAction;
+    const id = state.detail.id;
+    const endpoint = action === "archive" ? `/api/loops/${encodeURIComponent(id)}/archive` : `/api/loops/${encodeURIComponent(id)}/restore`;
+    try {
+      await api(endpoint, { method: "POST" });
+      await Promise.all([loadLoops(), loadArchivedLoops(), loadDetail(id)]);
+      if (state.view === "archived") renderArchivedLoops();
+    } catch (error) { notice(action === "archive" ? `Couldn’t archive this CtrlLoop: ${error.message}` : `Couldn’t restore this CtrlLoop: ${error.message}`, true); }
+    return;
+  }
+  if (event.target.closest("#delete-loop")) {
+    const id = state.detail.id;
+    try {
+      await api(`/api/loops/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (state.selectedId === id) state.selectedId = null;
+      state.detail = null;
+      await Promise.all([loadLoops(), loadArchivedLoops(), loadSession()]);
+      showHome();
+    } catch (error) { notice(`Couldn’t delete this CtrlLoop: ${error.message}`, true); }
+    return;
+  }
+  if (!event.target.closest("#run-instruction") || state.switchingCompany || state.running || hasActiveRun() || state.session?.worker?.mode !== "agent" || state.session?.worker?.status !== "online" || !state.detail?.instruction || state.detail?.archived_at) return;
   const id = state.detail.id, generation = state.sessionGeneration; state.running = true; renderControl(); $("page-notice").hidden = true;
   try { await api(`/api/loops/${encodeURIComponent(id)}/runs`, { method: "POST" }); if (generation === state.sessionGeneration) await Promise.all([loadDetail(id), loadLoops(), loadSession()]); }
   catch (error) { if (generation === state.sessionGeneration && error.status !== 401) notice(`Couldn’t start this run: ${error.message}`, true); }
@@ -718,6 +767,7 @@ $("home-desktop").addEventListener("click", () => { if (!state.creating) showDes
 $('workbench-nav').addEventListener('click', () => { if (!state.creating) showWorkbench(); });
 $("new-loop").addEventListener("click", () => { if (!state.creating) showHome({ focus: true }); });
 $("home-nav").addEventListener("click", () => { if (!state.creating) showHome(); });
+$("archived-nav").addEventListener("click", () => { if (!state.creating) showArchived(); });
 $("company-nav").addEventListener("click", () => {
   if (!canManageCompany() || state.creating) return;
   workbench.deactivate();

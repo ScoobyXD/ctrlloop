@@ -812,12 +812,63 @@ async def change_mode(body: Mode, request: Request):
 
 
 @app.get('/api/loops')
-async def list_loops(request: Request):
+async def list_loops(request: Request, archived: bool = False):
     async with database() as db:
         identity = await authorize(request, db)
+        clause = 'l.company_id=%s AND l.archived_at IS NOT NULL AND l.deleted_at IS NULL' if archived else 'l.company_id=%s AND l.archived_at IS NULL AND l.deleted_at IS NULL'
         return await (await db.execute('''SELECT l.*,jsonb_build_object('id',u.id,'email',u.email,'display_name',u.display_name) AS creator
-            FROM loops l LEFT JOIN users u ON u.id=l.created_by WHERE l.company_id=%s
+            FROM loops l LEFT JOIN users u ON u.id=l.created_by WHERE ''' + clause + '''
             ORDER BY l.created_at DESC LIMIT 100''', (identity['company_id'],))).fetchall()
+
+
+@app.post('/api/loops/{identity}/archive')
+async def archive_loop(identity: UUID, request: Request):
+    async with database() as db:
+        principal = await authorize(request, db)
+        row = await (await db.execute('SELECT * FROM loops WHERE id=%s AND company_id=%s FOR UPDATE', (identity, principal['company_id']))).fetchone()
+        if not row: raise HTTPException(404, 'Loop not found')
+        if row['created_by'] != acting_user(principal) and not principal['is_devadmin']:
+            raise HTTPException(403, 'Only the author can archive this CtrlLoop')
+        if row['deleted_at'] is not None: raise HTTPException(409, 'This CtrlLoop was permanently deleted')
+        if row['archived_at'] is not None: return row
+        active = await (await db.execute("SELECT id FROM runs WHERE loop_id=%s AND status IN ('queued','running','paused')", (identity,))).fetchone()
+        if active: raise HTTPException(409, 'Stop the active run before archiving this CtrlLoop')
+        row = await (await db.execute('UPDATE loops SET archived_at=now() WHERE id=%s AND company_id=%s RETURNING *', (identity, principal['company_id']))).fetchone()
+        await event(db, identity, 'loop_archived', 'CtrlLoop archived', data={'actor_user_id': str(principal['user_id'])})
+        return row
+
+
+@app.post('/api/loops/{identity}/restore')
+async def restore_loop(identity: UUID, request: Request):
+    async with database() as db:
+        principal = await authorize(request, db)
+        row = await (await db.execute('SELECT * FROM loops WHERE id=%s AND company_id=%s FOR UPDATE', (identity, principal['company_id']))).fetchone()
+        if not row: raise HTTPException(404, 'Loop not found')
+        if row['created_by'] != acting_user(principal) and not principal['is_devadmin']:
+            raise HTTPException(403, 'Only the author can restore this CtrlLoop')
+        if row['deleted_at'] is not None: raise HTTPException(409, 'This CtrlLoop was permanently deleted')
+        if row['archived_at'] is None: return row
+        row = await (await db.execute('UPDATE loops SET archived_at=NULL WHERE id=%s AND company_id=%s RETURNING *', (identity, principal['company_id']))).fetchone()
+        await event(db, identity, 'loop_restored', 'CtrlLoop restored', data={'actor_user_id': str(principal['user_id'])})
+        return row
+
+
+@app.delete('/api/loops/{identity}')
+async def delete_loop(identity: UUID, request: Request):
+    async with database() as db:
+        principal = await authorize(request, db)
+        row = await (await db.execute('SELECT * FROM loops WHERE id=%s AND company_id=%s FOR UPDATE', (identity, principal['company_id']))).fetchone()
+        if not row: raise HTTPException(404, 'Loop not found')
+        if row['created_by'] != acting_user(principal) and not principal['is_devadmin']:
+            raise HTTPException(403, 'Only the author can permanently delete this CtrlLoop')
+        if row['archived_at'] is None: raise HTTPException(409, 'Archive this CtrlLoop before deleting it permanently')
+        active = await (await db.execute("SELECT id FROM runs WHERE loop_id=%s AND status IN ('queued','running','paused')", (identity,))).fetchone()
+        if active: raise HTTPException(409, 'Stop the active run before permanently deleting this CtrlLoop')
+        await db.execute('DELETE FROM events WHERE company_id=%s AND loop_id=%s', (principal['company_id'], identity))
+        await db.execute('DELETE FROM runs WHERE company_id=%s AND loop_id=%s', (principal['company_id'], identity))
+        await db.execute('DELETE FROM loops WHERE id=%s AND company_id=%s', (identity, principal['company_id']))
+        await event(db, identity, 'loop_deleted', 'CtrlLoop permanently deleted', data={'actor_user_id': str(principal['user_id'])})
+        return {'deleted': True, 'loop_id': str(identity)}
 
 
 @app.post('/api/loops')
@@ -861,6 +912,8 @@ async def update_loop(identity: UUID, body: LoopUpdate, request: Request):
         if not row: raise HTTPException(404, 'Loop not found')
         if row['created_by'] != acting_user(principal) and not principal['is_devadmin']:
             raise HTTPException(403, 'Only the author can edit this workbench')
+        if row['archived_at'] is not None or row['deleted_at'] is not None:
+            raise HTTPException(409, 'Archived or deleted CtrlLoops cannot be edited')
         if row['steps'] is None: raise HTTPException(409, 'Only manual workbenches have editable steps')
         if row['version'] != body.version: raise HTTPException(409, 'This workbench changed; reload before saving')
         active = await (await db.execute("SELECT id FROM runs WHERE loop_id=%s AND status IN ('queued','running','paused')",
@@ -953,6 +1006,8 @@ async def create_run(identity: UUID, request: Request, body: RunRequest | None =
         principal = await authorize(request, db)
         loop = await (await db.execute('SELECT * FROM loops WHERE id=%s AND company_id=%s', (identity,principal['company_id']))).fetchone()
         if not loop or loop['status'] != 'ready': raise HTTPException(409, 'A saved instruction is required')
+        if loop['archived_at'] is not None or loop['deleted_at'] is not None:
+            raise HTTPException(409, 'Archived or deleted CtrlLoops cannot be started')
         if loop['steps'] is not None and (body is None or body.request_id is None):
             raise HTTPException(422, 'Manual runs require a unique request_id to prevent duplicate execution')
         return await queue_run(db, loop, principal, mode=body.mode if body else 'sequence',

@@ -68,6 +68,7 @@
       <button id="new-loop" class="new-loop"><span aria-hidden="true">＋</span> New CtrlLoop <kbd>N</kbd></button>
       <button id="workbench-nav" class="nav-item"><span aria-hidden="true">↦</span> Action workbench</button>
       <button id="home-nav" class="nav-item selected" aria-current="page"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m3 9 7-6 7 6v8h-5v-5H8v5H3Z"/></svg>Home<span class="nav-arrow" aria-hidden="true">↗</span></button>
+      <button id="archived-nav" class="nav-item"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 6.5h10M5 10h10M5 13.5h7"/><path d="M13.5 13.5h1.5v1.5h-1.5z"/></svg>Archived Loops<span class="nav-arrow" aria-hidden="true">↗</span></button>
       <div class="sidebar-section-label"><h2>CTRLLOOPS</h2><span id="loop-count">0</span></div>
       <div id="loop-list" class="loop-list"><p class="list-empty">Loading CtrlLoops…</p></div>
       <div class="sidebar-bottom"><button id="company-nav" class="nav-item" hidden><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="6" r="3"/><path d="M2 17v-2a5 5 0 0 1 10 0v2M14 3a3 3 0 0 1 0 6m1 3a4 4 0 0 1 3 4"/></svg>Company settings</button><div class="profile"><span id="user-initial" class="avatar" aria-hidden="true">—</span><div class="signed-in-person"><strong id="user-name">Signed in</strong><span id="user-role"></span></div><button id="logout" class="icon-button" aria-label="Sign out" title="Sign out"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 3H3v14h5m-1-7h10m-4-4 4 4-4 4"/></svg></button></div></div>
@@ -91,6 +92,10 @@
           <section class="panel compose-panel" id="compose-panel" aria-labelledby="compose-title"><div class="panel-heading"><h2 id="compose-title">What would you like to do?</h2><span class="technical-label">NEW CTRLLOOP</span></div><form id="compose-form"><label class="sr-only" for="prompt">Describe what your desktop should do</label><textarea id="prompt" name="prompt" rows="3" maxlength="2000" required placeholder="e.g. Open the search field in my browser"></textarea><div class="compose-bottom"><span id="compose-hint" class="compose-hint">Describe it once. We’ll prepare the instruction and start.</span><button id="create-loop" class="button primary" type="submit">Start CtrlLoop <span aria-hidden="true">↗</span></button></div></form><div class="compose-foot"><span><i class="status-dot" id="compose-worker-dot"></i><span id="compose-worker">Checking desktop</span><button id="home-desktop" type="button" class="desktop-shortcut">Open desktop ↗</button></span><span class="technical-label">01 REQUEST <b>→</b> 02 PREPARE <b>→</b> 03 EXECUTE</span></div></section>
           <section class="recent-section"><div class="section-heading"><h2>Recent CtrlLoops</h2><span id="home-loop-count" class="technical-label"></span></div><div id="recent-loops" class="recent-loops"><p class="list-empty">Your first CtrlLoop starts above.</p></div></section>
           <footer class="page-footer"><span>CTRLLOOP / HUMAN INTENT. COMPUTER ACTION.</span><span id="model-label" hidden></span><span>CTRL + ENTER TO START</span></footer>
+        </section>
+
+        <section id="archived-view" class="home-view" hidden aria-label="Archived CtrlLoops">
+          <div class="panel compose-panel archived-panel"><div class="panel-heading"><h2>Archived CtrlLoops</h2><span class="technical-label" id="archived-count">0</span></div><div id="archived-loops" class="recent-loops"><p class="list-empty">No archived CtrlLoops yet.</p></div></div>
         </section>
 
         <section id="loop-view" class="loop-view" hidden aria-label="Selected CtrlLoop">
