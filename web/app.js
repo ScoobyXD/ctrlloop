@@ -324,7 +324,7 @@ function renderArchivedLoops() {
   const archiveCount = state.archivedLoops.length;
   $("archived-count").textContent = String(archiveCount).padStart(2, "0");
   if (!archiveCount) { $("archived-loops").innerHTML = '<p class="list-empty">No archived CtrlLoops yet.</p>'; return; }
-  $("archived-loops").innerHTML = state.archivedLoops.map(loop => `<button class="recent-loop" data-loop-id="${escapeHtml(loop.id)}"><span class="recent-loop-index">ARCHIVE / ${String(loop.id).slice(0, 8).toUpperCase()}</span><span class="recent-loop-arrow" aria-hidden="true">↗</span><span class="recent-loop-title">${escapeHtml(loop.prompt || "Untitled CtrlLoop")}</span><span class="recent-loop-meta"><i class="status-dot ${errorStatuses.has(loop.status) ? "error" : loop.status === "generating" ? "warn" : ""}"></i>${escapeHtml(humanize(loop.status))}<span>·</span>${escapeHtml(validDate(loop.archived_at || loop.created_at)?.toLocaleDateString(undefined, { month: "short", day: "numeric" }) || "")}</span></button>`).join("");
+  $("archived-loops").innerHTML = state.archivedLoops.map(loop => `<article class="recent-loop archived-loop"><button type="button" class="archived-loop-open" data-loop-id="${escapeHtml(loop.id)}"><span class="recent-loop-index">ARCHIVE / ${escapeHtml(String(loop.id).slice(0, 8).toUpperCase())}</span><span class="recent-loop-arrow" aria-hidden="true">↗</span><span class="recent-loop-title">${escapeHtml(loop.prompt || "Untitled CtrlLoop")}</span></button><div class="archived-loop-footer"><span class="recent-loop-meta"><i class="status-dot ${errorStatuses.has(loop.status) ? "error" : loop.status === "generating" ? "warn" : ""}"></i>${escapeHtml(humanize(loop.status))}<span>·</span>${escapeHtml(validDate(loop.archived_at || loop.created_at)?.toLocaleDateString(undefined, { month: "short", day: "numeric" }) || "")}</span><div class="archived-loop-actions"><button type="button" class="button quiet small" data-loop-id="${escapeHtml(loop.id)}" data-archive-action="restore">Recover</button><button type="button" class="button quiet small" data-loop-id="${escapeHtml(loop.id)}" data-archive-action="delete" title="Delete permanently">Delete</button></div></div></article>`).join("");
 }
 function renderLoops() {
   renderHome();
@@ -778,7 +778,17 @@ $("compose-form").addEventListener("submit", async (event) => {
     if (generation === state.sessionGeneration) { state.creating = false; $("create-loop").innerHTML = 'Start CtrlLoop <span aria-hidden="true">↗</span>'; $("prompt").disabled = false; renderControl(); }
   }
 });
-for (const id of ["loop-list", "recent-loops", "archived-loops"]) $(id).addEventListener("click", event => { const item = event.target.closest("[data-loop-id]"); if (item && !state.creating) void selectLoop(item.dataset.loopId); });
+for (const id of ["loop-list", "recent-loops", "archived-loops"]) $(id).addEventListener("click", async event => {
+  const item = event.target.closest("[data-loop-id]");
+  if (!item || item.disabled || state.creating || state.switchingCompany) return;
+  const action = item.dataset.archiveAction;
+  if (!action) { void selectLoop(item.dataset.loopId); return; }
+  const buttons = item.closest('.archived-loop-actions').querySelectorAll('button');
+  buttons.forEach(button => { button.disabled = true; });
+  try { await changeLoopArchive(item.dataset.loopId, action); }
+  catch (error) { notice(`Couldn’t ${action === 'restore' ? 'recover' : 'delete'} this CtrlLoop: ${error.message}`, true); }
+  finally { buttons.forEach(button => { button.disabled = false; }); }
+});
 $("loop-detail").addEventListener("click", async (event) => {
   if (event.target.closest("#reuse-request")) { const prompt = state.detail?.prompt || ""; showHome({ focus: true }); $("prompt").value = prompt; return; }
   if (event.target.closest("#archive-loop")) {

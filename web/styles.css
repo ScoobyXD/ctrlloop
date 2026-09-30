@@ -127,6 +127,10 @@ button svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.4
 .recent-loop-title{font-size:13px;color:#d4d1ca;line-height:1.65;margin:11px 0 18px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
 .recent-loop-meta{color:#83817a;font:10px var(--mono);margin-top:auto;display:flex;align-items:center;gap:8px}
 .recent-loop-arrow{position:absolute;top:14px;right:16px;color:#878079;font-size:17px}
+.archived-loop-open{display:flex;flex-direction:column;align-items:start;width:100%;flex:1;padding:0;border:0;background:transparent;text-align:left}
+.archived-loop-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;width:100%;margin-top:auto}
+.archived-loop-footer .recent-loop-meta{margin-top:0}
+.archived-loop-actions{display:flex;gap:8px;margin-left:auto}
 .recent-empty{grid-column:1/-1;display:flex;gap:19px;align-items:center;padding:23px 0;border-top:1px dashed #303030;color:#a09d96}
 .recent-empty>span{font:24px var(--mono);color:#5b5650}
 .recent-empty p{font-size:13px;margin:0}
