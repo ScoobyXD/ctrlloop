@@ -362,5 +362,5 @@ export function createWorkbench(host, {api, session, scopedURL, onSaved, onRefre
     const menu = host.querySelector('.wb-history[open]');
     if (event.key === 'Escape' && menu) { menu.open = false; menu.querySelector('summary').focus(); }
   });
-  return {open, update, render, reset, deactivate};
+  return {open, update, render, reset, deactivate, archive: () => archiveCommand('archive')};
 }

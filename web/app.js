@@ -326,7 +326,7 @@ function renderLoops() {
   state.lastListSignature = signature;
   $("loop-count").textContent = String(state.loops.length).padStart(2, "0");
   if (!state.loops.length) { $("loop-list").innerHTML = '<p class="list-empty">Your CtrlLoops live here.<br>Start with a new request.</p>'; return; }
-  $("loop-list").innerHTML = state.loops.map(loop => `<button class="loop-list-item ${String(loop.id) === String(state.selectedId) ? "selected" : ""}" data-loop-id="${escapeHtml(loop.id)}" ${String(loop.id) === String(state.selectedId) ? 'aria-current="page"' : ""}><span class="loop-icon" aria-hidden="true">↳</span><span class="list-title">${escapeHtml(loop.prompt || "Untitled CtrlLoop")}</span><span class="list-item-meta"><i class="status-dot ${errorStatuses.has(loop.status) ? "error" : loop.status === "generating" ? "warn" : ""}"></i>${escapeHtml(humanize(loop.status))}<time title="${escapeHtml(formatDate(loop.created_at))}">${escapeHtml(validDate(loop.created_at)?.toLocaleDateString(undefined, { month: "short", day: "numeric" }) || "—")}</time></span></button>`).join("");
+  $("loop-list").innerHTML = state.loops.map(loop => `<div class="loop-list-entry"><button class="loop-list-item ${String(loop.id) === String(state.selectedId) ? "selected" : ""}" data-loop-id="${escapeHtml(loop.id)}" ${String(loop.id) === String(state.selectedId) ? 'aria-current="page"' : ""}><span class="loop-icon" aria-hidden="true">↳</span><span class="list-title">${escapeHtml(loop.prompt || "Untitled CtrlLoop")}</span><span class="list-item-meta"><i class="status-dot ${errorStatuses.has(loop.status) ? "error" : loop.status === "generating" ? "warn" : ""}"></i>${escapeHtml(humanize(loop.status))}<time title="${escapeHtml(formatDate(loop.created_at))}">${escapeHtml(validDate(loop.created_at)?.toLocaleDateString(undefined, { month: "short", day: "numeric" }) || "—")}</time></span></button><button class="loop-sidebar-archive" type="button" data-archive-loop-id="${escapeHtml(loop.id)}" aria-label="Archive ${escapeHtml(loop.prompt || 'Untitled CtrlLoop')}">Archive</button></div>`).join("");
 }
 async function selectLoop(id, { fromHistory = false } = {}) {
   if (state.selectedId !== id) workbench.deactivate();
@@ -746,6 +746,17 @@ $("compose-form").addEventListener("submit", async (event) => {
   }
 });
 for (const id of ["loop-list", "recent-loops", "archived-loops"]) $(id).addEventListener("click", event => { const item = event.target.closest("[data-loop-id]"); if (item && !state.creating) void selectLoop(item.dataset.loopId); });
+$("loop-list").addEventListener("click", async event => {
+  const button = event.target.closest('[data-archive-loop-id]');
+  if (!button || button.disabled || state.creating || state.switchingCompany) return;
+  const id = button.dataset.archiveLoopId;
+  button.disabled = true;
+  try {
+    if (state.selectedId === id && Array.isArray(state.detail?.steps)) await workbench.archive();
+    else await changeLoopArchive(id, 'archive');
+  } catch (error) { notice(`Couldn’t archive this CtrlLoop: ${error.message}`, true); }
+  finally { button.disabled = false; }
+});
 $("loop-detail").addEventListener("click", async (event) => {
   if (event.target.closest("#reuse-request")) { const prompt = state.detail?.prompt || ""; showHome({ focus: true }); $("prompt").value = prompt; return; }
   if (event.target.closest("#archive-loop")) {
