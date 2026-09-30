@@ -91,7 +91,7 @@ class RFBInputFilter:
 
 
 @asynccontextmanager
-async def desktop_connection(worker, environment):
+async def desktop_connection(worker, environment, *, permission_events=False):
     """Use Fleet's existing signed-service API; never create/release a claim.
 
     An issuance failure revokes its URL. Successful URLs expire at Fleet after
@@ -133,7 +133,10 @@ async def desktop_connection(worker, environment):
             credential = match[1]
             # Fleet strips its routing prefix. Reuse the SAME capability so the
             # guest can resolve its session binding, instead of minting another.
-            url = 'wss://run.cua.ai' + parsed.path + 'websockify?' + urlencode({'credential': credential})
+            query = {'credential': credential}
+            if permission_events and health.get('live_permissions') is True:
+                query['permission_events'] = '1'
+            url = 'wss://run.cua.ai' + parsed.path + 'websockify?' + urlencode(query)
             yield signed, credential, url
         except BaseException:
             try:

@@ -128,6 +128,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS runs_request_id ON runs(company_id, initiated_
 -- leaves a gap in the desktop's single active reservation guarantee.
 DROP INDEX IF EXISTS one_active_run_per_worker;
 
+-- A shared scalar on the existing worker authority orders permission grants
+-- from concurrent viewers. Heartbeats do not advance control ownership.
+ALTER TABLE workers ADD COLUMN IF NOT EXISTS control_version bigint NOT NULL DEFAULT 0;
+CREATE OR REPLACE FUNCTION ctrlloop_worker_control_version() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.mode IS DISTINCT FROM OLD.mode
+       OR NEW.human_session IS DISTINCT FROM OLD.human_session
+       OR NEW.active_run IS DISTINCT FROM OLD.active_run THEN
+        NEW.control_version := OLD.control_version + 1;
+    ELSE
+        NEW.control_version := OLD.control_version;
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE OR REPLACE TRIGGER desktop_policy_worker_control_version
+BEFORE UPDATE ON workers FOR EACH ROW EXECUTE FUNCTION ctrlloop_worker_control_version();
+
 -- Existing authority rows invalidate live desktop grants across every backend
 -- process. These are transient wakeups, not another session/ownership model.
 -- Heartbeat timestamps and source revisions deliberately do not trigger them.
@@ -138,9 +156,11 @@ DECLARE
     current_row jsonb;
     column_index integer;
     changed boolean := false;
+    notification_scope text;
 BEGIN
     IF TG_OP = 'TRUNCATE' THEN
         PERFORM pg_notify('ctrlloop_desktop_policy', '*');
+        PERFORM pg_notify('ctrlloop_desktop_policy_v2', '*');
         RETURN NULL;
     END IF;
     previous_row := to_jsonb(OLD);
@@ -154,9 +174,26 @@ BEGIN
         END LOOP;
         IF NOT changed THEN RETURN NULL; END IF;
     END IF;
+    notification_scope := TG_ARGV[0];
+    -- Only ownership/run changes preserve the viewing connection. Mixed
+    -- changes and all identity, assignment, or credential changes revoke it.
+    IF TG_OP = 'UPDATE' AND notification_scope = 'worker'
+       AND (previous_row -> 'id', previous_row -> 'company_id', previous_row -> 'assigned_user_id',
+            previous_row -> 'credential_hash', previous_row -> 'fleet_namespace',
+            previous_row -> 'fleet_claim', previous_row -> 'disabled_at') IS NOT DISTINCT FROM
+           (current_row -> 'id', current_row -> 'company_id', current_row -> 'assigned_user_id',
+            current_row -> 'credential_hash', current_row -> 'fleet_namespace',
+            current_row -> 'fleet_claim', current_row -> 'disabled_at') THEN
+        notification_scope := 'worker-control';
+    END IF;
+    -- Preserve the legacy hard notification so an older process cannot miss
+    -- revocation during rolling deployment or rollback. New processes listen
+    -- only to v2, where ownership/run changes can update a connected viewer.
     PERFORM pg_notify('ctrlloop_desktop_policy', TG_ARGV[0] || ':' || (previous_row ->> TG_ARGV[1]));
+    PERFORM pg_notify('ctrlloop_desktop_policy_v2', notification_scope || ':' || (previous_row ->> TG_ARGV[1]));
     IF TG_OP = 'UPDATE' AND previous_row -> TG_ARGV[1] IS DISTINCT FROM current_row -> TG_ARGV[1] THEN
         PERFORM pg_notify('ctrlloop_desktop_policy', TG_ARGV[0] || ':' || (current_row ->> TG_ARGV[1]));
+        PERFORM pg_notify('ctrlloop_desktop_policy_v2', notification_scope || ':' || (current_row ->> TG_ARGV[1]));
     END IF;
     RETURN NULL;
 END $$;

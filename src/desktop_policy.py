@@ -6,7 +6,9 @@ import logging
 from psycopg import AsyncConnection
 
 
-CHANNEL = 'ctrlloop_desktop_policy'
+# The legacy channel keeps hard invalidations for older backend processes
+# during deployment overlap or rollback. Only this channel carries soft updates.
+CHANNEL = 'ctrlloop_desktop_policy_v2'
 logger = logging.getLogger('uvicorn.error.desktop')
 
 
@@ -22,6 +24,7 @@ class DesktopPolicyNotifications:
         self.conninfo = conninfo
         self.ready = asyncio.Event()
         self.subscriptions = {}
+        self.permission_updates = {}
         self.task = None
 
     async def start(self):
@@ -31,9 +34,19 @@ class DesktopPolicyNotifications:
             await asyncio.wait_for(self.ready.wait(), 10)
 
     def invalidate(self, scope=None):
+        permission_change = bool(scope and scope.startswith('worker-control:'))
+        if permission_change:
+            scope = 'worker:' + scope.removeprefix('worker-control:')
         for changed, scopes in tuple(self.subscriptions.items()):
             if scope in (None, '*') or scopes is None or scope in scopes:
-                changed.set()
+                update = self.permission_updates.get(changed)
+                # Admission has not resolved its exact identity yet. It must
+                # still fail closed on any intervening authority change.
+                if permission_change and scopes is not None and update is not None:
+                    update[1] += 1
+                    update[0].set()
+                else:
+                    changed.set()
 
     def subscribe(self):
         if not self.ready.is_set():
@@ -49,8 +62,23 @@ class DesktopPolicyNotifications:
             raise PermissionError('Desktop authorization changed during validation')
         self.subscriptions[changed] = frozenset(scopes)
 
+    def enable_live_permissions(self, changed):
+        pending = asyncio.Event()
+        self.permission_updates[changed] = [pending, 0]
+        return pending
+
+    def permission_version(self, changed):
+        update = self.permission_updates.get(changed)
+        return update[1] if update is not None else 0
+
+    def permissions_current(self, changed, version):
+        """Check the sequence captured before querying without clearing revocation."""
+        update = self.permission_updates.get(changed)
+        return update is None or update[1] == version
+
     def unsubscribe(self, changed):
         self.subscriptions.pop(changed, None)
+        self.permission_updates.pop(changed, None)
 
     async def listen(self):
         try:

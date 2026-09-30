@@ -238,7 +238,7 @@ async def worker_authorize(request, db, *, lock=True):
 def public_worker(worker, digest=None, *, queued_run=None):
     if not worker: return None
     age = (datetime.now(timezone.utc)-worker['last_seen']).total_seconds() if worker['last_seen'] else 1e9
-    return {key: worker[key] for key in ('id', 'mode', 'last_seen', 'revision', 'active_run', 'fleet_namespace', 'fleet_claim')} | {
+    return {key: worker[key] for key in ('id', 'mode', 'last_seen', 'revision', 'active_run', 'control_version', 'fleet_namespace', 'fleet_claim')} | {
         'queued_run': queued_run,
         'status': 'online' if age < 30 else 'offline',
         'can_control': worker['mode'] == 'human' and worker['human_session'] == digest}
@@ -1281,7 +1281,8 @@ async def connect_desktop(request: Request):
         worker = await assigned_worker(db, identity)
     try:
         async with asyncio.timeout(25):
-            async with desktop_connection(worker, os.environ['APP_ENV']) as (signed, credential, url):
+            async with desktop_connection(worker, os.environ['APP_ENV'],
+                                          permission_events=request.headers.get('X-CtrlLoop-Desktop-Permissions') == 'live') as (signed, credential, url):
                 async with database() as db:
                     # Fleet calls do not hold database locks. Recheck the exact
                     # session/assignment after issuance and before publication.
@@ -1353,7 +1354,7 @@ async def desktop_policy_worker(db, websocket, credential_hash, *, admission=Fal
 
 @app.websocket('/api/worker/desktop-policy')
 async def desktop_policy(websocket: WebSocket):
-    """Admission/daily validation, with immediate committed-change invalidation.
+    """Admission/daily checks and opted-in ownership updates on one socket.
 
     Ordinary input uses the guest's local gate. No database transaction remains
     open while this policy socket is idle, and no per-input API exchange exists.
@@ -1367,30 +1368,76 @@ async def desktop_policy(websocket: WebSocket):
         changed = notifications.subscribe()
 
         async def communicate():
+            send_lock = asyncio.Lock()
+            refresh_requested = asyncio.Event()
+            permission_updates = None
+            paused_version = 0
+            inner_tasks = []
             # The outer timeout closes an idle or blocked socket at session
             # expiry, independently of the next requested daily validation.
             async with asyncio.timeout(None) as authorization:
-                async def validate(digest, *, admission=False):
+                async def pause_permissions():
+                    nonlocal paused_version
+                    async with send_lock:
+                        version = notifications.permission_version(changed)
+                        if version <= paused_version:
+                            return
+                        notifications.bind(changed, notifications.subscriptions[changed])
+                        await asyncio.wait_for(websocket.send_json({'op': 'pause'}), 2)
+                        paused_version = version
+                        refresh_requested.set()
+
+                async def watch_permissions():
+                    while True:
+                        await permission_updates.wait()
+                        permission_updates.clear()
+                        # This task can revoke input during an in-flight daily
+                        # DB query. It never receives messages or queries DB.
+                        await pause_permissions()
+
+                async def validate(digest, *, admission=False, operation='check'):
                     checked_at = asyncio.get_running_loop().time()
                     async with asyncio.timeout(5):
-                        async with database() as db:
-                            worker, allowed, expires_at, scopes, control_session = await desktop_policy_worker(
-                                db, websocket, digest, admission=admission)
-                    notifications.bind(changed, scopes)
-                    expires_in_seconds = (expires_at - datetime.now(timezone.utc)).total_seconds()
-                    if expires_in_seconds <= 0:
-                        raise PermissionError('Desktop session expired')
-                    # Daily refresh has a small exchange margin; session expiry
-                    # itself is never extended. Transport pings do not query DB.
-                    authorization.reschedule(min(asyncio.get_running_loop().time() + expires_in_seconds,
-                                                 checked_at + 86400 + 7))
-                    response = {'valid': True, 'allowed': allowed,
-                                'expires_in_seconds': expires_in_seconds,
-                                'control_session': control_session}
-                    if admission:
-                        response.update(worker_id=worker['id'], company_id=str(worker['company_id']),
-                                        assigned_user_id=str(worker['assigned_user_id']), environment=os.environ['APP_ENV'])
-                    await asyncio.wait_for(websocket.send_json(response), 2)
+                        while True:
+                            # Capture before querying. A committed change that
+                            # arrives during the snapshot forces a fresh read.
+                            version = notifications.permission_version(changed)
+                            if permission_updates is not None and not admission:
+                                await pause_permissions()
+                            async with database() as db:
+                                worker, allowed, expires_at, scopes, control_session = await desktop_policy_worker(
+                                    db, websocket, digest, admission=admission)
+                            notifications.bind(changed, scopes)
+                            expires_in_seconds = (expires_at - datetime.now(timezone.utc)).total_seconds()
+                            if expires_in_seconds <= 0:
+                                raise PermissionError('Desktop session expired')
+                            response = {'valid': True, 'allowed': allowed,
+                                        'expires_in_seconds': expires_in_seconds,
+                                        'control_session': control_session}
+                            if permission_updates is not None:
+                                response.update(live_permissions=True,
+                                                op='admission' if admission else operation,
+                                                control_version=worker['control_version'],
+                                                worker_mode=worker['mode'],
+                                                current_control_session=worker['human_session'])
+                            if admission:
+                                response.update(worker_id=worker['id'], company_id=str(worker['company_id']),
+                                                assigned_user_id=str(worker['assigned_user_id']), environment=os.environ['APP_ENV'])
+                            async with send_lock:
+                                # The existing admission guard also protects
+                                # sends after lock acquisition. Hard changes
+                                # are irrevocable; soft refresh cannot clear them.
+                                notifications.bind(changed, scopes)
+                                if not notifications.permissions_current(changed, version):
+                                    continue
+                                if operation == 'update':
+                                    refresh_requested.clear()
+                                # Daily refresh has an exchange margin; expiry
+                                # itself is never extended. Pings do not query DB.
+                                authorization.reschedule(min(asyncio.get_running_loop().time() + expires_in_seconds,
+                                                             checked_at + 86400 + 7))
+                                await asyncio.wait_for(websocket.send_json(response), 2)
+                                return
 
                 async with asyncio.timeout(5):
                     async with database() as db:
@@ -1402,13 +1449,44 @@ async def desktop_policy(websocket: WebSocket):
                             or not isinstance(credential, str) or not 20 <= len(credential) <= 4096):
                         raise PermissionError('Invalid desktop policy admission')
                     digest = token_hash(credential)
+                    if initial.get('live_permissions') is True:
+                        permission_updates = notifications.enable_live_permissions(changed)
                     del credential, initial
                     await validate(digest, admission=True)
-                while True:
-                    message = await websocket.receive_json()
-                    if message != {'op': 'check'}:
-                        raise ValueError('Invalid desktop policy operation')
-                    await validate(digest)
+                try:
+                    # Exactly one receiver owns the policy socket. A separate
+                    # notifier only sends pauses while validation is blocked.
+                    receiver = asyncio.create_task(websocket.receive_json())
+                    inner_tasks.append(receiver)
+                    if permission_updates is not None:
+                        watcher = asyncio.create_task(watch_permissions())
+                        refresh = asyncio.create_task(refresh_requested.wait())
+                        inner_tasks.extend((watcher, refresh))
+                    while True:
+                        waiting = [receiver]
+                        if permission_updates is not None:
+                            waiting.extend((watcher, refresh))
+                        done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+                        if permission_updates is not None and watcher in done:
+                            watcher.result()
+                            raise ConnectionError('Desktop permission watcher ended')
+                        if receiver in done:
+                            message = receiver.result()
+                            if message != {'op': 'check'}:
+                                raise ValueError('Invalid desktop policy operation')
+                            await validate(digest)
+                            inner_tasks.remove(receiver)
+                            receiver = asyncio.create_task(websocket.receive_json())
+                            inner_tasks.append(receiver)
+                        if permission_updates is not None and refresh_requested.is_set():
+                            await validate(digest, operation='update')
+                            inner_tasks.remove(refresh)
+                            refresh = asyncio.create_task(refresh_requested.wait())
+                            inner_tasks.append(refresh)
+                finally:
+                    for task in inner_tasks:
+                        task.cancel()
+                    await asyncio.gather(*inner_tasks, return_exceptions=True)
 
         tasks = [asyncio.create_task(communicate()), asyncio.create_task(changed.wait())]
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

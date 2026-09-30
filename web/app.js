@@ -14,7 +14,7 @@ const stageLabels = {
   completed: "Run completed", error: "Error", failed: "Run failed",
 };
 const viewerRetryDelays = [1000, 2000, 4000, 8000, 15000];
-const state = { session: null, sessionGeneration: 0, signingOut: false, loops: [], archivedLoops: [], detail: null, selectedId: null, creating: false, running: false, changingMode: false, pollBusy: false, rfb: null, viewerGeneration: 0, viewerConnecting: false, viewerWanted: false, viewerRetryCount: 0, viewerRetryTimer: null, viewerConnectTimer: null, viewerStableTimer: null, viewerSessionController: null, viewerFailure: "", lastDetailSignature: "", lastListSignature: "" };
+const state = { session: null, sessionGeneration: 0, signingOut: false, loops: [], archivedLoops: [], detail: null, selectedId: null, creating: false, running: false, changingMode: false, pollBusy: false, rfb: null, viewerSocket: null, viewerLivePermissions: false, viewerControlAllowed: false, viewerControlVersion: -1, viewerFocusPending: false, viewerGeneration: 0, viewerConnecting: false, viewerWanted: false, viewerRetryCount: 0, viewerRetryTimer: null, viewerConnectTimer: null, viewerStableTimer: null, viewerSessionController: null, viewerFailure: "", lastDetailSignature: "", lastListSignature: "" };
 Object.assign(state, { view: "home", controlUnconfirmed: false, switchingCompany: false, members: [], savingMember: false, savingCompany: false, authBusy: false, authView: "login", resetToken: null, companies: [], companyContext: null, userContext: null });
 const emptyDetail = $("loop-detail").innerHTML;
 let viewerModule;
@@ -176,6 +176,9 @@ function renderControl() {
   const maintenance = state.session?.worker?.mode === "maintenance";
   const agent = state.session?.worker?.mode === "agent";
   const canControl = state.session?.worker?.can_control === true && !state.controlUnconfirmed;
+  const expectedControlVersion = state.session?.worker?.control_version;
+  const guestControlReady = !state.viewerLivePermissions || (state.viewerControlAllowed && Number.isSafeInteger(expectedControlVersion) && expectedControlVersion >= 0 && state.viewerControlVersion >= expectedControlVersion);
+  const guestControlPending = human && canControl && !guestControlReady;
   const active = hasActiveRun();
   const disabled = !state.session?.worker?.id || (!human && !agent) || state.controlUnconfirmed || state.changingMode || state.switchingCompany || state.running || active || (human && !canControl);
   $("control-mode-label").textContent = state.changingMode ? "Switching…" : maintenance ? "Deployment in progress" : canControl ? "Return to agent ↗" : "View only";
@@ -184,17 +187,21 @@ function renderControl() {
   if (state.controlUnconfirmed) {
     $("control-mode-label").textContent = "Checking control";
     $("control-mode-description").textContent = "Desktop input is paused until ownership can be confirmed.";
+  } else if (guestControlPending && !state.changingMode) {
+    $("control-mode-label").textContent = "Applying control…";
+    $("control-mode-description").textContent = "Your screen stays live while desktop control is applied.";
   }
   $("control-mode-icon").parentElement.classList.toggle("human", canControl);
   $("toggle-control").disabled = disabled || (!canControl && (!state.rfb || state.viewerConnecting));
   $("toggle-control").setAttribute("aria-pressed", String(canControl));
-  $("toggle-control").setAttribute("aria-label", canControl ? "You have control. Return to agent" : `${$("control-mode-label").textContent}. Take control`);
+  $("toggle-control").setAttribute("aria-label", guestControlPending ? "Desktop control is being applied. Return to agent" : canControl ? "You have control. Return to agent" : `${$("control-mode-label").textContent}. Take control`);
   $("toggle-control").title = $("control-mode-description").textContent;
-  const inputEnabled = human && canControl && !disabled;
+  const inputEnabled = human && canControl && !disabled && guestControlReady;
   const takeover = $("desktop-takeover");
   takeover.hidden = inputEnabled || !state.rfb || state.viewerConnecting;
-  takeover.setAttribute("aria-disabled", String(disabled));
+  takeover.setAttribute("aria-disabled", String(disabled || guestControlPending));
   if (state.rfb) { state.rfb.viewOnly = !inputEnabled; state.rfb.focusOnClick = inputEnabled; }
+  focusViewerWhenReady();
   const startReason = !state.session?.worker?.id ? "Save your CtrlLoop now. An assigned desktop is needed before it can run." : maintenance ? "Your desktop is being updated. Starting will be available when it’s ready." : human ? "Return desktop control to the agent before starting a CtrlLoop." : state.session?.worker?.status !== "online" ? "Your desktop is offline. Starting will be available when it reconnects." : active ? "Your desktop is running a CtrlLoop. You can follow its activity or start another when it finishes." : "Describe it once. We’ll prepare the instruction and start.";
   $("compose-hint").textContent = startReason;
   $("create-loop").disabled = state.creating || state.switchingCompany || state.running || state.changingMode || (Boolean(state.session?.worker?.id) && (active || !agent || state.session.worker.status !== "online"));
@@ -405,6 +412,12 @@ function updateDurations() {
   }
 }
 
+function focusViewerWhenReady() {
+  if (!state.viewerFocusPending || !state.rfb || state.viewerConnecting || state.rfb.viewOnly) return;
+  state.viewerFocusPending = false;
+  const focused = document.activeElement;
+  if (desktopIsVisible() && !document.hidden && [document.body, $("desktop-takeover"), $("toggle-control")].includes(focused)) state.rfb.focus({ preventScroll: true });
+}
 function setViewerStatus(label, kind = "") { $("viewer-state").innerHTML = `<i class="status-dot ${kind}"></i>${escapeHtml(label)}`; }
 function viewerPlaceholder(title, message, canReconnect = true) { $("viewer-placeholder").hidden = false; $("viewer-placeholder-title").textContent = title; $("viewer-placeholder-message").textContent = message; $("reconnect-viewer").hidden = !canReconnect; }
 function clearViewerTimer(name) { clearTimeout(state[name]); state[name] = null; }
@@ -412,8 +425,11 @@ function closeViewerConnection() {
   state.viewerGeneration += 1; state.viewerConnecting = false;
   clearViewerTimer("viewerConnectTimer"); clearViewerTimer("viewerStableTimer");
   state.viewerSessionController?.abort(); state.viewerSessionController = null;
-  const rfb = state.rfb; state.rfb = null;
+  const rfb = state.rfb, socket = state.viewerSocket;
+  state.rfb = null; state.viewerSocket = null;
+  state.viewerLivePermissions = false; state.viewerControlAllowed = false; state.viewerControlVersion = -1; state.viewerFocusPending = false;
   if (rfb) { try { rfb.disconnect(); } catch { /* The connection may already be closed. */ } }
+  if (socket) { try { socket.close(); } catch { /* Also close sockets that failed before RFB attached. */ } }
 }
 function disconnectViewer() {
   state.viewerWanted = false; state.viewerRetryCount = 0;
@@ -476,17 +492,34 @@ async function connectViewer({ manual = false, focusOnConnect = false } = {}) {
     const { default: RFB } = await viewerModule;
     if (!current()) return;
     // Signed URLs authorize a new connection only. Never cache or reuse one on reconnect.
-    const connection = await api("/api/desktop/connection", { method: "POST", signal: controller.signal });
+    const connection = await api("/api/desktop/connection", { method: "POST", headers: { "X-CtrlLoop-Desktop-Permissions": "live" }, signal: controller.signal });
     if (!current()) return;
     state.viewerSessionController = null;
-    const rfb = new RFB($("desktop-canvas"), connection.url, { shared: true });
+    state.viewerLivePermissions = new URL(connection.url, location.href).searchParams.get("permission_events") === "1";
+    state.viewerControlAllowed = false; state.viewerControlVersion = -1; state.viewerFocusPending = focusOnConnect;
+    const socket = new WebSocket(connection.url, ["binary"]);
+    state.viewerSocket = socket;
+    // Register before RFB attaches its listener so permission messages never enter its binary parser.
+    socket.addEventListener("message", event => {
+      if (typeof event.data !== "string") return;
+      event.stopImmediatePropagation();
+      if (!current() || state.viewerSocket !== socket) return;
+      let permission;
+      try { permission = JSON.parse(event.data); } catch { /* Invalid text fails closed below. */ }
+      if (!permission || !["pause", "update"].includes(permission.op) || permission.live_permissions !== true || typeof permission.allowed !== "boolean" || !Number.isSafeInteger(permission.control_version) || permission.control_version < 0 || permission.control_version < state.viewerControlVersion || (permission.op === "pause" && permission.allowed)) {
+        viewerInterrupted("Desktop access interrupted", "The desktop sent an invalid control update. Reconnecting with fresh access.");
+        return;
+      }
+      state.viewerLivePermissions = true; state.viewerControlVersion = permission.control_version;
+      state.viewerControlAllowed = permission.op === "update" && permission.allowed;
+      renderControl();
+    });
+    const rfb = new RFB($("desktop-canvas"), socket, { shared: true });
     state.rfb = rfb; rfb.viewOnly = true; rfb.focusOnClick = false; rfb.scaleViewport = true; rfb.resizeSession = false; rfb.background = "#070707";
     rfb.addEventListener("connect", () => {
       if (!current() || state.rfb !== rfb) return;
       clearViewerTimer("viewerConnectTimer"); state.viewerConnecting = false;
       $("viewer-placeholder").hidden = true; setViewerStatus("Live", "live"); renderControl();
-      const focused = document.activeElement;
-      if (focusOnConnect && !rfb.viewOnly && desktopIsVisible() && !document.hidden && (focused === document.body || focused === $("desktop-takeover"))) rfb.focus({ preventScroll: true });
       // Brief connect/disconnect flapping must not reset the capped backoff.
       state.viewerStableTimer = setTimeout(() => {
         if (!current() || state.rfb !== rfb) return;
@@ -799,12 +832,19 @@ async function changeDesktopMode(mode) {
   if (state.changingMode || state.controlUnconfirmed || state.switchingCompany || state.signingOut || state.running || hasActiveRun() || !worker?.id) return;
   if (mode === "human" && (worker.mode !== "agent" || !state.rfb || state.viewerConnecting || !desktopIsVisible())) return;
   if (mode === "agent" && (worker.mode !== "human" || !worker.can_control)) return;
-  const generation = state.sessionGeneration, focusDesktop = document.activeElement === $("desktop-takeover");
+  const generation = state.sessionGeneration, focusDesktop = [$("desktop-takeover"), $("toggle-control")].includes(document.activeElement);
   state.changingMode = true;
-  // Retire the old admission before changing ownership, including an uncertain response.
-  clearViewerTimer("viewerRetryTimer"); closeViewerConnection(); renderControl();
-  setViewerStatus("Switching control", "warn");
-  viewerPlaceholder("Switching desktop control", "Applying your control change and reconnecting the desktop…", false);
+  // Pause local input while the guest applies ownership without replacing the video stream.
+  clearViewerTimer("viewerRetryTimer");
+  if (state.viewerLivePermissions) {
+    state.viewerFocusPending = mode === "human" && focusDesktop;
+    renderControl();
+    if (state.rfb && !state.viewerConnecting) setViewerStatus("Switching control", "warn");
+  } else {
+    // Older guests apply admission permissions only when a viewer connects.
+    closeViewerConnection(); renderControl(); setViewerStatus("Switching control", "warn");
+    viewerPlaceholder("Switching desktop control", "Applying your control change and reconnecting the desktop…", false);
+  }
   try {
     await api("/api/worker/mode", { method: "POST", body: JSON.stringify({ mode }) });
     if (generation === state.sessionGeneration) await loadSession();
@@ -816,7 +856,12 @@ async function changeDesktopMode(mode) {
   } finally {
     if (generation === state.sessionGeneration) {
       state.changingMode = false; renderControl();
-      if (state.viewerWanted && state.session?.authenticated && state.session?.worker?.id && desktopIsVisible()) void connectViewer({ manual: true, focusOnConnect: mode === "human" && focusDesktop });
+      if (state.rfb && !state.viewerConnecting) {
+        setViewerStatus("Live", "live");
+        if (!state.controlUnconfirmed && (state.session?.worker?.mode !== "human" || !state.session?.worker?.can_control)) state.viewerFocusPending = false;
+      } else if (!state.rfb && !state.viewerConnecting && state.viewerWanted && state.session?.authenticated && state.session?.worker?.id && desktopIsVisible()) {
+        void connectViewer({ manual: true, focusOnConnect: mode === "human" && focusDesktop });
+      }
     }
   }
 }
