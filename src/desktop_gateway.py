@@ -10,7 +10,7 @@ from urllib.parse import urlsplit, urlencode
 
 
 logger = logging.getLogger('uvicorn.error.desktop')
-STREAM_PROTOCOL = 'ctrlloop-direct-v1'
+STREAM_PROTOCOL = 'ctrlloop-direct-v2'
 SIGNED_URL_SECONDS = 120
 
 

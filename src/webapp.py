@@ -27,6 +27,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.websockets import WebSocketDisconnect
 
 from .desktop_gateway import desktop_connection
+from .desktop_policy import DesktopPolicyNotifications
 from .identity import token_hash, hash_password, check_password, normalize_email
 from .company_migration import migrate_company_schema
 from .account_mail import send_account_mail, delivery_mode
@@ -44,6 +45,7 @@ generation_tasks = set()
 login_attempts = {}
 dummy_password_hash = None
 database_pool = None
+desktop_policy_notifications = None
 logger = logging.getLogger('uvicorn.error.desktop')
 artifact_slots = asyncio.Semaphore(1)
 
@@ -64,7 +66,7 @@ async def event(db, loop_id, stage, message, *, run_id=None, data=None, event_id
 
 @asynccontextmanager
 async def lifespan(app):
-    global database_pool, dummy_password_hash
+    global database_pool, dummy_password_hash, desktop_policy_notifications
     if os.environ.get('OPENAI_MODEL', MODEL) != MODEL:
         raise RuntimeError('This MVP pins gpt-6-luna; model substitution is disabled')
     for name in ('DATABASE_URL', 'APP_ENV', 'APP_ORIGIN', 'OPENAI_API_KEY', 'CUA_CLIENT_ID', 'CUA_CLIENT_SECRET'):
@@ -83,8 +85,13 @@ async def lifespan(app):
             # Neither unfinished generation nor undispatched execution is replayed.
             await interrupt_queued_runs(db, 'Server restarted before dispatch. Start again when ready.')
             await db.execute("UPDATE loops SET status='error',error='Generation interrupted by server restart; create a new loop.' WHERE status='generating'")
+        desktop_policy_notifications = DesktopPolicyNotifications(os.environ['DATABASE_URL'])
+        await desktop_policy_notifications.start()
         yield
     finally:
+        if desktop_policy_notifications is not None:
+            await desktop_policy_notifications.close()
+            desktop_policy_notifications = None
         pending = list(generation_tasks)
         for task in pending: task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
@@ -1273,63 +1280,100 @@ async def desktop_policy_worker(db, websocket, credential_hash, *, admission=Fal
         AND disabled_at IS NULL FOR SHARE''',
         (worker['id'], worker['credential_hash'], binding['company_id'], binding['assigned_user_id'],
          binding['fleet_namespace'], binding['fleet_claim']))).fetchone()
-    # Lock the binding last: context changes take the same session/worker locks
-    # and cannot invalidate it between this check and the input acknowledgement.
-    live = await (await db.execute('SELECT token_hash FROM desktop_connections WHERE token_hash=%s FOR SHARE',
-                                  (credential_hash,))).fetchone()
+    # Read expiry after taking the existing session lock. A shortened session
+    # must not inherit its previous (longer) lifetime in the guest's local gate.
+    live = await (await db.execute('''SELECT d.token_hash,s.expires_at FROM desktop_connections d
+        JOIN sessions s ON s.token_hash=d.session_hash WHERE d.token_hash=%s FOR SHARE OF d''',
+        (credential_hash,))).fetchone()
     if worker is None or live is None:
         raise PermissionError('Desktop access changed')
     allowed = (worker['mode'] == 'human' and worker['human_session'] == identity['session_hash']
                and worker['active_run'] is None)
-    return worker, allowed
+    scopes = {'connection:' + credential_hash, 'session:' + binding['session_hash'],
+              'worker:' + worker['id'], 'user:' + str(identity['user_id']),
+              'user:' + str(worker['assigned_user_id']),
+              'company:' + str(identity['home_company_id']), 'company:' + str(worker['company_id'])}
+    return worker, allowed, live['expires_at'], scopes, binding['session_hash'] if allowed else None
 
 
 @app.websocket('/api/worker/desktop-policy')
 async def desktop_policy(websocket: WebSocket):
-    """Small authorization messages only; no pixels or RFB input cross the app.
+    """Admission/daily validation, with immediate committed-change invalidation.
 
-    A grant holds the existing database ownership locks through the guest ACK.
-    The guest's 2s end-to-end deadline is shorter than this 5s ACK timeout. Its
-    local worker lock also prevents a delayed grant overlapping agent execution
-    if the app/control channel fails. Never retry an input grant.
+    Ordinary input uses the guest's local gate. No database transaction remains
+    open while this policy socket is idle, and no per-input API exchange exists.
     """
+    notifications = desktop_policy_notifications
+    changed = None
+    tasks = []
     try:
-        async with asyncio.timeout(5):
-            async with database() as db:
-                await worker_authorize(websocket, db, lock=False)
-            await websocket.accept()
-            initial = await websocket.receive_json()
-            credential = initial.get('credential') if isinstance(initial, dict) else None
-            if not isinstance(credential, str) or not 20 <= len(credential) <= 4096:
-                raise PermissionError('Invalid desktop credential')
-            digest = token_hash(credential)
-            del credential, initial
-            async with database() as db:
-                worker, _ = await desktop_policy_worker(db, websocket, digest, admission=True)
-            await websocket.send_json({'valid': True, 'worker_id': worker['id'],
-                'company_id': str(worker['company_id']), 'assigned_user_id': str(worker['assigned_user_id']),
-                'environment': os.environ['APP_ENV']})
-        while True:
-            # Missing guest checks mean a dead connection; do not retain it.
-            message = await asyncio.wait_for(websocket.receive_json(), 20)
-            operation = message.get('op') if isinstance(message, dict) else None
-            if operation not in ('check', 'input'):
-                raise ValueError('Invalid desktop policy operation')
-            async with database() as db:
+        if notifications is None:
+            raise PermissionError('Desktop authorization notifications are unavailable')
+        changed = notifications.subscribe()
+
+        async def communicate():
+            # The outer timeout closes an idle or blocked socket at session
+            # expiry, independently of the next requested daily validation.
+            async with asyncio.timeout(None) as authorization:
+                async def validate(digest, *, admission=False):
+                    checked_at = asyncio.get_running_loop().time()
+                    async with asyncio.timeout(5):
+                        async with database() as db:
+                            worker, allowed, expires_at, scopes, control_session = await desktop_policy_worker(
+                                db, websocket, digest, admission=admission)
+                    notifications.bind(changed, scopes)
+                    expires_in_seconds = (expires_at - datetime.now(timezone.utc)).total_seconds()
+                    if expires_in_seconds <= 0:
+                        raise PermissionError('Desktop session expired')
+                    # Daily refresh has a small exchange margin; session expiry
+                    # itself is never extended. Transport pings do not query DB.
+                    authorization.reschedule(min(asyncio.get_running_loop().time() + expires_in_seconds,
+                                                 checked_at + 86400 + 7))
+                    response = {'valid': True, 'allowed': allowed,
+                                'expires_in_seconds': expires_in_seconds,
+                                'control_session': control_session}
+                    if admission:
+                        response.update(worker_id=worker['id'], company_id=str(worker['company_id']),
+                                        assigned_user_id=str(worker['assigned_user_id']), environment=os.environ['APP_ENV'])
+                    await asyncio.wait_for(websocket.send_json(response), 2)
+
                 async with asyncio.timeout(5):
-                    worker, allowed = await desktop_policy_worker(db, websocket, digest)
-                await asyncio.wait_for(websocket.send_json({'valid': True, 'allowed': allowed}), 2)
-                if operation == 'input':
-                    acknowledgement = await asyncio.wait_for(websocket.receive_json(), 5)
-                    if acknowledgement != {'op': 'ack'}:
-                        raise ValueError('Invalid desktop input acknowledgement')
+                    async with database() as db:
+                        await worker_authorize(websocket, db, lock=False)
+                    await websocket.accept()
+                    initial = await websocket.receive_json()
+                    credential = initial.get('credential') if isinstance(initial, dict) else None
+                    if (not isinstance(initial, dict) or initial.get('protocol') != 'ctrlloop-direct-v2'
+                            or not isinstance(credential, str) or not 20 <= len(credential) <= 4096):
+                        raise PermissionError('Invalid desktop policy admission')
+                    digest = token_hash(credential)
+                    del credential, initial
+                    await validate(digest, admission=True)
+                while True:
+                    message = await websocket.receive_json()
+                    if message != {'op': 'check'}:
+                        raise ValueError('Invalid desktop policy operation')
+                    await validate(digest)
+
+        tasks = [asyncio.create_task(communicate()), asyncio.create_task(changed.wait())]
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
     except WebSocketDisconnect:
         pass
     except Exception as error:
         logger.info('desktop policy closed error=%s', type(error).__name__)
     finally:
+        for task in tasks:
+            task.cancel()
+        # Close promptly on a notification even if an in-flight DB query needs
+        # additional cancellation/rollback time. No old grant survives the gap.
         with suppress(RuntimeError, OSError, WebSocketDisconnect, TimeoutError):
             await asyncio.wait_for(websocket.close(code=1008, reason='Desktop permission changed; reconnect'), 2)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if changed is not None:
+            notifications.unsubscribe(changed)
 
 
 @app.websocket('/api/desktop')

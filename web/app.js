@@ -381,7 +381,7 @@ function disconnectViewer() {
   $("desktop-canvas").replaceChildren(); setViewerStatus("Disconnected");
 }
 function scheduleViewerReconnect() {
-  if (!state.viewerWanted || !state.session?.authenticated || !state.session?.worker?.id || state.switchingCompany || state.signingOut || state.rfb || state.viewerConnecting || state.viewerRetryTimer !== null) return;
+  if (!state.viewerWanted || !state.session?.authenticated || !state.session?.worker?.id || state.switchingCompany || state.signingOut || state.changingMode || state.rfb || state.viewerConnecting || state.viewerRetryTimer !== null) return;
   if (document.hidden) {
     setViewerStatus("Reconnect paused", "warn");
     viewerPlaceholder("Desktop connection interrupted", "Automatic reconnect will resume when you return to this tab.");
@@ -406,8 +406,8 @@ function viewerInterrupted(title, message, retry = true) {
   viewerPlaceholder(title, message);
   if (retry) scheduleViewerReconnect();
 }
-async function connectViewer({ manual = false } = {}) {
-  if (state.signingOut || state.switchingCompany || !state.session?.worker?.id) return;
+async function connectViewer({ manual = false, focusOnConnect = false } = {}) {
+  if (state.signingOut || state.switchingCompany || state.changingMode || !state.session?.worker?.id) return;
   if (manual) { state.viewerWanted = true; state.viewerRetryCount = 0; state.viewerFailure = ""; clearViewerTimer("viewerRetryTimer"); }
   if (!state.viewerWanted || !state.session?.authenticated || state.viewerConnecting || state.rfb) return;
   if (document.hidden) { scheduleViewerReconnect(); return; }
@@ -445,6 +445,8 @@ async function connectViewer({ manual = false } = {}) {
       if (!current() || state.rfb !== rfb) return;
       clearViewerTimer("viewerConnectTimer"); state.viewerConnecting = false;
       $("viewer-placeholder").hidden = true; setViewerStatus("Live", "live"); renderControl();
+      const focused = document.activeElement;
+      if (focusOnConnect && !rfb.viewOnly && desktopIsVisible() && !document.hidden && (focused === document.body || focused === $("desktop-takeover"))) rfb.focus({ preventScroll: true });
       // Brief connect/disconnect flapping must not reset the capped backoff.
       state.viewerStableTimer = setTimeout(() => {
         if (!current() || state.rfb !== rfb) return;
@@ -741,8 +743,12 @@ async function changeDesktopMode(mode) {
   if (state.changingMode || state.controlUnconfirmed || state.switchingCompany || state.signingOut || state.running || hasActiveRun() || !worker?.id) return;
   if (mode === "human" && (worker.mode !== "agent" || !state.rfb || state.viewerConnecting || !desktopIsVisible())) return;
   if (mode === "agent" && (worker.mode !== "human" || !worker.can_control)) return;
-  const generation = state.sessionGeneration, rfb = state.rfb;
-  state.changingMode = true; renderControl();
+  const generation = state.sessionGeneration, focusDesktop = document.activeElement === $("desktop-takeover");
+  state.changingMode = true;
+  // Retire the old admission before changing ownership, including an uncertain response.
+  clearViewerTimer("viewerRetryTimer"); closeViewerConnection(); renderControl();
+  setViewerStatus("Switching control", "warn");
+  viewerPlaceholder("Switching desktop control", "Applying your control change and reconnecting the desktop…", false);
   try {
     await api("/api/worker/mode", { method: "POST", body: JSON.stringify({ mode }) });
     if (generation === state.sessionGeneration) await loadSession();
@@ -753,9 +759,8 @@ async function changeDesktopMode(mode) {
     }
   } finally {
     if (generation === state.sessionGeneration) {
-      const focusDesktop = document.activeElement === $("desktop-takeover");
       state.changingMode = false; renderControl();
-      if (mode === "human" && focusDesktop && rfb && state.rfb === rfb && !rfb.viewOnly && desktopIsVisible() && !document.hidden) rfb.focus({ preventScroll: true });
+      if (state.viewerWanted && state.session?.authenticated && state.session?.worker?.id && desktopIsVisible()) void connectViewer({ manual: true, focusOnConnect: mode === "human" && focusDesktop });
     }
   }
 }

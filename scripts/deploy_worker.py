@@ -40,7 +40,7 @@ else:
     revision = values.get('CTRLLOOP_REVISION')
 if not revision:
     raise SystemExit('The installed worker has no explicit revision')
-expected = {'protocol':'ctrlloop-direct-v1', 'revision':revision, 'worker_id':target['id'],
+expected = {'protocol':'ctrlloop-direct-v2', 'revision':revision, 'worker_id':target['id'],
             'environment':target['environment'], 'company_id':target['company_id'],
             'assigned_user_id':target['assigned_user_id']}
 deadline = time.monotonic() + 60
@@ -105,7 +105,7 @@ def bundle(ref=None, *, require_direct=True):
         contents = dict(items)
         gate = contents.get('src/desktop_stream.py', b'')
         worker = ast.parse(contents.get('src/cloud_worker.py', b''))
-        if (b'ctrlloop-direct-v1' not in gate
+        if (b'ctrlloop-direct-v2' not in gate
                 or not any(isinstance(node, ast.ImportFrom) and node.module == 'desktop_stream'
                            for node in ast.walk(worker))):
             raise SystemExit('Selected revision has no compatible direct desktop gate. Deploy a direct-streaming worker revision; older --source-ref values cannot be rolled back onto this endpoint.')

@@ -125,3 +125,63 @@ CREATE UNIQUE INDEX IF NOT EXISTS runs_request_id ON runs(company_id, initiated_
 -- Create the stronger index before removing its predecessor, so startup never
 -- leaves a gap in the desktop's single active reservation guarantee.
 DROP INDEX IF EXISTS one_active_run_per_worker;
+
+-- Existing authority rows invalidate live desktop grants across every backend
+-- process. These are transient wakeups, not another session/ownership model.
+-- Heartbeat timestamps and source revisions deliberately do not trigger them.
+CREATE OR REPLACE FUNCTION ctrlloop_notify_desktop_policy() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    previous_row jsonb;
+    current_row jsonb;
+    column_index integer;
+    changed boolean := false;
+BEGIN
+    IF TG_OP = 'TRUNCATE' THEN
+        PERFORM pg_notify('ctrlloop_desktop_policy', '*');
+        RETURN NULL;
+    END IF;
+    previous_row := to_jsonb(OLD);
+    IF TG_OP = 'UPDATE' THEN
+        current_row := to_jsonb(NEW);
+        FOR column_index IN 1..TG_NARGS - 1 LOOP
+            IF previous_row -> TG_ARGV[column_index] IS DISTINCT FROM current_row -> TG_ARGV[column_index] THEN
+                changed := true;
+                EXIT;
+            END IF;
+        END LOOP;
+        IF NOT changed THEN RETURN NULL; END IF;
+    END IF;
+    PERFORM pg_notify('ctrlloop_desktop_policy', TG_ARGV[0] || ':' || (previous_row ->> TG_ARGV[1]));
+    IF TG_OP = 'UPDATE' AND previous_row -> TG_ARGV[1] IS DISTINCT FROM current_row -> TG_ARGV[1] THEN
+        PERFORM pg_notify('ctrlloop_desktop_policy', TG_ARGV[0] || ':' || (current_row ->> TG_ARGV[1]));
+    END IF;
+    RETURN NULL;
+END $$;
+
+CREATE OR REPLACE TRIGGER desktop_policy_sessions
+AFTER DELETE OR UPDATE OF token_hash, company_id, user_id, expires_at ON sessions
+FOR EACH ROW EXECUTE FUNCTION ctrlloop_notify_desktop_policy('session', 'token_hash', 'company_id', 'user_id', 'expires_at');
+CREATE OR REPLACE TRIGGER desktop_policy_users
+AFTER DELETE OR UPDATE OF id, company_id, email, password_hash, role, is_devadmin, email_verified_at, disabled_at ON users
+FOR EACH ROW EXECUTE FUNCTION ctrlloop_notify_desktop_policy('user', 'id', 'company_id', 'email', 'password_hash', 'role', 'is_devadmin', 'email_verified_at', 'disabled_at');
+CREATE OR REPLACE TRIGGER desktop_policy_workers
+AFTER DELETE OR UPDATE OF id, company_id, assigned_user_id, credential_hash, fleet_namespace, fleet_claim, mode, human_session, active_run, disabled_at ON workers
+FOR EACH ROW EXECUTE FUNCTION ctrlloop_notify_desktop_policy('worker', 'id', 'company_id', 'assigned_user_id', 'credential_hash', 'fleet_namespace', 'fleet_claim', 'mode', 'human_session', 'active_run', 'disabled_at');
+CREATE OR REPLACE TRIGGER desktop_policy_connections
+AFTER DELETE OR UPDATE OF token_hash, session_hash, worker_id, company_id, assigned_user_id, fleet_namespace, fleet_claim ON desktop_connections
+FOR EACH ROW EXECUTE FUNCTION ctrlloop_notify_desktop_policy('connection', 'token_hash', 'session_hash', 'worker_id', 'company_id', 'assigned_user_id', 'fleet_namespace', 'fleet_claim');
+CREATE OR REPLACE TRIGGER desktop_policy_companies
+AFTER DELETE OR UPDATE OF id ON companies
+FOR EACH ROW EXECUTE FUNCTION ctrlloop_notify_desktop_policy('company', 'id');
+
+CREATE OR REPLACE TRIGGER desktop_policy_sessions_truncate AFTER TRUNCATE ON sessions
+FOR EACH STATEMENT EXECUTE FUNCTION ctrlloop_notify_desktop_policy();
+CREATE OR REPLACE TRIGGER desktop_policy_users_truncate AFTER TRUNCATE ON users
+FOR EACH STATEMENT EXECUTE FUNCTION ctrlloop_notify_desktop_policy();
+CREATE OR REPLACE TRIGGER desktop_policy_workers_truncate AFTER TRUNCATE ON workers
+FOR EACH STATEMENT EXECUTE FUNCTION ctrlloop_notify_desktop_policy();
+CREATE OR REPLACE TRIGGER desktop_policy_connections_truncate AFTER TRUNCATE ON desktop_connections
+FOR EACH STATEMENT EXECUTE FUNCTION ctrlloop_notify_desktop_policy();
+CREATE OR REPLACE TRIGGER desktop_policy_companies_truncate AFTER TRUNCATE ON companies
+FOR EACH STATEMENT EXECUTE FUNCTION ctrlloop_notify_desktop_policy();

@@ -217,8 +217,6 @@ async def main():
                 while True:
                     action_acquired = False
                     try:
-                        await action_lock.acquire()
-                        action_acquired = True
                         gate.ensure_input_ready()
                         await settle_journal()
                         if recovery_needed:
@@ -234,15 +232,19 @@ async def main():
                             raise
                         run = payload.get('run')
                         if not run:
-                            action_lock.release()
-                            action_acquired = False
                             await asyncio.sleep(2)
                             continue
                         identity = validate_run_context(run)
                         recovery_needed = True
+                        # Idle network polling must not stall human input. Only
+                        # an actual dispatch acquires the local action lock;
+                        # revoke human grants and release held keys before any
+                        # native agent command, including a delayed delivery.
+                        await action_lock.acquire()
+                        action_acquired = True
                         gate.begin_execution()
                         # Release any held human keys/buttons before agent actions.
-                        # The same lock has excluded input since before run dispatch.
+                        # The same local lock excludes every human input write.
                         await gate.release_inputs()
                         try:
                             await check_assignment()

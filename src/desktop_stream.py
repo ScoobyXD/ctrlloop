@@ -9,6 +9,7 @@ from http import HTTPStatus
 from itertools import groupby
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -19,13 +20,14 @@ from websockets.asyncio.server import serve
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Response
+from websockets.protocol import State
 
 from .desktop_gateway import RFBInputFilter
 
 
-PROTOCOL = 'ctrlloop-direct-v1'
+PROTOCOL = 'ctrlloop-direct-v2'
 INPUT_SECONDS = 2
-CHECK_SECONDS = 5
+CHECK_SECONDS = 24 * 60 * 60
 POLICY_CHECK_SECONDS = 7
 IDENTITY_KEYS = ('worker_id', 'company_id', 'assigned_user_id', 'environment')
 logger = logging.getLogger('ctrlloop.desktop')
@@ -60,6 +62,10 @@ class DesktopStream:
         self.worker_token = worker_token
         self.assignment = {key: str(assignment[key]) for key in IDENTITY_KEYS}
         self.action_lock = action_lock
+        # Serialize authorization snapshots across viewers, never input events.
+        # A late reply for a former owner cannot overtake a newer admission.
+        self.policy_lock = asyncio.Lock()
+        self.control_session = None
         self.clients = set()
         self.executing = False
         self.execution_epoch = 0
@@ -93,9 +99,14 @@ class DesktopStream:
 
     def begin_execution(self):
         # Called while the worker owns action_lock, before its first native
-        # action. An input waiting for an idle poll cannot cross this boundary.
+        # action. Old human streams cannot carry queued input into another run.
         self.execution_epoch += 1
         self.executing = True
+        self.control_session = None
+        for client in self.clients:
+            if client.control_allowed:
+                client.stop()
+            client.control_allowed = False
 
     async def process_request(self, connection, request):
         if request.path == '/health':
@@ -161,13 +172,60 @@ class _Viewer:
         self.keys = {}
         self.buttons = 0
         self.pointer_packet = None
+        self.control_allowed = False
+        self.control_session = None
+        self.authorization_deadline = 0
+        self.authorization_changed = asyncio.Event()
 
     @property
     def has_pressed_input(self):
         return bool(self.keys or self.buttons)
 
     def stop(self):
+        self.control_allowed = False
         self.stopped.set()
+
+    def input_allowed(self):
+        return (self.control_allowed and not self.stopped.is_set()
+                and not self.gate.executing
+                and self.control_session == self.gate.control_session
+                and asyncio.get_running_loop().time() < self.authorization_deadline)
+
+    async def authorize(self, permission, started, epoch):
+        """Apply a connection-level grant; input never contacts the backend."""
+        allowed = permission.get('allowed')
+        remaining = permission.get('expires_in_seconds')
+        session = permission.get('control_session')
+        if (not isinstance(allowed, bool) or type(remaining) not in (int, float)
+                or not math.isfinite(remaining) or remaining <= 0
+                or (allowed and (not isinstance(session, str)
+                                 or not re.fullmatch(r'[0-9a-f]{64}', session)))
+                or (not allowed and session is not None)):
+            raise PermissionError('Invalid desktop authorization')
+        # Anchor to request start, not response arrival. A late renewal cannot
+        # extend either the session expiry or the daily validation deadline.
+        self.authorization_deadline = started + min(remaining, CHECK_SECONDS + POLICY_CHECK_SECONDS)
+        self.authorization_changed.set()
+        self.control_allowed = False
+        if asyncio.get_running_loop().time() >= self.authorization_deadline:
+            raise PermissionError('Desktop authorization expired')
+        if not allowed or self.gate.executing or epoch != self.gate.execution_epoch:
+            if self.has_pressed_input:
+                await self.release_pressed_input()
+            return
+        async with self.gate.action_lock:
+            if (self.stopped.is_set() or self.gate.executing
+                    or epoch != self.gate.execution_epoch
+                    or asyncio.get_running_loop().time() >= self.authorization_deadline):
+                return
+            # Different viewers can learn about an ownership change at different
+            # times. Revoke and release the former owner before enabling this one.
+            for client in tuple(self.gate.clients):
+                if client is not self and client.control_session not in (None, session):
+                    client.stop()
+                    await client.release_pressed_input(action_lock_held=True)
+            self.gate.control_session = self.control_session = session
+            self.control_allowed = True
 
     def record_input(self, packet, *, confirmed=True):
         if packet[0] == 4:
@@ -242,11 +300,16 @@ class _Viewer:
 
     async def run(self):
         policy = None
+        admission_locked = False
         tasks = []
         close_code = 1000
         failure_stage = 'admission'
         try:
             credential = parse_qs(urlsplit(self.websocket.request.path).query)['credential'][0]
+            # Queue locally before opening the policy socket: the backend's
+            # admission timeout must not include another viewer's round trip.
+            await self.gate.policy_lock.acquire()
+            admission_locked = True
             async with connect(self.gate.policy_url,
                                additional_headers={'Authorization': 'Bearer ' + self.gate.worker_token},
                                max_size=8192, open_timeout=5, close_timeout=1,
@@ -261,23 +324,31 @@ class _Viewer:
                         raise PermissionError('Desktop access is no longer authorized')
                     return value
 
-                async with asyncio.timeout(5):
-                    await policy.send(_json({'credential': credential}))
-                    initial = await receive_policy()
-                    if any(str(initial.get(key, '')) != value for key, value in self.gate.assignment.items()):
-                        raise PermissionError('Desktop policy assignment changed')
-                    reader, self.writer = await asyncio.open_connection('127.0.0.1', 5902)
+                try:
+                    async with asyncio.timeout(POLICY_CHECK_SECONDS):
+                        checked_at = asyncio.get_running_loop().time()
+                        epoch = self.gate.execution_epoch
+                        await policy.send(_json({'credential': credential, 'protocol': PROTOCOL}))
+                        initial = await receive_policy()
+                        if any(str(initial.get(key, '')) != value for key, value in self.gate.assignment.items()):
+                            raise PermissionError('Desktop policy assignment changed')
+                        reader, self.writer = await asyncio.open_connection('127.0.0.1', 5902)
+                        if policy.state is not State.OPEN:
+                            raise PermissionError('Desktop policy connection closed')
+                        await self.authorize(initial, checked_at, epoch)
+                finally:
+                    self.gate.policy_lock.release()
+                    admission_locked = False
                 # Send the capability only at admission; never include it in
                 # traffic logs, error messages, or subsequent policy exchanges.
                 del credential
-                policy_lock = asyncio.Lock()
                 parser = RFBInputFilter()
 
-                async def input_packets(packets, epoch, received_during_execution):
-                    # Actual execution drops input immediately. Brief idle-poll
-                    # contention may wait within the same total deadline; the
-                    # epoch refuses replay if that poll dispatched any work.
-                    if (received_during_execution or self.gate.executing
+                async def input_packets(packets, epoch, received_with_control):
+                    # Only local state and the local action lock are consulted.
+                    # No policy request or database query is made per input.
+                    if (not received_with_control or not self.input_allowed()
+                            or policy.state is not State.OPEN
                             or self.gate.execution_epoch != epoch):
                         return
                     self.gate.ensure_input_ready()
@@ -290,44 +361,30 @@ class _Viewer:
                             self.stop()
                         return
                     try:
-                        if self.gate.executing or self.gate.execution_epoch != epoch:
+                        if (not self.input_allowed() or policy.state is not State.OPEN
+                                or self.gate.execution_epoch != epoch):
                             return
                         async with asyncio.timeout_at(deadline):
-                            async with policy_lock:
-                                await policy.send(_json({'op': 'input'}))
-                                permission = await receive_policy()
-                                allowed = permission.get('allowed')
-                                if not isinstance(allowed, bool):
-                                    raise PermissionError('Invalid desktop input permission')
-                                if allowed:
-                                    # write() queues bytes synchronously while
-                                    # the backend still holds its 5-second lock.
-                                    # The guest's total 2-second deadline starts
-                                    # BEFORE the request, so stale grants expire
-                                    # before the backend may release that lock.
-                                    for index, packet in enumerate(packets):
-                                        if index and index % 16 == 0:
-                                            await asyncio.sleep(0)
-                                        if asyncio.get_running_loop().time() >= deadline or self.stopped.is_set():
-                                            raise TimeoutError('Desktop input authorization expired')
-                                        self.writer.write(packet)
-                                        # Retain release uncertainty until
-                                        # drain succeeds. A down+up batch with
-                                        # a failed drain still needs cleanup.
-                                        self.record_input(packet, confirmed=False)
-                                    await self.writer.drain()
-                                    for packet in packets:
-                                        self.record_input(packet)
-                                await policy.send(_json({'op': 'ack'}))
-                                if not allowed and self.has_pressed_input:
-                                    self.stop()
+                            for index, packet in enumerate(packets):
+                                if index and index % 16 == 0:
+                                    await asyncio.sleep(0)
+                                if (not self.input_allowed() or policy.state is not State.OPEN
+                                        or asyncio.get_running_loop().time() >= deadline):
+                                    raise PermissionError('Desktop input permission ended')
+                                self.writer.write(packet)
+                                # Keep uncertainty until drain succeeds so
+                                # cancellation still releases pressed input.
+                                self.record_input(packet, confirmed=False)
+                            await self.writer.drain()
+                            for packet in packets:
+                                self.record_input(packet)
                     finally:
                         self.gate.action_lock.release()
 
                 async def inbound():
                     async for packet in self.websocket:
                         epoch = self.gate.execution_epoch
-                        received_during_execution = self.gate.executing
+                        received_with_control = self.input_allowed()
                         if self.stopped.is_set():
                             return
                         if not isinstance(packet, bytes):
@@ -343,7 +400,7 @@ class _Viewer:
                                 if requires_input:
                                     for start in range(0, len(packets), 256):
                                         await input_packets(packets[start:start + 256], epoch,
-                                                            received_during_execution)
+                                                            received_with_control)
                                 else:
                                     self.writer.writelines(packets)
                                     async with asyncio.timeout(5):
@@ -359,22 +416,38 @@ class _Viewer:
                             await self.websocket.send(packet)
 
                 async def watchdog():
+                    last_check = checked_at
                     while True:
-                        await asyncio.sleep(CHECK_SECONDS)
-                        # Check more often while allowing ordinary API latency.
-                        # The 5-second interval plus a 7-second TOTAL exchange
-                        # budget still bounds revocation detection to 12 seconds.
-                        # Input grants retain their separate 2-second deadline.
-                        async with asyncio.timeout(POLICY_CHECK_SECONDS):
-                            async with policy_lock:
+                        await asyncio.sleep(max(0, last_check + CHECK_SECONDS
+                                                - asyncio.get_running_loop().time()))
+                        async with self.gate.policy_lock:
+                            async with asyncio.timeout(POLICY_CHECK_SECONDS):
+                                started = asyncio.get_running_loop().time()
+                                epoch = self.gate.execution_epoch
                                 await policy.send(_json({'op': 'check'}))
                                 permission = await receive_policy()
-                                if permission.get('allowed') is False and self.has_pressed_input:
-                                    self.stop()
+                                if policy.state is not State.OPEN:
+                                    raise PermissionError('Desktop policy connection closed')
+                                await self.authorize(permission, started, epoch)
+                                last_check = started
+
+                async def expiry():
+                    # Session expiry and a failed daily renewal have a hard
+                    # local deadline, even if the renewal task is waiting.
+                    while True:
+                        self.authorization_changed.clear()
+                        remaining = self.authorization_deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            raise PermissionError('Desktop authorization expired')
+                        try:
+                            await asyncio.wait_for(self.authorization_changed.wait(), remaining)
+                        except TimeoutError:
+                            raise PermissionError('Desktop authorization expired') from None
 
                 tasks = [asyncio.create_task(fn(), name=name) for name, fn in
                          (('browser_input', inbound), ('desktop_output', outbound),
                           ('policy_check', watchdog), ('local_stop', self.stopped.wait),
+                          ('authorization_expiry', expiry),
                           ('policy_closed', policy.wait_closed))]
                 try:
                     done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -398,6 +471,8 @@ class _Viewer:
             logger.warning('desktop stream closed stage=%s error_type=%s',
                            failure_stage, type(error).__name__)
         finally:
+            if admission_locked:
+                self.gate.policy_lock.release()
             self.stop()
             for task in tasks:
                 task.cancel()
