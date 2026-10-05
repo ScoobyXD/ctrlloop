@@ -89,6 +89,28 @@ def control_candidates(elements):
     return candidates
 
 
+def browser_candidates(observed):
+    """Use the same Candidate API, retaining the Driver's DOM refs unchanged."""
+    rows = observed["refs"] + observed.get("content_refs", [])
+    candidates = []
+    seen = set()
+    for row in rows:
+        if row["ref"] in seen or row.get("visibility") in {"no_layout", "unknown"}:
+            continue
+        if not row.get("actions") and not (row.get("name") or row.get("value")):
+            continue
+        seen.add(row["ref"])
+        description = {"role": row["role"]}
+        for key, source in (("label", "name"), ("value", "value")):
+            if value := _text(row.get(source)):
+                description[key] = value
+        for key in ("actions", "states"):
+            if row.get(key):
+                description[key] = row[key]
+        candidates.append(Candidate(f"control_{len(candidates)}", description, row))
+    return candidates
+
+
 def _span(report, operation, **details):
     return report.span(operation, **details) if report else nullcontext({})
 
@@ -216,6 +238,10 @@ async def run_pipeline(
             windows = discovered.get("windows")
             if not isinstance(windows, list):
                 raise DriverError("Driver did not return a window list.", code="invalid_window_observation")
+            if driver.browser_pid:
+                # Unsupported consumer profiles must not fall back to frame clicks.
+                windows = [w for w in windows if w.get("pid") == driver.browser_pid
+                           or w.get("app_name") not in {"google-chrome", "chromium", "chromium-browser"}]
             if report:
                 report.append("windows_discovered", windows=windows)
             await notify("windows_discovered", iteration=iteration, candidate_count=len(windows))
@@ -236,20 +262,27 @@ async def run_pipeline(
             if report:
                 report.append("window_selected", window=result.window, selections=selection.rounds)
             await notify("window_selected", iteration=iteration, window=result.window, rounds=selection.rounds)
-            # Foreground activation stays inside the private VM, before snapshot.
-            with _span(report, "foreground_activation", tool="bring_to_front"):
-                activation = await driver.call("bring_to_front", target)
-            if report:
-                report.append("window_activated", result=activation)
-            with _span(report, "control_acquisition", stage="controls", tool="get_window_state"):
-                observed = await driver.call("get_window_state", {**target, "include_screenshot": False})
-            result.snapshot_id = observed.get("snapshot_id")
+            browser = result.window["pid"] == driver.browser_pid
+            if not browser:
+                with _span(report, "foreground_activation", tool="bring_to_front"):
+                    activation = await driver.call("bring_to_front", target)
+                if report:
+                    report.append("window_activated", result=activation)
+            observation_tool = "get_browser_state" if browser else "get_window_state"
+            with _span(report, "control_acquisition", stage="controls", tool=observation_tool):
+                observed = (await driver.browser_snapshot(target) if browser else
+                            await driver.call("get_window_state", {**target, "include_screenshot": False}))
+            result.snapshot_id = observed.get("snapshot", {}).get("id") if browser else observed.get("snapshot_id")
             result.observation = {key: observed[key] for key in (
                 "elements_complete", "degraded", "degraded_reason", "truncated", "truncation_reason",
                 "element_count", "total_element_count", "returned_element_count", "filtered_element_count",
             ) if key in observed}
-            result.observation.update(source="cua_driver.get_window_state", coverage="bounded native accessibility observation; full UI coverage is not established")
-            elements = observed.get("elements")
+            result.observation.update(source=f"cua_driver.{observation_tool}", coverage=(
+                "bounded DOM, accessibility and layout snapshot" if browser else
+                "bounded native accessibility observation; full UI coverage is not established"))
+            if browser:
+                result.observation.update(page=observed.get("page"), snapshot=observed.get("snapshot"))
+            elements = observed.get("refs") if browser else observed.get("elements")
             if isinstance(elements, list):
                 result.observation["observed_control_count"] = len(elements)
             if report:
@@ -263,7 +296,7 @@ async def run_pipeline(
             if not elements:
                 return _stop(result, trace, "no_controls", "Driver returned no controls; this does not prove the app has none.", report)
             with _span(report, "candidate_preparation", stage="controls"):
-                candidates = control_candidates(elements)
+                candidates = browser_candidates(observed) if browser else control_candidates(elements)
                 if candidate_filter:
                     candidates = candidate_filter("controls", candidates)
             if report:
@@ -289,7 +322,14 @@ async def run_pipeline(
             if tool == "read":
                 result.last_control = {"window": state["current_window"], "control": winner.description, "action": tool}
                 with _span(report, "read_text", source="observed_control"):
-                    result.action_result = _read_observed_text(winner.record, elements, result.snapshot_id, result.observation)
+                    if browser:
+                        fields = [{"ref": winner.record["ref"], "field": key, "text": winner.record[key]}
+                                  for key in ("value", "name") if isinstance(winner.record.get(key), str) and winner.record[key]]
+                        result.action_result = {"text": "\n".join(dict.fromkeys(f["text"] for f in fields)),
+                                                "fields": fields, "source": "cua_driver.get_browser_state",
+                                                "snapshot_id": result.snapshot_id, "scope": "selected_control"}
+                    else:
+                        result.action_result = _read_observed_text(winner.record, elements, result.snapshot_id, result.observation)
                 if not result.action_result["text"]:
                     return _stop(result, trace, "read_unavailable", "The selected control has no exposed text in this observation.", report)
                 if report:
@@ -300,8 +340,25 @@ async def run_pipeline(
                 if screenshots and report:
                     trace["screenshots"] = {"before": await report.capture_screenshot(driver, phase="before", iteration=iteration)}
                 return _stop(result, trace, "no_action", "No prepared text is available for this typing operation (missing, empty, or already used).", report)
+            dispatch_tool = tool
             arguments = {**target, "delivery_mode": "foreground"}
-            if winner.record.get("element_token"):
+            if browser:
+                if tool == "press_key":
+                    return _stop(result, trace, "no_action", "Typed browser tools do not support targeted key actions; use an observed button or a current-focus key action.", report)
+                required_action = "type" if tool == "type_text" else "click"
+                if required_action not in winner.record.get("actions", []):
+                    return _stop(result, trace, "no_action", "Selected browser control does not expose the requested action.", report)
+                arguments = {k: observed[k] for k in ("target_id", "tab_id")}
+                arguments["ref"] = winner.record["ref"]
+                if tool == "type_text":
+                    if not winner.record.get("states", {}).get("focused"):
+                        return _stop(result, trace, "no_action", "Click the browser field before typing; the selected field is not focused.", report)
+                    dispatch_tool = "browser_type"
+                    arguments.update(mode="insert_text", replace=True)
+                else:
+                    dispatch_tool = "browser_click"
+                    arguments["input_route"] = "dom_event"
+            elif winner.record.get("element_token"):
                 arguments["element_token"] = winner.record["element_token"]
             else:
                 arguments.update(element_index=winner.record["element_index"], snapshot_id=result.snapshot_id)
@@ -323,7 +380,7 @@ async def run_pipeline(
                     if tool == "type_text":
                         pending_text = None  # Consume before sending, including uncertain delivery.
                     with _span(report, "native_action", tool=tool, completion_scope="call_return"):
-                        result.action_result = await driver.call(tool, arguments)
+                        result.action_result = await driver.call(dispatch_tool, arguments)
             except DriverError as error:
                 if report:
                     report.append("loop_action_finished", iteration=iteration, boundary="cua_driver_call_error")

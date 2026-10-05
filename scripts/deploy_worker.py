@@ -213,6 +213,7 @@ Type=simple
 WorkingDirectory={remote}
 EnvironmentFile={env_path}
 Environment=CTRLLOOP_REVISION={revision}
+{('Environment="CUA_LOCAL_MCP_URL=http://127.0.0.1:3001/mcp"' + chr(10) + 'Environment=' + json.dumps('CTRLLOOP_BROWSER_START_URL=' + args.browser_start_url)) if args.browser_start_url else ''}
 ExecStart={remote}/.venv/bin/python -m src.cloud_worker
 Restart=on-failure
 RestartPreventExitStatus=78
@@ -225,6 +226,15 @@ WantedBy=default.target
 '''
         await sandbox.files.make_dir('/home/omarchy/.config/systemd/user')
         await sandbox.files.write_text(control+'/ctrlloop-worker.service',service)
+        browser_setup = ''
+        if args.browser_start_url:
+            parts = urlsplit(args.browser_start_url)
+            if parts.scheme not in ('http', 'https') or not parts.hostname or parts.username or parts.password or any(ord(c) < 32 for c in args.browser_start_url):
+                raise ValueError('--browser-start-url must be an HTTP(S) URL without credentials')
+            browser_source = (subprocess.check_output(['git', 'show', args.source_ref + ':scripts/setup_worker_browser.sh'], cwd=ROOT)
+                              if args.source_ref else (ROOT/'scripts/setup_worker_browser.sh').read_bytes())
+            await sandbox.files.write_bytes(control+'/setup-browser.sh', browser_source)
+            browser_setup = 'bash ' + shlex.quote(control+'/setup-browser.sh')
         begin=phase+' begin'+(' '+shlex.quote(staged_env) if staged_env else '')
         if args.previous_api_url: begin+=' '+shlex.quote(args.previous_api_url)
         install_env=('install -m 600 '+shlex.quote(staged_env)+' '+shlex.quote(env_path)+'\n'
@@ -250,6 +260,7 @@ cd {shlex.quote(remote)}
 tar -xzf {shlex.quote(control+'/source.tar.gz')}
 uv sync --locked --no-dev --python 3.12
 .venv/bin/python -m compileall -q src
+{browser_setup}
 test ! -e /home/omarchy/.local/state/ctrlloop-worker/active-run.json
 if test -f src/desktop_display.py; then
     .venv/bin/python -m src.desktop_display
@@ -290,6 +301,7 @@ if __name__=='__main__':
     parser.add_argument('--email',required=True)
     parser.add_argument('--jev-env',type=Path)
     parser.add_argument('--source-ref',help='Bundle an exact Git commit/ref without changing this checkout')
+    parser.add_argument('--browser-start-url', help='Opt in to pinned Driver 0.28.2 with the persistent isolated ctrlloop browser profile; open this page at run start')
     parser.add_argument('--configure',action='store_true',help='Initial administrator setup from dedicated user credential files')
     parser.add_argument('--previous-api-url',help='With --configure only: require this exact prior HTTPS origin during an explicit origin migration')
     mode=parser.add_mutually_exclusive_group()

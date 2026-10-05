@@ -313,7 +313,8 @@ async def main():
                                                 'events': chunk})
                             try:
                                 driver = CuaDriver(local_endpoint=os.environ.get('CUA_LOCAL_MCP_URL', 'http://127.0.0.1:3000/mcp'),
-                                                   local_token=os.environ.get('CUA_LOCAL_MCP_TOKEN'), report=report)
+                                                   local_token=os.environ.get('CUA_LOCAL_MCP_TOKEN'), report=report,
+                                                   browser_start_url=os.environ.get('CTRLLOOP_BROWSER_START_URL'))
                                 with report.span('driver_initialization'):
                                     await driver.start()
                                 report.append('driver_connected', **driver.session_info)

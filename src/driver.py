@@ -27,6 +27,7 @@ import httpx2
 
 
 PINNED_DRIVER_VERSION = "0.24.0"
+PINNED_BROWSER_DRIVER_VERSION = "0.28.2"
 _PROTOCOLS = {"2025-06-18", "2025-03-26"}
 _PROJECT = Path(__file__).resolve().parents[1]
 _RESPONSE_LIMIT = 20 * 1024 * 1024
@@ -67,7 +68,8 @@ class CuaDriver:
     """
 
     def __init__(self, claim_file: Path | None = None, *, service: str = "mcp", timeout: float = 60.0,
-                 local_endpoint: str | None = None, local_token: str | None = None, report=None) -> None:
+                 local_endpoint: str | None = None, local_token: str | None = None, report=None,
+                 browser_start_url: str | None = None) -> None:
         if not isinstance(service, str) or not re.fullmatch(r"[a-zA-Z0-9_-]+", service):
             raise ValueError("service must name one Fleet service")
         if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
@@ -82,6 +84,10 @@ class CuaDriver:
             parts.port  # Reject malformed ports before opening a connection.
         elif local_token is not None:
             raise ValueError("local_token is only supported with local_endpoint.")
+        if browser_start_url is not None:
+            parts = urlsplit(browser_start_url)
+            if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+                raise ValueError("browser_start_url must be an HTTP(S) URL without credentials.")
         self.claim_file = Path(claim_file).expanduser().resolve() if claim_file is not None else None
         self.local_endpoint = local_endpoint
         self._local_http: httpx2.AsyncClient | None = None
@@ -105,6 +111,9 @@ class CuaDriver:
         self._started = self._closed = self._broken = self._session_started = False
         self._snapshot: dict[str, Any] | None = None
         self._desktop_observed = False
+        self.browser_start_url = browser_start_url
+        self.browser_pid: int | None = None
+        self._browser_snapshot: dict[str, Any] | None = None
         self.report = report
 
     def _acquire_claim_lock(self, reference: dict[str, Any] | None = None) -> None:
@@ -177,9 +186,10 @@ class CuaDriver:
             if initialized.get("protocolVersion") not in _PROTOCOLS:
                 raise DriverError("Driver advertised an unsupported MCP protocol.", code="driver_protocol_unsupported")
             self.server_info = initialized.get("serverInfo", {})
+            expected_version = PINNED_BROWSER_DRIVER_VERSION if self.browser_start_url else PINNED_DRIVER_VERSION
             if (not isinstance(self.server_info, dict) or self.server_info.get("name") != "cua-driver"
-                    or self.server_info.get("version") != PINNED_DRIVER_VERSION):
-                raise DriverError(f"This adapter requires Cua Driver {PINNED_DRIVER_VERSION}.", code="driver_version_unsupported")
+                    or self.server_info.get("version") != expected_version):
+                raise DriverError(f"This adapter requires Cua Driver {expected_version}.", code="driver_version_unsupported")
             self._headers["mcp-protocol-version"] = initialized["protocolVersion"]
             await self._rpc("notifications/initialized", notification=True)
             listing = await self._rpc("tools/list", {})
@@ -200,6 +210,8 @@ class CuaDriver:
             self._session_started = True
             await self.call("start_session", {"session": self.session})
             self.session_info["driver"] = dict(self.server_info)
+            if self.browser_start_url:
+                await self._prepare_browser()
             if url is not None:
                 await self.call("launch_app", {"urls": [url]})
         except BaseException as error:
@@ -400,7 +412,7 @@ class CuaDriver:
         refused = isinstance(payload, dict) and (
             any(key in payload for key in ("refusal", "error", "code"))
             or payload.get("effect") == "refused"
-            or ("status" in payload and payload["status"] != "success")
+            or ("status" in payload and payload["status"] not in {"success", "ok"})
         )
         if result.get("isError") or refused:
             code = "driver_call_failed"
@@ -411,6 +423,8 @@ class CuaDriver:
                     if known in candidates:
                         code = known
                         break
+                if isinstance(refusal, dict) and isinstance(refusal.get("code"), str):
+                    code = refusal["code"]
             error = DriverError("Cua Driver refused or failed the call; it was not retried.", code=code, tool=tool)
             if isinstance(payload, dict):
                 error.context["native_result"] = payload
@@ -434,6 +448,14 @@ class CuaDriver:
         args = self._arguments(tool, arguments)
         if tool in {"click", "type_text", "press_key"}:
             self._validate_target(tool, args)
+        if tool in {"browser_click", "browser_type"}:
+            snapshot = self._browser_snapshot
+            if (not snapshot or any(args.get(k) != snapshot.get(k) for k in ("target_id", "tab_id"))
+                    or not any(row.get("ref") == args.get("ref") for row in snapshot.get("refs", []))):
+                raise DriverError("Observe a fresh browser ref before acting.", code="stale_browser_ref", tool=tool)
+            self._browser_snapshot = None
+        elif tool in {"get_browser_state", "browser_navigate", "browser_prepare"}:
+            self._browser_snapshot = None
         if tool == "get_window_state" or self.tools[tool].get("annotations", {}).get("readOnlyHint") is not True:
             # Invalidate BEFORE dispatch: interrupted input may already land.
             self._snapshot = None
@@ -443,7 +465,7 @@ class CuaDriver:
             payload = self._payload(tool, result)
             if tool == "get_window_state":
                 self._validate_snapshot(payload, args)
-            if tool in {"click", "type_text", "press_key"}:
+            if tool in {"click", "type_text", "press_key", "browser_click", "browser_type"}:
                 # These are native ActionResult fields. A successful transport
                 # without these facts cannot justify another control decision.
                 effect, route = payload.get("effect"), payload.get("route")
@@ -464,7 +486,54 @@ class CuaDriver:
             self._snapshot = deepcopy(payload)
         elif tool == "get_desktop_state":
             self._desktop_observed = True
+        elif tool == "get_browser_state" and payload.get("mode") == "snapshot":
+            if (payload.get("status") != "ok" or not isinstance(payload.get("refs"), list)
+                    or not payload.get("snapshot", {}).get("id")
+                    or any(not isinstance(row, dict) or not isinstance(row.get("ref"), str)
+                           or not isinstance(row.get("role"), str) for row in payload["refs"])
+                    or any(payload.get(k) != args.get(k) for k in ("target_id", "tab_id"))):
+                raise DriverError("Driver returned an invalid browser snapshot.", code="invalid_driver_response", tool=tool)
+            self._browser_snapshot = deepcopy(payload)
         return payload, result
+
+    async def _prepare_browser(self) -> None:
+        """Opt-in worker browser with a persistent isolated profile, never user cookies."""
+        required = {"browser_prepare", "get_browser_state", "browser_click", "browser_type", "browser_navigate"}
+        if not required.issubset(self.tools):
+            raise DriverError("Driver lacks typed browser tools.", code="driver_schema_unsupported")
+        windows = (await self.call("list_windows", {"on_screen_only": True}))["windows"]
+        chrome = next((w for w in windows if w.get("app_name") in {"google-chrome", "chromium", "chromium-browser"}), None)
+        args = {"allow_launch": True, "profile": {"mode": "isolated_named", "name": "ctrlloop"}}
+        if chrome:
+            args["pid"] = chrome["pid"]
+        prepared = await self.call("browser_prepare", args)
+        self.browser_pid = prepared.get("prepared_pid")
+        if type(self.browser_pid) is not int or self.browser_pid <= 0:
+            raise DriverError("Browser preparation returned no process identity.", code="invalid_driver_response")
+        for _ in range(20):
+            windows = (await self.call("list_windows", {"on_screen_only": True}))["windows"]
+            matches = [w for w in windows if w.get("pid") == self.browser_pid]
+            if len(matches) == 1:
+                break
+            await asyncio.sleep(0.25)
+        else:
+            raise DriverError("Prepared browser has no unique visible window.", code="browser_window_unavailable")
+        bound = await self._bind_browser({k: matches[0][k] for k in ("pid", "window_id")})
+        await self.call("browser_navigate", {**bound, "url": self.browser_start_url})
+        self.session_info["browser"] = {"profile": "isolated_named", "name": "ctrlloop", "pid": self.browser_pid}
+
+    async def _bind_browser(self, target: dict[str, Any]) -> dict[str, str]:
+        bound = await self.call("get_browser_state", target)
+        tabs = [tab for tab in bound.get("tabs", []) if tab.get("active") is True]
+        if (bound.get("status") != "ok" or bound.get("binding_quality") != "exact"
+                or bound.get("mutation_allowed") is not True or len(tabs) != 1
+                or not isinstance(bound.get("target_id"), str) or not isinstance(tabs[0].get("tab_id"), str)):
+            raise DriverError("Browser window or selected tab could not be bound exactly.", code="browser_binding_unavailable")
+        return {"target_id": bound["target_id"], "tab_id": tabs[0]["tab_id"]}
+
+    async def browser_snapshot(self, target: dict[str, Any]) -> dict[str, Any]:
+        bound = await self._bind_browser(target)
+        return await self.call("get_browser_state", {**bound, "snapshot_format": "semantic_v2"})
 
     async def call(self, tool: str, arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Return native structured content or the pinned activation envelope."""

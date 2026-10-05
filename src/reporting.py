@@ -253,7 +253,7 @@ class RunReport:
         # retain intent without a dispatch marker, which recovery labels unknown.
         at_ns = perf_counter_ns()
         self._native_dispatches[call_id] = {**details, "_at_ns": at_ns}
-        if iteration in self._loops and tool in {"click", "type_text", "press_key", "hotkey"}:
+        if iteration in self._loops and tool in {"click", "type_text", "press_key", "hotkey", "browser_click", "browser_type"}:
             self._loops[iteration].update(last_command_ns=at_ns, last_command_id=call_id, last_command_tool=tool)
         return at_ns
 
