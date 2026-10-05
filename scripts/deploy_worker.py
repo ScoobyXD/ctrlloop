@@ -212,8 +212,8 @@ After=default.target
 Type=simple
 WorkingDirectory={remote}
 EnvironmentFile={env_path}
+{('EnvironmentFile=' + control + '/browser.env') if args.browser_start_url else ''}
 Environment=CTRLLOOP_REVISION={revision}
-{('Environment="CUA_LOCAL_MCP_URL=http://127.0.0.1:3001/mcp"' + chr(10) + 'Environment=' + json.dumps('CTRLLOOP_BROWSER_START_URL=' + args.browser_start_url)) if args.browser_start_url else ''}
 ExecStart={remote}/.venv/bin/python -m src.cloud_worker
 Restart=on-failure
 RestartPreventExitStatus=78
@@ -231,6 +231,8 @@ WantedBy=default.target
             parts = urlsplit(args.browser_start_url)
             if parts.scheme not in ('http', 'https') or not parts.hostname or parts.username or parts.password or any(ord(c) < 32 for c in args.browser_start_url):
                 raise ValueError('--browser-start-url must be an HTTP(S) URL without credentials')
+            await sandbox.files.write_text(control+'/browser.env',
+                'CUA_LOCAL_MCP_URL="http://127.0.0.1:3001/mcp"\nCTRLLOOP_BROWSER_START_URL=' + json.dumps(args.browser_start_url) + '\n')
             browser_source = (subprocess.check_output(['git', 'show', args.source_ref + ':scripts/setup_worker_browser.sh'], cwd=ROOT)
                               if args.source_ref else (ROOT/'scripts/setup_worker_browser.sh').read_bytes())
             await sandbox.files.write_bytes(control+'/setup-browser.sh', browser_source)

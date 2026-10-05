@@ -10,7 +10,7 @@ if ! test -x "$dir/cua-driver"; then
     archive="$dir/cua-driver.tar.gz"
     curl -fLsS https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.28.2/cua-driver-rs-0.28.2-linux-x86_64-binary.tar.gz -o "$archive"
     printf '%s  %s\n' a1d99fd04bb4927ef5ffdbe60eb91ed8b51a2bab60e10fc604a75bd59ce69c3e "$archive" | sha256sum -c -
-    tar -xzf "$archive" -C "$dir" ./cua-driver
+    tar -xzf "$archive" -C "$dir"
     chmod 700 "$dir/cua-driver"
 fi
 "$dir/cua-driver" --version | grep -q '0.28.2'
