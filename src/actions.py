@@ -2,13 +2,15 @@
 
 from typing import Any
 
+ACTION_TOOLS = ('click', 'type_text', 'press_key', 'read')
+
 
 def normalize_action(action: Any, *, allow_incomplete: bool = False) -> dict[str, str]:
     """Validate one action; drafts may omit required content until execution."""
     if not isinstance(action, dict) or set(action) - {"tool", "target", "text", "key"}:
         raise ValueError("An action must contain only tool, target, text, and key fields.")
     tool = action.get("tool")
-    if not isinstance(tool, str) or tool not in {"click", "type_text", "press_key", "read"}:
+    if not isinstance(tool, str) or tool not in ACTION_TOOLS:
         raise ValueError("Choose click, type_text, press_key, or read.")
     normalized = {"tool": tool}
     target = action.get("target")

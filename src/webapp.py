@@ -32,6 +32,7 @@ from .identity import token_hash, hash_password, check_password, normalize_email
 from .company_migration import migrate_company_schema
 from .account_mail import send_account_mail, delivery_mode
 from .actions import normalize_action
+from .planning import PlanningError, generated_steps, planning_payload
 from .run_artifacts import (MAX_ARCHIVE_BYTES, inspect_archive, store_archive,
                             load_archive, worker_record, evidence_bundle)
 
@@ -334,7 +335,7 @@ async def queue_run(db, loop, principal, *, mode='sequence', start_step=0, reque
          Jsonb(loop['steps']) if loop['steps'] is not None else None, mode, request_id,
          start_step,end_step,start_step))).fetchone()
     run['initiator'] = {'id': acting_user(principal), 'email': principal['target_email'], 'display_name': principal['target_display_name']}
-    message = ('Manual sequence queued for its assigned Omarchy worker' if loop['steps'] is not None else
+    message = ('Step sequence queued for its assigned Omarchy worker' if loop['steps'] is not None else
                'Desktop reserved; the instruction will run automatically when ready'
                if loop['status'] == 'generating' else 'Saved instruction queued for its assigned Omarchy worker')
     await event(db, loop['id'], 'delivery_queued', message, run_id=run['id'],
@@ -894,7 +895,7 @@ async def create_loop(body: Prompt, request: Request):
             (identity,prompt,MODEL,principal['company_id'],acting_user(principal)))).fetchone()
         row['creator'] = {'id': acting_user(principal), 'email': principal['target_email'], 'display_name': principal['target_display_name']}
         await event(db, identity, 'user_request', prompt, data={'actor_user_id': str(principal['user_id'])})
-        await event(db, identity, 'llm_generation', 'Generating an instruction with gpt-6-luna · high reasoning')
+        await event(db, identity, 'llm_generation', 'Generating executable steps with gpt-6-luna · high reasoning')
         row['runs'] = [await queue_run(db, row, principal)] if body.start else []
     task = asyncio.create_task(generate_instruction(identity, prompt, principal['company_id'])); generation_tasks.add(task); task.add_done_callback(generation_tasks.discard)
     return row
@@ -914,7 +915,7 @@ async def update_loop(identity: UUID, body: LoopUpdate, request: Request):
             raise HTTPException(403, 'Only the author can edit this workbench')
         if row['archived_at'] is not None or row['deleted_at'] is not None:
             raise HTTPException(409, 'Archived or deleted CtrlLoops cannot be edited')
-        if row['steps'] is None: raise HTTPException(409, 'Only manual workbenches have editable steps')
+        if row['steps'] is None: raise HTTPException(409, 'This CtrlLoop has no editable steps')
         if row['version'] != body.version: raise HTTPException(409, 'This workbench changed; reload before saving')
         active = await (await db.execute("SELECT id FROM runs WHERE loop_id=%s AND status IN ('queued','running','paused')",
                                        (identity,))).fetchone()
@@ -928,9 +929,7 @@ async def update_loop(identity: UUID, body: LoopUpdate, request: Request):
 
 async def generate_instruction(identity, prompt, company_id):
     started = time.monotonic()
-    payload = {'model': MODEL, 'reasoning': {'effort': 'high'}, 'store': False,
-               'instructions': 'Restate the user request as one concise computer instruction, preserving their intended application and task. Output only the instruction. Do not invent task data, credentials, destinations, additional steps, or claims of execution. The executor can select visible windows and controls and attempt click or type actions, but does not yet plan arbitrary tasks, generate typing content, or assess general task completion. Preserve the request faithfully even when those capabilities may be needed; do not redirect it to a particular website.',
-               'input': prompt, 'max_output_tokens': 500}
+    payload = planning_payload(prompt, MODEL)
     raw_request = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
     try:
         async with database() as db:
@@ -958,12 +957,16 @@ async def generate_instruction(identity, prompt, company_id):
                               'cost_estimate': estimated_cost,
                               'cost_status': 'Usage estimate from published pricing; not an invoice' if estimated_cost else 'Usage or cached-token breakdown unavailable; cost is unknown'})
         response.raise_for_status(); result = response.json()
-        instruction = ''.join(part.get('text','') for item in result.get('output',[]) if item.get('type')=='message' for part in item.get('content',[]) if part.get('type')=='output_text').strip()
-        if result.get('status') != 'completed' or not instruction: raise ValueError('Model did not return a complete instruction')
+        output = ''.join(part.get('text','') for item in result.get('output',[]) if item.get('type')=='message' for part in item.get('content',[]) if part.get('type')=='output_text').strip()
+        if result.get('status') != 'completed' or not output: raise ValueError('Model did not return a complete plan')
+        instruction, steps = generated_steps(output)
         async with database() as db:
-            await db.execute("UPDATE loops SET instruction=%s,status='ready',generated_at=now(),llm_response_id=%s,llm_usage=%s WHERE id=%s AND company_id=%s", (instruction,result.get('id'),Jsonb(result.get('usage',{})),identity,company_id))
-            await event(db,identity,'llm_generated',instruction,data={'model':result.get('model'), 'reasoning_effort':'high','duration_ms':round((time.monotonic()-started)*1000), 'response_id':result.get('id'),'usage':result.get('usage')})
-            await event(db,identity,'db_saved','Generated instruction committed to PostgreSQL')
+            await db.execute("UPDATE loops SET instruction=%s,steps=%s,status='ready',generated_at=now(),llm_response_id=%s,llm_usage=%s WHERE id=%s AND company_id=%s", (instruction,Jsonb(steps),result.get('id'),Jsonb(result.get('usage',{})),identity,company_id))
+            # The initial Start reserves a run while generation is pending. Freeze
+            # the same validated steps into that reservation before it can dispatch.
+            await db.execute("UPDATE runs SET steps=%s,end_step=%s,request_id=COALESCE(request_id,%s) WHERE loop_id=%s AND company_id=%s AND status='queued' AND steps IS NULL", (Jsonb(steps),len(steps),uuid4(),identity,company_id))
+            await event(db,identity,'llm_generated',instruction,data={'model':result.get('model'), 'reasoning_effort':'high','duration_ms':round((time.monotonic()-started)*1000), 'response_id':result.get('id'),'usage':result.get('usage'), 'step_count':len(steps), 'steps':steps})
+            await event(db,identity,'db_saved','Generated steps committed to PostgreSQL')
     except asyncio.CancelledError:
         async with database() as db:
             await interrupt_queued_runs(db, 'Generation interrupted before dispatch. No actions were sent.',
@@ -973,7 +976,8 @@ async def generate_instruction(identity, prompt, company_id):
                         data={'error_type': 'CancelledError', 'duration_ms': round((time.monotonic()-started)*1000, 3)})
         raise
     except Exception as error:
-        message = f'LLM generation failed ({type(error).__name__}); no instruction was fabricated.'
+        message = ('Cannot generate runnable steps: ' + str(error) if isinstance(error, PlanningError) else
+                   f'LLM generation failed ({type(error).__name__}); no steps were dispatched.')
         async with database() as db:
             await interrupt_queued_runs(db, 'Generation failed before dispatch. No actions were sent.',
                                         clause='loop_id=%s AND company_id=%s', params=(identity,company_id))
@@ -1009,7 +1013,7 @@ async def create_run(identity: UUID, request: Request, body: RunRequest | None =
         if loop['archived_at'] is not None or loop['deleted_at'] is not None:
             raise HTTPException(409, 'Archived or deleted CtrlLoops cannot be started')
         if loop['steps'] is not None and (body is None or body.request_id is None):
-            raise HTTPException(422, 'Manual runs require a unique request_id to prevent duplicate execution')
+            raise HTTPException(422, 'Step sequences require a unique request_id to prevent duplicate execution')
         return await queue_run(db, loop, principal, mode=body.mode if body else 'sequence',
                                start_step=body.start_step if body else 0,
                                request_id=body.request_id if body else None)
@@ -1571,7 +1575,7 @@ async def report_record(identity, request, *, loop_only=False):
                     for record in item['data'].get('events',[]) if isinstance(record,dict)]
     events = [item for item in events if item['stage'] != 'step_trace']
     missing = []
-    if loop['steps'] is None:
+    if loop['model'] != 'manual':
         if not any(item['stage'] == 'llm_request' for item in events): missing.append('Exact OpenAI request was not captured for this earlier request.')
         if not any(item['stage'] == 'llm_response' for item in events): missing.append('OpenAI response is unavailable; generation may predate capture or have been interrupted.')
     artifact = ((run or {}).get('result') or {}).get('artifacts')

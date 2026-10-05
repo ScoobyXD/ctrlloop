@@ -373,7 +373,7 @@ function renderDetail() {
   const loop = state.detail;
   if (Array.isArray(loop.steps)) {
     $('loop-title').textContent = loop.prompt;
-    $('loop-reference').textContent = 'MANUAL SEQUENCE';
+    $('loop-reference').textContent = loop.model === 'manual' ? 'MANUAL SEQUENCE' : 'GENERATED STEPS';
     $('loop-heading-status').replaceChildren();
     workbench.update(loop); renderNavigation(false); return;
   }
