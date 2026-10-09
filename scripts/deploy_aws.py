@@ -87,6 +87,9 @@ def account_email_configuration(config):
 class Deployment:
     def __init__(self, profile, environment):
         self.config = load_environment(environment)
+        self.assign_public_ip = self.config.raw.get("assign_public_ip", "DISABLED")
+        if self.assign_public_ip not in ("ENABLED", "DISABLED"):
+            raise ValueError("assign_public_ip must be ENABLED or DISABLED")
         self.local = self.config.state_dir
         self.state_path = self.config.state_path
         self.secret_path = self.config.secret_path
@@ -105,6 +108,11 @@ class Deployment:
 
     def client(self, name):
         return self.session.client(name)
+
+    def task_network(self):
+        return {"awsvpcConfiguration": {"subnets": self.subnets,
+            "securityGroups": [self.state["security_group"]],
+            "assignPublicIp": self.assign_public_ip}}
 
     def record(self, **kwargs):
         self.state.update(kwargs)
@@ -269,7 +277,7 @@ print("CTRL Loop dedicated database created and login verified")
                 "secrets": [{"name": "DB_ADMIN_PASSWORD", "valueFrom": admin_secret}, {"name": "DB_PASSWORD", "valueFrom": f"{self.state['app_secret_arn']}:DATABASE_PASSWORD::"}],
                 "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": f"/ecs/{self.name}", "awslogs-region": self.region, "awslogs-stream-prefix": "bootstrap"}}}], tags=self.lower_tags)["taskDefinition"]
         result = after_iam_propagation(ecs.run_task, cluster=self.cluster, taskDefinition=task["taskDefinitionArn"], launchType="FARGATE", platformVersion="1.4.0",
-            networkConfiguration={"awsvpcConfiguration": {"subnets": self.subnets, "securityGroups": [self.state["security_group"]], "assignPublicIp": "DISABLED"}}, tags=self.lower_tags)
+            networkConfiguration=self.task_network(), tags=self.lower_tags)
         if result.get("failures"):
             raise RuntimeError(f"DB init task launch failed: {result['failures']}")
         self.record(db_init_task=result["tasks"][0]["taskArn"], database=self.db_name, database_host=self.db_host, database_ready=False)
@@ -677,12 +685,14 @@ phases:
                 or services[0]["deployments"][0].get("rolloutState") != "COMPLETED"):
             raise RuntimeError("Service changed during release preparation; coordinate and inspect before retrying")
         if services and services[0]["status"] != "INACTIVE":
-            ecs.update_service(cluster=self.cluster, service=self.name, taskDefinition=task["taskDefinitionArn"], desiredCount=1,
+            ecs.update_service(cluster=self.cluster, service=self.name, taskDefinition=task["taskDefinitionArn"],
+                healthCheckGracePeriodSeconds=180,
+                networkConfiguration=self.task_network(),
                 deploymentConfiguration={"maximumPercent": 200, "minimumHealthyPercent": 100, "deploymentCircuitBreaker": {"enable": True, "rollback": allow_rollback}})
         else:
             ecs.create_service(cluster=self.cluster, serviceName=self.name, taskDefinition=task["taskDefinitionArn"], desiredCount=1, launchType="FARGATE",
-                platformVersion="1.4.0", healthCheckGracePeriodSeconds=60,
-                networkConfiguration={"awsvpcConfiguration": {"subnets": self.subnets, "securityGroups": [self.state["security_group"]], "assignPublicIp": "DISABLED"}},
+                platformVersion="1.4.0", healthCheckGracePeriodSeconds=180,
+                networkConfiguration=self.task_network(),
                 loadBalancers=[{"targetGroupArn": self.state["target_group"], "containerName": "app", "containerPort": 8080}],
                 deploymentConfiguration={"maximumPercent": 200, "minimumHealthyPercent": 100, "deploymentCircuitBreaker": {"enable": True, "rollback": False}}, tags=self.lower_tags)
         self.record(service=self.name, deployed_at=dt.datetime.now(dt.timezone.utc).isoformat())

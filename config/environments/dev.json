@@ -6,10 +6,11 @@
   "region": "us-west-1",
   "default_profile": "mangorts-dev",
   "resource_name": "ctrlloop-mvp",
+  "assign_public_ip": "ENABLED",
   "vpc": "vpc-091ee99d4afb8bec5",
   "subnets": [
-    "subnet-0c96aa9cdb41d46f7",
-    "subnet-0d7cdf9a8970301c1"
+    "subnet-00a38a8cafdcd4f6b",
+    "subnet-0c765c34c59978b0f"
   ],
   "alb_sg": "sg-080dc70b173bd3d6c",
   "db_sg": "sg-085727cf5320e53ac",

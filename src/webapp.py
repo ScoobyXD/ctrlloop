@@ -76,11 +76,11 @@ async def lifespan(app):
     dummy_password_hash = await hash_password(secrets.token_urlsafe(32))
     database_pool = AsyncConnectionPool(
         os.environ['DATABASE_URL'], open=False, min_size=2, max_size=8,
-        timeout=5, kwargs={'row_factory': dict_row, 'connect_timeout': 5},
+        timeout=5, kwargs={'row_factory': dict_row, 'connect_timeout': 60},
         name='ctrlloop',
     )
     try:
-        await database_pool.open(wait=True, timeout=15)
+        await database_pool.open(wait=True, timeout=120)
         async with database() as db:
             await migrate_company_schema(db)
             # Neither unfinished generation nor undispatched execution is replayed.
